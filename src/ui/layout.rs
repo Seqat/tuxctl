@@ -2,6 +2,13 @@ use ratatui::layout::Rect;
 
 use crate::action::Tab;
 
+pub const MIN_TERMINAL_WIDTH: u16 = 40;
+pub const MIN_TERMINAL_HEIGHT: u16 = 40;
+
+pub fn terminal_size_supported(area: Rect) -> bool {
+    area.width >= MIN_TERMINAL_WIDTH && area.height >= MIN_TERMINAL_HEIGHT
+}
+
 pub struct ScreenLayout {
     pub tabs: Rect,
     pub content: Rect,
@@ -118,5 +125,14 @@ mod tests {
         assert_eq!(truncate("CPU λ model", 6), "CPU λ…");
         assert_eq!(truncate("anything", 1), "…");
         assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn minimum_terminal_boundary_requires_both_dimensions() {
+        assert!(terminal_size_supported(Rect::new(0, 0, 40, 40)));
+        assert!(!terminal_size_supported(Rect::new(0, 0, 39, 40)));
+        assert!(!terminal_size_supported(Rect::new(0, 0, 40, 39)));
+        assert!(!terminal_size_supported(Rect::new(0, 0, 39, 39)));
+        assert!(!terminal_size_supported(Rect::new(0, 0, 0, 0)));
     }
 }

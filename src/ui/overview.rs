@@ -10,7 +10,7 @@ use crate::app::App;
 
 use super::{format_uptime, format_usage, hardware, layout};
 
-const SIDE_BY_SIDE_MIN_WIDTH: u16 = 58;
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 90;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverviewAreas {
@@ -228,5 +228,21 @@ mod tests {
         assert_eq!(tiny.system.width, 1);
         assert_eq!(tiny.system.height, 1);
         assert_eq!(tiny.hardware.height, 0);
+    }
+
+    #[test]
+    fn overview_keeps_supported_narrow_viewports_stacked() {
+        for width in [40, 46, 80, SIDE_BY_SIDE_MIN_WIDTH - 1] {
+            let area = Rect::new(0, 0, width, 57);
+            let result = overview_areas(area);
+            assert_eq!(result.system.width, width);
+            assert_eq!(result.hardware.width, width);
+            assert_eq!(result.hardware.y, result.system.bottom());
+        }
+
+        let result = overview_areas(Rect::new(0, 0, SIDE_BY_SIDE_MIN_WIDTH, 57));
+        assert_eq!(result.system.y, result.hardware.y);
+        assert!(result.system.width >= 26);
+        assert!(result.hardware.width >= 52);
     }
 }

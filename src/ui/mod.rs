@@ -310,7 +310,12 @@ impl UiRegions {
 
 pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     let area = frame.area();
+    frame.render_widget(Clear, area);
     if area.width == 0 || area.height == 0 {
+        return UiRegions::default();
+    }
+    if !layout::terminal_size_supported(area) {
+        render_terminal_size_warning(frame, area);
         return UiRegions::default();
     }
 
@@ -463,6 +468,40 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     }
 
     regions
+}
+
+fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
+    let width = area.width.min(36);
+    let height = area.height.min(9);
+    let warning_area = layout::centered_rect(area, width, height);
+    if warning_area.width == 0 || warning_area.height == 0 {
+        return;
+    }
+
+    let lines = vec![
+        Line::from("tuxctl").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("Terminal too small").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(format!(
+            "Minimum: {}x{}",
+            layout::MIN_TERMINAL_WIDTH,
+            layout::MIN_TERMINAL_HEIGHT
+        )),
+        Line::from(format!("Current: {}x{}", area.width, area.height)),
+        Line::from(""),
+        Line::from("Resize the terminal to continue."),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        warning_area,
+    );
 }
 
 fn render_tabs(
@@ -654,6 +693,16 @@ mod tests {
         ByteUsage, LogicalCpuId, LogicalCpuMetrics, OverviewMetrics, ProcessIdentity,
     };
 
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn hit_testing_includes_top_left_and_excludes_bottom_right() {
         let regions = UiRegions::from_tabs([(Tab::Overview, Rect::new(10, 5, 8, 2))]);
@@ -784,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn implemented_screens_render_in_tiny_terminals() {
+    fn implemented_screens_use_the_warning_path_in_tiny_terminals() {
         for tab in [
             Tab::Overview,
             Tab::Processes,
@@ -798,13 +847,71 @@ mod tests {
             for (width, height) in [(1, 1), (2, 2), (10, 3)] {
                 let backend = TestBackend::new(width, height);
                 let mut terminal = Terminal::new(backend).unwrap();
-                terminal
-                    .draw(|frame| {
-                        render(frame, &app);
-                    })
-                    .unwrap();
+                assert!(rendered_regions_are_empty(&mut terminal, &app));
             }
         }
+    }
+
+    fn rendered_regions_are_empty(terminal: &mut Terminal<TestBackend>, app: &App) -> bool {
+        let mut empty = false;
+        terminal
+            .draw(|frame| {
+                empty = render(frame, app).tabs.is_empty();
+            })
+            .unwrap();
+        empty
+    }
+
+    #[test]
+    fn minimum_terminal_size_render_boundary_is_global() {
+        let app = App::default();
+        for (width, height) in [(39, 40), (40, 39), (39, 39)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            assert!(rendered_regions_are_empty(&mut terminal, &app));
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Terminal too small"));
+            assert!(text.contains(&format!("Current: {width}x{height}")));
+        }
+
+        let backend = TestBackend::new(40, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        assert!(!buffer_text(&terminal).contains("Terminal too small"));
+    }
+
+    #[test]
+    fn minimum_terminal_warning_is_safe_at_pathological_sizes() {
+        let app = App::default();
+        for (width, height) in [(1, 1), (1, 40), (40, 1), (2, 2)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            assert!(rendered_regions_are_empty(&mut terminal, &app));
+        }
+    }
+
+    #[test]
+    fn resize_transitions_clear_warning_and_normal_content() {
+        let app = App::default();
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        assert!(buffer_text(&terminal).contains("Processes"));
+
+        terminal.backend_mut().resize(39, 40);
+        terminal.autoresize().unwrap();
+        assert!(rendered_regions_are_empty(&mut terminal, &app));
+        let warning = buffer_text(&terminal);
+        assert!(warning.contains("Terminal too small"));
+        assert!(!warning.contains("Processes"));
+
+        terminal.backend_mut().resize(80, 40);
+        terminal.autoresize().unwrap();
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        let normal = buffer_text(&terminal);
+        assert!(normal.contains("Processes"));
+        assert!(!normal.contains("Terminal too small"));
     }
 
     #[test]
@@ -837,15 +944,7 @@ mod tests {
             app.update(Action::OverviewUpdated(metrics));
         }
 
-        for (width, height) in [
-            (180, 50),
-            (120, 35),
-            (80, 24),
-            (60, 18),
-            (39, 15),
-            (12, 6),
-            (1, 1),
-        ] {
+        for (width, height) in [(180, 50), (120, 40), (90, 40), (80, 40), (46, 60), (40, 40)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal

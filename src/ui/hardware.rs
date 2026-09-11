@@ -16,7 +16,11 @@ use crate::{
 
 use super::{format_bytes, layout};
 
-const DETAILED_CPU_CELL_WIDTH: usize = 18;
+const PREFERRED_CPU_CELL_WIDTH: usize = 22;
+const MIN_DETAILED_CPU_CELL_WIDTH: usize = 16;
+const MAX_DETAILED_CPU_COLUMNS: usize = 4;
+const MIN_USEFUL_CPU_GAUGE_WIDTH: usize = 6;
+const MAX_RAM_GAUGE_WIDTH: usize = 36;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CpuGridLayout {
@@ -77,8 +81,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(1),
         ),
     ];
-    let heights = allocate_section_heights(inner.height, desired);
-    let areas = vertical_areas(inner, heights);
+    let (heights, spacing) = allocate_section_heights(inner.height, desired);
+    let areas = vertical_areas(inner, heights, spacing);
 
     render_cpu(frame, app, inventory, metrics, grid, areas[0]);
     render_ram(frame, inventory, metrics, areas[1]);
@@ -86,13 +90,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_storage(frame, inventory, areas[3]);
 }
 
-fn allocate_section_heights(total: u16, desired: [u16; 4]) -> [u16; 4] {
+fn allocate_section_heights(total: u16, desired: [u16; 4]) -> ([u16; 4], u16) {
     let mut heights = [0; 4];
-    let mut remaining = total;
+    let spacing = u16::from(total >= 18);
+    let mut remaining = total.saturating_sub(spacing.saturating_mul(3));
 
     for height in &mut heights {
         if remaining == 0 {
-            return heights;
+            return (heights, 0);
         }
         *height = 1;
         remaining -= 1;
@@ -105,16 +110,20 @@ fn allocate_section_heights(total: u16, desired: [u16; 4]) -> [u16; 4] {
         heights[section] += addition;
         remaining -= addition;
     }
-    heights[3] = heights[3].saturating_add(remaining);
-    heights
+    (heights, spacing)
 }
 
-fn vertical_areas(area: Rect, heights: [u16; 4]) -> [Rect; 4] {
+fn vertical_areas(area: Rect, heights: [u16; 4], spacing: u16) -> [Rect; 4] {
     let mut y = area.y;
+    let mut index = 0;
     heights.map(|height| {
         let height = height.min(area.bottom().saturating_sub(y));
         let result = Rect::new(area.x, y, area.width, height);
         y = y.saturating_add(height);
+        if index < heights.len() - 1 && height > 0 {
+            y = y.saturating_add(spacing).min(area.bottom());
+        }
+        index += 1;
         result
     })
 }
@@ -191,14 +200,19 @@ fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize)
     }
 
     let needed_columns = count.div_ceil(max_rows);
-    let detailed_columns = (width / DETAILED_CPU_CELL_WIDTH).max(1).min(count);
+    let preferred_columns = (width / PREFERRED_CPU_CELL_WIDTH)
+        .clamp(1, MAX_DETAILED_CPU_COLUMNS)
+        .min(count);
+    let detailed_capacity = (width / MIN_DETAILED_CPU_CELL_WIDTH)
+        .clamp(1, MAX_DETAILED_CPU_COLUMNS)
+        .min(count);
     let dense_cell_width = format!("CPU{max_cpu_id}█100%").chars().count().max(8);
     let dense_columns = (width / dense_cell_width).max(1).min(count);
-    let dense = needed_columns > detailed_columns;
+    let dense = needed_columns > detailed_capacity;
     let columns = if dense {
-        dense_columns.max(detailed_columns)
+        dense_columns.max(detailed_capacity)
     } else {
-        detailed_columns
+        preferred_columns.max(needed_columns.min(detailed_capacity))
     };
     let visible = count.min(columns.saturating_mul(max_rows));
 
@@ -229,18 +243,28 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
                             format_percent(cpu.utilization_percent)
                         )
                     } else {
-                        format!(
-                            "CPU{:<3} {} {:>4}",
-                            cpu.id.index(),
-                            utilization_bar(cpu.utilization_percent, 5),
-                            format_percent(cpu.utilization_percent)
-                        )
+                        detailed_cpu_cell(cpu, cell_width)
                     };
                     pad_cell(&layout::truncate(&text, cell_width), cell_width)
                 })
                 .collect::<String>()
         })
         .collect()
+}
+
+fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize) -> String {
+    let label = format!("CPU{}", cpu.id.index());
+    let percent = format_percent(cpu.utilization_percent);
+    let percent_width = percent.chars().count().max(4);
+    let fixed_width = label.chars().count() + percent_width + 2;
+    let gauge_width = cell_width.saturating_sub(fixed_width);
+    if gauge_width < MIN_USEFUL_CPU_GAUGE_WIDTH {
+        return layout::truncate(&format!("{label} {percent}"), cell_width);
+    }
+    format!(
+        "{label} {} {percent:>4}",
+        utilization_bar(cpu.utilization_percent, gauge_width)
+    )
 }
 
 fn render_ram(
@@ -267,14 +291,7 @@ fn render_ram(
         );
         let usage_line = metrics.memory.map_or_else(
             || "Used  N/A".into(),
-            |memory| {
-                let percent = memory.percent();
-                format!(
-                    "Used  {}  {}",
-                    utilization_bar(Some(percent), 8),
-                    format_usage_compact(memory.used, memory.total, percent)
-                )
-            },
+            |memory| ram_usage_line(memory, width),
         );
         if area.height >= 3 {
             lines.push(Line::from(layout::truncate(&total_line, width)));
@@ -301,6 +318,23 @@ fn render_ram(
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn ram_usage_line(memory: crate::linux::ByteUsage, width: usize) -> String {
+    let percent = memory.percent();
+    let usage = format_usage_compact(memory.used, memory.total, percent);
+    let fixed_width = "Used  ".len() + 2 + usage.chars().count();
+    let gauge_width = width.saturating_sub(fixed_width).min(MAX_RAM_GAUGE_WIDTH);
+    if gauge_width < 4 {
+        return layout::truncate(&format!("Used  {usage}"), width);
+    }
+    layout::truncate(
+        &format!(
+            "Used  {}  {usage}",
+            utilization_bar(Some(percent), gauge_width)
+        ),
+        width,
+    )
 }
 
 fn render_gpu(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Rect) {
@@ -531,8 +565,8 @@ mod tests {
     #[test]
     fn twelve_logical_cpus_form_a_balanced_detailed_grid() {
         let grid = cpu_grid_layout(12, 11, 80, 6);
-        assert_eq!(grid.columns, 4);
-        assert_eq!(grid.rows, 3);
+        assert_eq!(grid.columns, 3);
+        assert_eq!(grid.rows, 4);
         assert_eq!(grid.visible, 12);
         assert!(!grid.dense);
     }
@@ -560,6 +594,7 @@ mod tests {
         assert_eq!(narrow.columns, 1);
         assert_eq!(narrow.rows, 4);
         assert_eq!(narrow.visible, 4);
+        assert!(narrow.visible < 12);
 
         assert_eq!(cpu_grid_layout(32, 31, 0, 10).visible, 0);
         assert_eq!(cpu_grid_layout(32, 31, 10, 0).visible, 0);
@@ -572,6 +607,45 @@ mod tests {
         assert_eq!(history_sparkline(samples.into_iter(), 4), "▅▆▇█");
         assert_eq!(history_sparkline(samples.into_iter(), 0), "");
         assert_eq!(history_sparkline([].into_iter(), 4), "—");
+    }
+
+    #[test]
+    fn wide_cpu_grid_caps_columns_and_provides_useful_gauges() {
+        let grid = cpu_grid_layout(12, 11, 120, 6);
+        assert_eq!(grid.columns, 4);
+        assert!(!grid.dense);
+
+        let cpus = (0..12)
+            .map(|index| LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(index),
+                utilization_percent: Some(48.0),
+            })
+            .collect::<Vec<_>>();
+        let lines = cpu_grid_lines(&cpus, 120, grid);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].matches(['█', '░']).count() >= 4 * MIN_USEFUL_CPU_GAUGE_WIDTH);
+        assert!(lines[2].contains("CPU10"));
+        assert!(lines[2].contains("CPU11"));
+    }
+
+    #[test]
+    fn medium_and_narrow_cpu_grids_prefer_readable_columns() {
+        assert_eq!(cpu_grid_layout(12, 11, 72, 6).columns, 3);
+        assert_eq!(cpu_grid_layout(12, 11, 44, 6).columns, 2);
+    }
+
+    #[test]
+    fn ram_gauge_expands_but_remains_bounded() {
+        let memory = crate::linux::ByteUsage {
+            used: 8 * 1024 * 1024 * 1024,
+            total: 32 * 1024 * 1024 * 1024,
+        };
+        let wide = ram_usage_line(memory, 100);
+        let narrow = ram_usage_line(memory, 32);
+
+        assert_eq!(wide.matches(['█', '░']).count(), MAX_RAM_GAUGE_WIDTH);
+        assert!(wide.chars().count() <= 100);
+        assert!(narrow.chars().count() <= 32);
     }
 
     #[test]
@@ -597,10 +671,28 @@ mod tests {
     }
 
     #[test]
+    fn long_storage_names_can_be_safely_truncated() {
+        let device = StorageDevice {
+            system_name: "nvme0n1".into(),
+            model: Some("A very long storage model name that exceeds the panel".into()),
+            capacity_bytes: Some(1_000_000_000_000),
+            kind: StorageKind::Nvme,
+        };
+        let line = layout::truncate(&format_storage_device("NVMe", 0, &device), 24);
+
+        assert_eq!(line.chars().count(), 24);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
     fn section_height_allocation_never_exceeds_the_available_area() {
         for height in 0..40 {
-            let allocated = allocate_section_heights(height, [20, 5, 4, 8]);
-            assert_eq!(allocated.into_iter().sum::<u16>(), height);
+            let (allocated, spacing) = allocate_section_heights(height, [20, 5, 4, 8]);
+            let used = allocated.into_iter().sum::<u16>() + spacing * 3;
+            assert!(used <= height);
+            if height >= 18 {
+                assert_eq!(spacing, 1);
+            }
         }
     }
 }
