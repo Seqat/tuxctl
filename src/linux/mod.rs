@@ -5,6 +5,8 @@ mod overview;
 mod process;
 mod service;
 
+#[cfg(test)]
+pub(crate) use hardware::NetworkDevice;
 pub use hardware::{
     GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
 };

@@ -73,7 +73,7 @@ pub struct StorageDevice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkDevice {
     pub interface_name: String,
-    pub model: String,
+    pub model: Option<String>,
 }
 
 pub struct HardwareCollector {
@@ -119,9 +119,9 @@ fn discover_network_devices(root: &Path) -> Vec<NetworkDevice> {
         .filter_map(|interface| {
             let interface_name = interface.file_name()?.to_str()?.to_owned();
             let device = fs::canonicalize(interface.join("device")).ok()?;
-            discover_nic_model(&device).map(|model| NetworkDevice {
+            Some(NetworkDevice {
                 interface_name,
-                model,
+                model: discover_nic_model(&device),
             })
         })
         .collect()
@@ -592,6 +592,25 @@ mod tests {
         fs::remove_file(root.join("manufacturer")).unwrap();
         fs::remove_file(root.join("product")).unwrap();
         assert_eq!(discover_nic_model(&root), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_nic_without_model_is_retained() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("physical-nic");
+        let devices = root.join("devices");
+        let interfaces = root.join("net");
+        fs::create_dir_all(&devices).unwrap();
+        fs::create_dir_all(interfaces.join("enp6s0")).unwrap();
+        symlink(&devices, interfaces.join("enp6s0/device")).unwrap();
+
+        let discovered = discover_network_devices(&interfaces);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].interface_name, "enp6s0");
+        assert_eq!(discovered[0].model, None);
 
         let _ = fs::remove_dir_all(root);
     }

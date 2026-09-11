@@ -61,9 +61,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         grid_row_budget,
     );
 
-    let network_count = app.network_count();
+    let network_count = overview_network_interfaces(app.networks(), inventory).len();
     let desired = [
-        4_u16
+        6_u16
             .saturating_add(u16::try_from(grid.rows).unwrap_or(u16::MAX))
             .saturating_add(u16::from(grid.visible < cpu_count)),
         2_u16.saturating_add(
@@ -147,16 +147,26 @@ fn render_cpu(
         return;
     }
     let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    let grid_lines = cpu_grid_lines(&metrics.logical_cpus, width, grid);
+    let has_overflow = grid.visible < metrics.logical_cpus.len();
+    let content_height = 4_usize
+        .saturating_add(grid_lines.len())
+        .saturating_add(usize::from(has_overflow));
+    let spacing = height.saturating_sub(content_height).min(2);
     let mut lines = vec![section_heading("CPU")];
 
-    if lines.len() < usize::from(area.height) {
+    if lines.len() < height {
         let model = inventory
             .and_then(|inventory| inventory.cpus.first())
             .map(|cpu| cpu.model.as_str())
             .unwrap_or("Discovering hardware…");
         lines.push(Line::from(layout::truncate(model, width)));
     }
-    if lines.len() < usize::from(area.height) {
+    if spacing >= 1 && lines.len() < height {
+        lines.push(Line::from(""));
+    }
+    if lines.len() < height {
         let percent = format_percent(metrics.cpu_percent);
         let prefix = format!("Util  {percent:>4}  ");
         let history_width = width.saturating_sub(prefix.chars().count());
@@ -166,7 +176,7 @@ fn render_cpu(
             width,
         )));
     }
-    if lines.len() < usize::from(area.height) {
+    if lines.len() < height {
         let load = metrics.load_average.map_or_else(
             || "Load  1m N/A  5m N/A  15m N/A".into(),
             |load| {
@@ -178,15 +188,13 @@ fn render_cpu(
         );
         lines.push(Line::from(layout::truncate(&load, width)));
     }
+    if spacing >= 2 && lines.len() < height {
+        lines.push(Line::from(""));
+    }
 
-    let remaining = usize::from(area.height).saturating_sub(lines.len());
-    lines.extend(
-        cpu_grid_lines(&metrics.logical_cpus, width, grid)
-            .into_iter()
-            .take(remaining)
-            .map(Line::from),
-    );
-    if grid.visible < metrics.logical_cpus.len() && lines.len() < usize::from(area.height) {
+    let remaining = height.saturating_sub(lines.len());
+    lines.extend(grid_lines.into_iter().take(remaining).map(Line::from));
+    if has_overflow && lines.len() < height {
         lines.push(Line::from(format!(
             "… {} more logical CPUs",
             metrics.logical_cpus.len() - grid.visible
@@ -328,15 +336,16 @@ fn render_ram(
 
 fn ram_usage_line(memory: crate::linux::ByteUsage, width: usize) -> String {
     let percent = memory.percent();
-    let usage = format_usage_compact(memory.used, memory.total, percent);
-    let fixed_width = "Used  ".len() + 2 + usage.chars().count();
+    let percent_text = format!("{percent:.0}%");
+    let usage = format_usage_compact(memory.used, memory.total);
+    let fixed_width = "Used  ".len() + percent_text.chars().count() + 4 + usage.chars().count();
     let gauge_width = width.saturating_sub(fixed_width).min(MAX_RAM_GAUGE_WIDTH);
     if gauge_width < 4 {
-        return layout::truncate(&format!("Used  {usage}"), width);
+        return layout::truncate(&format!("Used  {percent_text}  {usage}"), width);
     }
     layout::truncate(
         &format!(
-            "Used  {}  {usage}",
+            "Used  {percent_text}  {}  {usage}",
             utilization_bar(Some(percent), gauge_width)
         ),
         width,
@@ -443,34 +452,84 @@ fn render_network(frame: &mut Frame, app: &App, inventory: Option<&HardwareInven
             "No interfaces found"
         }));
     } else {
-        let show_overflow = app.network_count() > MAX_NETWORK_INTERFACES && remaining > 1;
-        let interface_limit = app
-            .network_count()
+        let interfaces = overview_network_interfaces(app.networks(), inventory);
+        if interfaces.is_empty() {
+            lines.push(Line::from("No hardware interfaces found"));
+            frame.render_widget(Paragraph::new(lines), area);
+            return;
+        }
+        let show_overflow = interfaces.len() > MAX_NETWORK_INTERFACES && remaining > 1;
+        let interface_limit = interfaces
+            .len()
             .min(MAX_NETWORK_INTERFACES)
             .min(remaining.saturating_sub(usize::from(show_overflow)));
-        lines.extend(
-            app.networks()
-                .iter()
-                .take(interface_limit)
-                .map(|interface| {
-                    let model = inventory.and_then(|inventory| {
-                        inventory
-                            .network_devices
-                            .iter()
-                            .find(|device| device.interface_name == interface.name)
-                            .map(|device| device.model.as_str())
-                    });
-                    network_summary_line(interface, model, width)
-                }),
-        );
+        lines.extend(interfaces.iter().take(interface_limit).map(|interface| {
+            let model = inventory.and_then(|inventory| {
+                inventory
+                    .network_devices
+                    .iter()
+                    .find(|device| device.interface_name == interface.name)
+                    .and_then(|device| device.model.as_deref())
+            });
+            network_summary_line(interface, model, width)
+        }));
         if show_overflow {
             lines.push(Line::from(format!(
                 "… {} more interfaces",
-                app.network_count() - interface_limit
+                interfaces.len() - interface_limit
             )));
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn overview_network_interfaces<'a>(
+    interfaces: &'a [NetworkInterfaceInfo],
+    inventory: Option<&HardwareInventory>,
+) -> Vec<&'a NetworkInterfaceInfo> {
+    let is_physical = |name: &str| {
+        inventory.is_some_and(|inventory| {
+            inventory
+                .network_devices
+                .iter()
+                .any(|device| device.interface_name == name)
+        })
+    };
+    let mut relevant = interfaces
+        .iter()
+        .filter(|interface| is_physical(&interface.name) || !is_noisy_network_name(&interface.name))
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|interface| !is_physical(&interface.name));
+    relevant
+}
+
+fn is_noisy_network_name(name: &str) -> bool {
+    name == "lo"
+        || [
+            "docker",
+            "veth",
+            "br-",
+            "virbr",
+            "cni",
+            "flannel",
+            "cali",
+            "kube",
+            "vboxnet",
+            "vmnet",
+            "tun",
+            "tap",
+            "wg",
+            "tailscale",
+            "sit",
+            "ip6tnl",
+            "gre",
+            "gretap",
+            "erspan",
+            "geneve",
+            "vxlan",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn network_summary_line(
@@ -622,12 +681,8 @@ fn format_percent(percent: Option<f64>) -> String {
         .unwrap_or_else(|| "N/A".into())
 }
 
-fn format_usage_compact(used: u64, total: u64, percent: f64) -> String {
-    format!(
-        "{} / {}  {percent:.0}%",
-        format_bytes(used),
-        format_bytes(total)
-    )
+fn format_usage_compact(used: u64, total: u64) -> String {
+    format!("{} / {}", format_bytes(used), format_bytes(total))
 }
 
 fn pad_cell(text: &str, width: usize) -> String {
@@ -788,6 +843,48 @@ mod tests {
     }
 
     #[test]
+    fn cpu_summary_uses_available_vertical_breathing_room() {
+        let mut app = App::default();
+        app.update(crate::action::Action::OverviewUpdated(OverviewMetrics {
+            cpu_percent: Some(12.0),
+            logical_cpus: vec![LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(0),
+                utilization_percent: Some(8.0),
+            }],
+            ..OverviewMetrics::default()
+        }));
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_cpu(
+                    frame,
+                    &app,
+                    None,
+                    app.overview(),
+                    cpu_grid_layout(1, 0, 60, 1),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert!(rows[0].starts_with("CPU"));
+        assert!(rows[1].starts_with("Discovering hardware"));
+        assert!(rows[2].trim().is_empty());
+        assert!(rows[3].starts_with("Util"));
+        assert!(rows[4].starts_with("Load"));
+        assert!(rows[5].trim().is_empty());
+        assert!(rows[6].starts_with("CPU0"));
+    }
+
+    #[test]
     fn wide_cpu_grid_caps_columns_and_provides_useful_gauges() {
         let grid = cpu_grid_layout(12, 11, 120, 6);
         assert_eq!(grid.columns, 4);
@@ -875,8 +972,14 @@ mod tests {
         let narrow = ram_usage_line(memory, 32);
 
         assert_eq!(wide.matches(['█', '░']).count(), MAX_RAM_GAUGE_WIDTH);
+        let percent = wide.find("25%").unwrap();
+        let gauge = wide.find(['█', '░']).unwrap();
+        let values = wide.find("8.0 GiB / 32.0 GiB").unwrap();
+        assert!(percent < gauge);
+        assert!(gauge < values);
         assert!(wide.chars().count() <= 100);
         assert!(narrow.chars().count() <= 32);
+        assert!(narrow.starts_with("Used  25%"));
     }
 
     #[test]
@@ -944,6 +1047,32 @@ mod tests {
         assert!(text.contains('…'));
         assert!(text.contains("● up"));
         assert!(text.contains("RX"));
+    }
+
+    #[test]
+    fn network_summary_prefers_physical_interfaces_and_filters_noise() {
+        let interfaces = [
+            test_interface("docker0", OperState::Up),
+            test_interface("wlp5s0", OperState::Down),
+            test_interface("veth1234", OperState::Up),
+            test_interface("enp6s0", OperState::Up),
+            test_interface("lo", OperState::Unknown),
+        ];
+        let inventory = HardwareInventory {
+            network_devices: vec![crate::linux::NetworkDevice {
+                interface_name: "enp6s0".into(),
+                model: None,
+            }],
+            ..HardwareInventory::default()
+        };
+
+        let selected = overview_network_interfaces(&interfaces, Some(&inventory));
+        let names = selected
+            .iter()
+            .map(|interface| interface.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["enp6s0", "wlp5s0"]);
     }
 
     #[test]
