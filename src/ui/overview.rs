@@ -23,28 +23,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    render_status(frame, sections[0]);
-
-    let areas = overview_areas(sections[1]);
+    let areas = overview_areas(area);
     render_system(frame, app, areas.system);
     hardware::render(frame, app, areas.hardware);
-}
-
-fn render_status(frame: &mut Frame, area: Rect) {
-    let text = if area.width >= 75 {
-        " System & Hardware Dashboard"
-    } else if area.width >= 54 {
-        " System & Hardware Dashboard   ? Help"
-    } else if area.width >= 28 {
-        " System + Hardware   ? Help"
-    } else {
-        " Overview   ?"
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
-        area,
-    );
 }
 
 fn overview_areas(area: Rect) -> OverviewAreas {

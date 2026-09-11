@@ -548,16 +548,16 @@ fn render_tabs(
 
 fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     let active_tab = app.active_tab();
+    if active_tab == Tab::Overview {
+        overview::render(frame, app, area);
+        return ContentRender::None;
+    }
+
     let block = Block::default()
         .borders(Borders::TOP)
         .title(format!(" {} ", active_tab.label()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if active_tab == Tab::Overview {
-        overview::render(frame, app, inner);
-        return ContentRender::None;
-    }
 
     if active_tab == Tab::Processes {
         return ContentRender::Processes(processes::render(frame, app, inner));
@@ -961,7 +961,51 @@ mod tests {
                     render(frame, &app);
                 })
                 .unwrap();
+
+            let buffer = buffer_text(&terminal);
+            assert!(!buffer.contains("Dashboard"));
+
+            let rows = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>();
+
+            // Row 0 is outer border, Row 1 is tab bar, Row 2 begins System content directly below tabs.
+            assert!(rows[1].contains("Overview"));
+            assert!(rows[2].contains("System"));
+            assert!(!rows[2].contains("Overview"));
+            assert!(!rows[2].trim().is_empty());
+            assert!(!rows[3].trim().is_empty());
+
+            let content_width = width.saturating_sub(2);
+            if content_width >= 90 {
+                assert!(rows[2].contains("Hardware"));
+            } else {
+                assert!(rows.iter().skip(3).any(|row| row.contains("Hardware")));
+            }
         }
+
+        // Confirm other screens preserve their content header
+        let mut proc_app = App::default();
+        proc_app.update(Action::SelectTab(Tab::Processes));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &proc_app);
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows[2].contains("Processes"));
     }
 
     #[test]
