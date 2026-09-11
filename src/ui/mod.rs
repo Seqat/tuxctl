@@ -1014,6 +1014,7 @@ mod tests {
                     command: Some("/bin/testproc".into()),
                     state: "R (running)".into(),
                     parent_pid: 1,
+                    state_code: 'R',
                     start_time: 100,
                 }],
                 error: None,

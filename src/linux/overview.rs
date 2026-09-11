@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs, io,
     mem::MaybeUninit,
@@ -11,14 +12,41 @@ const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
 const PROC_UPTIME: &str = "/proc/uptime";
 const PROC_LOADAVG: &str = "/proc/loadavg";
+const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
+const PROC_KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverviewMetrics {
     pub cpu_percent: Option<f64>,
+    pub logical_cpus: Vec<LogicalCpuMetrics>,
     pub memory: Option<ByteUsage>,
     pub uptime: Option<Duration>,
     pub load_average: Option<LoadAverage>,
     pub root_filesystem: Option<ByteUsage>,
+    pub system_identity: SystemIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogicalCpuMetrics {
+    pub id: LogicalCpuId,
+    pub utilization_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogicalCpuId(u32);
+
+impl LogicalCpuId {
+    // Consumed by the Overview v2 rendering phase.
+    #[allow(dead_code)]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemIdentity {
+    pub hostname: Option<String>,
+    pub kernel_release: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +85,11 @@ impl OverviewCollector {
         let worker = thread::Builder::new()
             .name("overview-metrics".into())
             .spawn(move || {
-                let mut previous_cpu = None;
+                let identity = collect_system_identity();
+                let mut sampler = OverviewSampler::new(identity);
 
                 loop {
-                    if metrics_tx.send(collect(&mut previous_cpu)).is_err() {
+                    if metrics_tx.send(sampler.collect()).is_err() {
                         break;
                     }
 
@@ -98,37 +127,84 @@ struct CpuTimes {
     total: u64,
 }
 
-fn collect(previous_cpu: &mut Option<CpuTimes>) -> OverviewMetrics {
-    let current_cpu = fs::read_to_string(PROC_STAT)
-        .ok()
-        .and_then(|contents| parse_cpu_times(&contents));
-    let cpu_percent = (*previous_cpu)
-        .zip(current_cpu)
-        .and_then(|(previous, current)| cpu_utilization(previous, current));
-    if current_cpu.is_some() {
-        *previous_cpu = current_cpu;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CpuSample {
+    aggregate: CpuTimes,
+    logical: BTreeMap<LogicalCpuId, CpuTimes>,
+}
+
+struct OverviewSampler {
+    previous_cpu: Option<CpuSample>,
+    system_identity: SystemIdentity,
+}
+
+impl OverviewSampler {
+    fn new(system_identity: SystemIdentity) -> Self {
+        Self {
+            previous_cpu: None,
+            system_identity,
+        }
     }
 
-    OverviewMetrics {
-        cpu_percent,
-        memory: fs::read_to_string(PROC_MEMINFO)
+    fn collect(&mut self) -> OverviewMetrics {
+        let current_cpu = fs::read_to_string(PROC_STAT)
             .ok()
-            .and_then(|contents| parse_memory_usage(&contents)),
-        uptime: fs::read_to_string(PROC_UPTIME)
-            .ok()
-            .and_then(|contents| parse_uptime(&contents)),
-        load_average: fs::read_to_string(PROC_LOADAVG)
-            .ok()
-            .and_then(|contents| parse_load_average(&contents)),
-        root_filesystem: filesystem_usage("/").ok(),
+            .and_then(|contents| parse_cpu_sample(&contents));
+        let (cpu_percent, logical_cpus) = current_cpu.as_ref().map_or_else(
+            || (None, Vec::new()),
+            |current| cpu_metrics(self.previous_cpu.as_ref(), current),
+        );
+        if current_cpu.is_some() {
+            self.previous_cpu = current_cpu;
+        }
+
+        OverviewMetrics {
+            cpu_percent,
+            logical_cpus,
+            memory: fs::read_to_string(PROC_MEMINFO)
+                .ok()
+                .and_then(|contents| parse_memory_usage(&contents)),
+            uptime: fs::read_to_string(PROC_UPTIME)
+                .ok()
+                .and_then(|contents| parse_uptime(&contents)),
+            load_average: fs::read_to_string(PROC_LOADAVG)
+                .ok()
+                .and_then(|contents| parse_load_average(&contents)),
+            root_filesystem: filesystem_usage("/").ok(),
+            system_identity: self.system_identity.clone(),
+        }
     }
 }
 
-fn parse_cpu_times(contents: &str) -> Option<CpuTimes> {
-    let line = contents.lines().find(|line| line.starts_with("cpu "))?;
-    let values = line
-        .split_whitespace()
-        .skip(1)
+fn parse_cpu_sample(contents: &str) -> Option<CpuSample> {
+    let mut aggregate = None;
+    let mut logical = BTreeMap::new();
+
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(label) = fields.next() else {
+            continue;
+        };
+        if label == "cpu" {
+            aggregate = parse_cpu_times(fields);
+        } else if let Some(index) = label
+            .strip_prefix("cpu")
+            .and_then(|index| index.parse::<u32>().ok())
+        {
+            if let Some(times) = parse_cpu_times(fields) {
+                logical.insert(LogicalCpuId(index), times);
+            }
+        }
+    }
+
+    Some(CpuSample {
+        aggregate: aggregate?,
+        logical,
+    })
+}
+
+fn parse_cpu_times<'a>(fields: impl Iterator<Item = &'a str>) -> Option<CpuTimes> {
+    let values = fields
         .take(8)
         .map(str::parse::<u64>)
         .collect::<Result<Vec<_>, _>>()
@@ -143,6 +219,26 @@ fn parse_cpu_times(contents: &str) -> Option<CpuTimes> {
     let idle = values[3].checked_add(values.get(4).copied().unwrap_or(0))?;
 
     Some(CpuTimes { idle, total })
+}
+
+fn cpu_metrics(
+    previous: Option<&CpuSample>,
+    current: &CpuSample,
+) -> (Option<f64>, Vec<LogicalCpuMetrics>) {
+    let aggregate =
+        previous.and_then(|previous| cpu_utilization(previous.aggregate, current.aggregate));
+    let logical = current
+        .logical
+        .iter()
+        .map(|(&id, &times)| LogicalCpuMetrics {
+            id,
+            utilization_percent: previous
+                .and_then(|previous| previous.logical.get(&id))
+                .and_then(|&previous| cpu_utilization(previous, times)),
+        })
+        .collect();
+
+    (aggregate, logical)
 }
 
 fn cpu_utilization(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
@@ -198,6 +294,20 @@ fn parse_load_average(contents: &str) -> Option<LoadAverage> {
     })
 }
 
+fn collect_system_identity() -> SystemIdentity {
+    SystemIdentity {
+        hostname: read_trimmed(PROC_HOSTNAME),
+        kernel_release: read_trimmed(PROC_KERNEL_RELEASE),
+    }
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 fn filesystem_usage(path: &str) -> io::Result<ByteUsage> {
     let path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a null byte"))?;
@@ -236,12 +346,105 @@ mod tests {
         let contents = "cpu  100 20 30 400 50 6 7 8 9 10\ncpu0 1 2 3 4\n";
 
         assert_eq!(
-            parse_cpu_times(contents),
+            parse_cpu_sample(contents).map(|sample| sample.aggregate),
             Some(CpuTimes {
                 idle: 450,
                 total: 621,
             })
         );
+    }
+
+    #[test]
+    fn parses_stable_logical_cpu_identifiers_and_skips_malformed_rows() {
+        let contents = concat!(
+            "cpu  100 0 50 850 0 0 0 0\n",
+            "cpu2 20 0 10 170 0 0 0 0\n",
+            "cpu0 10 0 5 85 0 0 0 0\n",
+            "cpu1 malformed\n",
+            "cpuX 1 2 3 4\n",
+            "intr 100\n",
+        );
+
+        let sample = parse_cpu_sample(contents).unwrap();
+        let ids = sample
+            .logical
+            .keys()
+            .map(|id| id.index())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![0, 2]);
+    }
+
+    #[test]
+    fn calculates_each_logical_cpu_from_matching_counter_deltas() {
+        let previous = parse_cpu_sample(concat!(
+            "cpu 100 0 0 100 0 0 0 0\n",
+            "cpu0 40 0 0 60 0 0 0 0\n",
+            "cpu1 60 0 0 40 0 0 0 0\n",
+        ))
+        .unwrap();
+        let current = parse_cpu_sample(concat!(
+            "cpu 160 0 0 140 0 0 0 0\n",
+            "cpu0 70 0 0 70 0 0 0 0\n",
+            "cpu1 90 0 0 70 0 0 0 0\n",
+        ))
+        .unwrap();
+
+        let (aggregate, logical) = cpu_metrics(Some(&previous), &current);
+
+        assert_eq!(aggregate, Some(60.0));
+        assert_eq!(logical.len(), 2);
+        assert_eq!(logical[0].id.index(), 0);
+        assert_eq!(logical[0].utilization_percent, Some(75.0));
+        assert_eq!(logical[1].id.index(), 1);
+        assert_eq!(logical[1].utilization_percent, Some(50.0));
+    }
+
+    #[test]
+    fn first_cpu_sample_has_identities_without_invented_utilization() {
+        let current = parse_cpu_sample(concat!(
+            "cpu 100 0 0 100\n",
+            "cpu0 40 0 0 60\n",
+            "cpu1 60 0 0 40\n",
+        ))
+        .unwrap();
+
+        let (aggregate, logical) = cpu_metrics(None, &current);
+
+        assert_eq!(aggregate, None);
+        assert_eq!(logical.len(), 2);
+        assert!(logical.iter().all(|cpu| cpu.utilization_percent.is_none()));
+    }
+
+    #[test]
+    fn logical_cpu_appearance_and_disappearance_are_nonfatal() {
+        let previous = parse_cpu_sample(concat!(
+            "cpu 100 0 0 100\n",
+            "cpu0 40 0 0 60\n",
+            "cpu1 60 0 0 40\n",
+        ))
+        .unwrap();
+        let current = parse_cpu_sample(concat!(
+            "cpu 160 0 0 140\n",
+            "cpu1 90 0 0 70\n",
+            "cpu3 10 0 0 90\n",
+        ))
+        .unwrap();
+
+        let (_, logical) = cpu_metrics(Some(&previous), &current);
+
+        assert_eq!(logical.len(), 2);
+        assert_eq!(logical[0].id.index(), 1);
+        assert_eq!(logical[0].utilization_percent, Some(50.0));
+        assert_eq!(logical[1].id.index(), 3);
+        assert_eq!(logical[1].utilization_percent, None);
+    }
+
+    #[test]
+    fn rejects_missing_or_incomplete_aggregate_cpu_data() {
+        assert_eq!(parse_cpu_sample("cpu0 1 2 3 4\n"), None);
+        assert_eq!(parse_cpu_sample("cpu 1 2 3\ncpu0 1 2 3 4\n"), None);
+        assert_eq!(parse_cpu_sample("cpu 1 bad 3 4\n"), None);
     }
 
     #[test]

@@ -10,11 +10,14 @@ pub use hardware::{
 };
 pub use journal::{JournalBatch, JournalCollector, JournalEntry};
 pub use network::{NetworkCollector, NetworkInterfaceInfo, NetworkSnapshot, OperState};
-pub use overview::{ByteUsage, OverviewCollector, OverviewMetrics};
+#[allow(unused_imports)]
+pub use overview::{
+    ByteUsage, LogicalCpuId, LogicalCpuMetrics, OverviewCollector, OverviewMetrics, SystemIdentity,
+};
 #[cfg(test)]
 pub use process::verify_and_send_signal_at;
 pub use process::{
     send_process_signal, ProcessCollector, ProcessIdentity, ProcessInfo, ProcessSignal,
-    ProcessSignalError, ProcessSnapshot,
+    ProcessSignalError, ProcessSnapshot, ProcessSummary,
 };
 pub use service::{ServiceCollector, ServiceInfo, ServiceSnapshot};

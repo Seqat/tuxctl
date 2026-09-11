@@ -7,7 +7,7 @@ use crate::{
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
         NetworkSnapshot, OverviewMetrics, ProcessIdentity, ProcessInfo, ProcessSignal,
-        ProcessSignalError, ProcessSnapshot, ServiceInfo, ServiceSnapshot,
+        ProcessSignalError, ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceSnapshot,
     },
 };
 
@@ -15,6 +15,7 @@ use crate::{
 use crate::linux::verify_and_send_signal_at;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
+const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -25,13 +26,48 @@ pub struct ProcessSignalConfirmation {
 }
 
 #[derive(Debug)]
+pub struct AggregateCpuHistory {
+    samples: VecDeque<f64>,
+}
+
+impl Default for AggregateCpuHistory {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(AGGREGATE_CPU_HISTORY_CAPACITY),
+        }
+    }
+}
+
+impl AggregateCpuHistory {
+    fn push(&mut self, utilization_percent: f64) -> bool {
+        if !utilization_percent.is_finite() {
+            return false;
+        }
+        if self.samples.len() == AGGREGATE_CPU_HISTORY_CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples
+            .push_back(utilization_percent.clamp(0.0, 100.0));
+        true
+    }
+
+    // Consumed by the Overview v2 rendering phase.
+    #[allow(dead_code)]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = f64> + '_ {
+        self.samples.iter().copied()
+    }
+}
+
+#[derive(Debug)]
 pub struct App {
     should_quit: bool,
     active_tab: Tab,
     help_visible: bool,
     overview: OverviewMetrics,
     hardware: Option<HardwareInventory>,
+    aggregate_cpu_history: AggregateCpuHistory,
     processes: Vec<ProcessInfo>,
+    process_summary: ProcessSummary,
     filtered_processes: Vec<usize>,
     selected_process: Option<ProcessIdentity>,
     process_scroll: usize,
@@ -83,7 +119,9 @@ impl Default for App {
             help_visible: false,
             overview: OverviewMetrics::default(),
             hardware: None,
+            aggregate_cpu_history: AggregateCpuHistory::default(),
             processes: Vec::new(),
+            process_summary: ProcessSummary::default(),
             filtered_processes: Vec::new(),
             selected_process: None,
             process_scroll: 0,
@@ -146,6 +184,12 @@ impl App {
         &self.overview
     }
 
+    // Consumed by the Overview v2 rendering phase.
+    #[allow(dead_code)]
+    pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
+        &self.aggregate_cpu_history
+    }
+
     pub fn hardware(&self) -> Option<&HardwareInventory> {
         self.hardware.as_ref()
     }
@@ -182,6 +226,12 @@ impl App {
 
     pub fn process_count(&self) -> usize {
         self.filtered_processes.len()
+    }
+
+    // Consumed by the Overview v2 rendering phase.
+    #[allow(dead_code)]
+    pub fn process_summary(&self) -> ProcessSummary {
+        self.process_summary
     }
 
     pub fn process_at(&self, index: usize) -> Option<&ProcessInfo> {
@@ -390,12 +440,14 @@ impl App {
                 false
             }
             Action::OverviewUpdated(metrics) => {
-                if self.overview == metrics {
-                    false
-                } else {
+                let history_changed = metrics
+                    .cpu_percent
+                    .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
+                let metrics_changed = self.overview != metrics;
+                if metrics_changed {
                     self.overview = metrics;
-                    self.active_tab == Tab::Overview
                 }
+                self.active_tab == Tab::Overview && (metrics_changed || history_changed)
             }
             Action::HardwareDiscovered(hardware) => {
                 if self.hardware.as_ref() == Some(&hardware) {
@@ -601,6 +653,7 @@ impl App {
 
     fn update_processes(&mut self, snapshot: ProcessSnapshot) -> bool {
         let visible = self.active_tab == Tab::Processes;
+        let summary = snapshot.summary();
         if let Some(error) = snapshot.error {
             if self.process_error.as_ref() == Some(&error) {
                 return false;
@@ -616,6 +669,7 @@ impl App {
         let previous_index = self.selected_process_index().unwrap_or(0);
         let previous_selection = self.selected_process;
         self.processes = snapshot.processes;
+        self.process_summary = summary;
         self.process_error = None;
         self.rebuild_process_filter();
 
@@ -1568,6 +1622,7 @@ mod tests {
             command: Some(format!("/usr/bin/{name}")),
             state: "S (sleeping)".into(),
             parent_pid: 1,
+            state_code: 'S',
             start_time: u64::from(pid),
         }
     }
@@ -2476,6 +2531,49 @@ mod tests {
         let proc_redraw_active =
             app.update(Action::ProcessesUpdated(processes(vec![process(2, "new")])));
         assert!(proc_redraw_active);
+    }
+
+    #[test]
+    fn aggregate_cpu_history_is_bounded_and_evicts_oldest_samples() {
+        let mut app = App::default();
+        let sample_count = AGGREGATE_CPU_HISTORY_CAPACITY + 5;
+
+        for sample in 0..sample_count {
+            app.update(Action::OverviewUpdated(OverviewMetrics {
+                cpu_percent: Some(sample as f64),
+                ..Default::default()
+            }));
+        }
+
+        let history = app.aggregate_cpu_history().iter().collect::<Vec<_>>();
+        assert_eq!(history.len(), AGGREGATE_CPU_HISTORY_CAPACITY);
+        assert_eq!(history.first(), Some(&5.0));
+        assert_eq!(history.last(), Some(&64.0));
+    }
+
+    #[test]
+    fn process_summary_is_cached_from_process_snapshots() {
+        let mut app = App::default();
+        let mut running = process(1, "running");
+        running.state = "R (running)".into();
+        running.state_code = 'R';
+        let mut zombie = process(2, "zombie");
+        zombie.state = "Z (zombie)".into();
+        zombie.state_code = 'Z';
+
+        assert!(!app.update(Action::ProcessesUpdated(processes(vec![
+            running,
+            zombie,
+            process(3, "sleeping"),
+        ]))));
+        assert_eq!(
+            app.process_summary(),
+            ProcessSummary {
+                total: 3,
+                running: 1,
+                zombies: 1,
+            }
+        );
     }
 
     #[test]

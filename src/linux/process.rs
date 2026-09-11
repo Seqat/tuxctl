@@ -18,6 +18,7 @@ pub struct ProcessInfo {
     pub command: Option<String>,
     pub state: String,
     pub parent_pid: u32,
+    pub(crate) state_code: char,
     pub(crate) start_time: u64,
 }
 
@@ -163,6 +164,31 @@ pub struct ProcessSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessSummary {
+    pub total: usize,
+    pub running: usize,
+    pub zombies: usize,
+}
+
+impl ProcessSnapshot {
+    pub fn summary(&self) -> ProcessSummary {
+        ProcessSummary {
+            total: self.processes.len(),
+            running: self
+                .processes
+                .iter()
+                .filter(|process| process.state_code == 'R')
+                .count(),
+            zombies: self
+                .processes
+                .iter()
+                .filter(|process| process.state_code == 'Z')
+                .count(),
+        }
+    }
+}
+
 pub struct ProcessCollector {
     receiver: Receiver<ProcessSnapshot>,
     stop: Sender<()>,
@@ -276,6 +302,7 @@ impl ProcessSampler {
                 command: process.command,
                 state: process_state(process.state).into(),
                 parent_pid: process.parent_pid,
+                state_code: process.state,
                 start_time: process.start_time,
             });
         }
@@ -465,6 +492,39 @@ mod tests {
         assert_eq!(process_cpu_percent(100, 125, 200, 4), Some(50.0));
         assert_eq!(process_cpu_percent(100, 125, 0, 4), None);
         assert_eq!(process_cpu_percent(125, 100, 200, 4), None);
+    }
+
+    #[test]
+    fn derives_process_summary_from_collected_state_codes() {
+        let process = |pid, state_code| ProcessInfo {
+            pid,
+            name: format!("process-{pid}"),
+            cpu_percent: None,
+            memory_bytes: 0,
+            command: None,
+            state: process_state(state_code).into(),
+            parent_pid: 1,
+            state_code,
+            start_time: u64::from(pid),
+        };
+        let snapshot = ProcessSnapshot {
+            processes: vec![
+                process(1, 'R'),
+                process(2, 'S'),
+                process(3, 'R'),
+                process(4, 'Z'),
+            ],
+            error: None,
+        };
+
+        assert_eq!(
+            snapshot.summary(),
+            ProcessSummary {
+                total: 4,
+                running: 2,
+                zombies: 1,
+            }
+        );
     }
 
     #[test]
