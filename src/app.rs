@@ -6,8 +6,8 @@ use crate::{
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
-        NetworkSnapshot, OverviewMetrics, ProcessIdentity, ProcessInfo, ProcessSignal,
-        ProcessSignalError, ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceSnapshot,
+        NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
+        ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceSnapshot, SystemMetrics,
     },
 };
 
@@ -61,7 +61,7 @@ pub struct App {
     should_quit: bool,
     active_tab: Tab,
     help_visible: bool,
-    overview: OverviewMetrics,
+    system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
     aggregate_cpu_history: AggregateCpuHistory,
     processes: Vec<ProcessInfo>,
@@ -115,7 +115,7 @@ impl Default for App {
             should_quit: false,
             active_tab: Tab::Overview,
             help_visible: false,
-            overview: OverviewMetrics::default(),
+            system_metrics: SystemMetrics::default(),
             hardware: None,
             aggregate_cpu_history: AggregateCpuHistory::default(),
             processes: Vec::new(),
@@ -178,8 +178,8 @@ impl App {
         self.help_visible
     }
 
-    pub fn overview(&self) -> &OverviewMetrics {
-        &self.overview
+    pub fn system_metrics(&self) -> &SystemMetrics {
+        &self.system_metrics
     }
 
     pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
@@ -437,15 +437,16 @@ impl App {
                 self.should_quit = true;
                 false
             }
-            Action::OverviewUpdated(metrics) => {
-                let process_metrics_changed = self.overview.cpu_percent != metrics.cpu_percent
-                    || self.overview.memory != metrics.memory;
+            Action::SystemMetricsUpdated(metrics) => {
+                let process_metrics_changed = self.system_metrics.cpu_percent
+                    != metrics.cpu_percent
+                    || self.system_metrics.memory != metrics.memory;
                 let history_changed = metrics
                     .cpu_percent
                     .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
-                let metrics_changed = self.overview != metrics;
+                let metrics_changed = self.system_metrics != metrics;
                 if metrics_changed {
-                    self.overview = metrics;
+                    self.system_metrics = metrics;
                 }
                 match self.active_tab {
                     Tab::Overview => metrics_changed || history_changed,
@@ -2522,33 +2523,33 @@ mod tests {
         assert_eq!(app.network_count(), 1);
 
         // Overview update while on Overview tab DOES trigger redraw
-        let metrics = OverviewMetrics {
+        let metrics = SystemMetrics {
             cpu_percent: Some(42.0),
             ..Default::default()
         };
-        let ov_redraw = app.update(Action::OverviewUpdated(metrics.clone()));
+        let ov_redraw = app.update(Action::SystemMetricsUpdated(metrics.clone()));
         assert!(ov_redraw);
 
         // Switching to Processes tab triggers redraw
         assert!(app.update(Action::SelectTab(Tab::Processes)));
 
         // Visible system metrics update the active Processes summary.
-        let metrics2 = OverviewMetrics {
+        let metrics2 = SystemMetrics {
             cpu_percent: Some(99.0),
             memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
             ..Default::default()
         };
-        let process_metrics_redraw = app.update(Action::OverviewUpdated(metrics2.clone()));
+        let process_metrics_redraw = app.update(Action::SystemMetricsUpdated(metrics2.clone()));
         assert!(process_metrics_redraw);
 
         let mut memory_only_metrics = metrics2;
         memory_only_metrics.memory = Some(crate::linux::ByteUsage { used: 2, total: 4 });
-        assert!(app.update(Action::OverviewUpdated(memory_only_metrics.clone())));
+        assert!(app.update(Action::SystemMetricsUpdated(memory_only_metrics.clone())));
 
         // Unrelated Overview-only fields do not redraw Processes.
         let mut overview_only_metrics = memory_only_metrics;
         overview_only_metrics.uptime = Some(std::time::Duration::from_secs(60));
-        assert!(!app.update(Action::OverviewUpdated(overview_only_metrics)));
+        assert!(!app.update(Action::SystemMetricsUpdated(overview_only_metrics)));
 
         let net_redraw_inactive = app.update(Action::NetworkUpdated(NetworkSnapshot {
             interfaces: vec![dummy_network("wlan0")],
@@ -2563,7 +2564,7 @@ mod tests {
 
         // System metrics remain cached without redrawing unrelated active tabs.
         assert!(app.update(Action::SelectTab(Tab::Services)));
-        assert!(!app.update(Action::OverviewUpdated(OverviewMetrics {
+        assert!(!app.update(Action::SystemMetricsUpdated(SystemMetrics {
             cpu_percent: Some(12.0),
             memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
             ..Default::default()
@@ -2576,7 +2577,7 @@ mod tests {
         let sample_count = AGGREGATE_CPU_HISTORY_CAPACITY + 5;
 
         for sample in 0..sample_count {
-            app.update(Action::OverviewUpdated(OverviewMetrics {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
                 cpu_percent: Some(sample as f64),
                 ..Default::default()
             }));

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::linux::{
-    HardwareInventory, JournalBatch, NetworkSnapshot, OverviewMetrics, ProcessIdentity,
-    ProcessSignal, ProcessSnapshot, ServiceSnapshot,
+    HardwareInventory, JournalBatch, NetworkSnapshot, ProcessIdentity, ProcessSignal,
+    ProcessSnapshot, ServiceSnapshot, SystemMetrics,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,7 +13,7 @@ pub enum Action {
     PreviousTab,
     ShowHelp,
     Escape,
-    OverviewUpdated(OverviewMetrics),
+    SystemMetricsUpdated(SystemMetrics),
     HardwareDiscovered(HardwareInventory),
     ProcessesUpdated(ProcessSnapshot),
     ProcessPrevious,

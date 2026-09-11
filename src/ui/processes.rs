@@ -10,7 +10,7 @@ use crate::{
     action::{MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton},
     app::calculate_scroll,
     app::{App, ProcessSignalConfirmation},
-    linux::{OverviewMetrics, ProcessIdentity, ProcessInfo, ProcessSignal},
+    linux::{ProcessIdentity, ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
 use super::{format_bytes, layout};
@@ -187,11 +187,15 @@ fn sort_header(
 }
 
 fn render_resource_summary(frame: &mut Frame, app: &App, area: Rect) {
-    let text = resource_summary_text(app.process_count(), app.overview(), usize::from(area.width));
+    let text = resource_summary_text(
+        app.process_count(),
+        app.system_metrics(),
+        usize::from(area.width),
+    );
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn resource_summary_text(count: usize, metrics: &OverviewMetrics, width: usize) -> String {
+fn resource_summary_text(count: usize, metrics: &SystemMetrics, width: usize) -> String {
     let cpu = metrics.cpu_percent;
     let ram = metrics.memory.map(|memory| memory.percent());
     let values = metrics.memory.map(|memory| {
@@ -491,14 +495,14 @@ mod tests {
 
     use super::*;
 
-    fn metrics() -> OverviewMetrics {
-        OverviewMetrics {
+    fn metrics() -> SystemMetrics {
+        SystemMetrics {
             cpu_percent: Some(14.0),
             memory: Some(ByteUsage {
                 used: 8 * 1024 * 1024 * 1024,
                 total: 32 * 1024 * 1024 * 1024,
             }),
-            ..OverviewMetrics::default()
+            ..SystemMetrics::default()
         }
     }
 
@@ -552,7 +556,7 @@ mod tests {
     fn processes_render_uses_cached_metrics_without_overlapping_table_geometry() {
         let mut app = App::default();
         app.update(Action::SelectTab(crate::action::Tab::Processes));
-        app.update(Action::OverviewUpdated(metrics()));
+        app.update(Action::SystemMetricsUpdated(metrics()));
         let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut rendered = None;

@@ -16,7 +16,7 @@ const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 const PROC_KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct OverviewMetrics {
+pub struct SystemMetrics {
     pub cpu_percent: Option<f64>,
     pub logical_cpus: Vec<LogicalCpuMetrics>,
     pub memory: Option<ByteUsage>,
@@ -75,21 +75,21 @@ pub struct LoadAverage {
     pub fifteen: f64,
 }
 
-pub struct OverviewCollector {
-    receiver: Receiver<OverviewMetrics>,
+pub struct SystemMetricsCollector {
+    receiver: Receiver<SystemMetrics>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl OverviewCollector {
+impl SystemMetricsCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (metrics_tx, receiver) = mpsc::channel();
         let (stop, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name("overview-metrics".into())
+            .name("system-metrics".into())
             .spawn(move || {
                 let identity = collect_system_identity();
-                let mut sampler = OverviewSampler::new(identity);
+                let mut sampler = SystemMetricsSampler::new(identity);
 
                 loop {
                     if metrics_tx.send(sampler.collect()).is_err() {
@@ -110,12 +110,12 @@ impl OverviewCollector {
         })
     }
 
-    pub fn latest(&self) -> Option<OverviewMetrics> {
+    pub fn latest(&self) -> Option<SystemMetrics> {
         self.receiver.try_iter().last()
     }
 }
 
-impl Drop for OverviewCollector {
+impl Drop for SystemMetricsCollector {
     fn drop(&mut self) {
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
@@ -136,12 +136,12 @@ struct CpuSample {
     logical: BTreeMap<LogicalCpuId, CpuTimes>,
 }
 
-struct OverviewSampler {
+struct SystemMetricsSampler {
     previous_cpu: Option<CpuSample>,
     system_identity: SystemIdentity,
 }
 
-impl OverviewSampler {
+impl SystemMetricsSampler {
     fn new(system_identity: SystemIdentity) -> Self {
         Self {
             previous_cpu: None,
@@ -149,7 +149,7 @@ impl OverviewSampler {
         }
     }
 
-    fn collect(&mut self) -> OverviewMetrics {
+    fn collect(&mut self) -> SystemMetrics {
         let current_cpu = fs::read_to_string(PROC_STAT)
             .ok()
             .and_then(|contents| parse_cpu_sample(&contents));
@@ -161,7 +161,7 @@ impl OverviewSampler {
             self.previous_cpu = current_cpu;
         }
 
-        OverviewMetrics {
+        SystemMetrics {
             cpu_percent,
             logical_cpus,
             memory: fs::read_to_string(PROC_MEMINFO)

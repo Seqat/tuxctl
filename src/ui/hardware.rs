@@ -10,7 +10,7 @@ use crate::{
     app::App,
     linux::{
         GpuKind, HardwareInventory, LogicalCpuMetrics, MemoryModule, NetworkInterfaceInfo,
-        OperState, OverviewMetrics, StorageDevice, StorageKind,
+        OperState, StorageDevice, StorageKind, SystemMetrics,
     },
 };
 
@@ -45,7 +45,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let inventory = app.hardware();
-    let metrics = app.overview();
+    let metrics = app.system_metrics();
     let cpu_count = metrics.logical_cpus.len();
     let max_cpu_id = metrics
         .logical_cpus
@@ -139,7 +139,7 @@ fn render_cpu(
     frame: &mut Frame,
     app: &App,
     inventory: Option<&HardwareInventory>,
-    metrics: &OverviewMetrics,
+    metrics: &SystemMetrics,
     grid: CpuGridLayout,
     area: Rect,
 ) {
@@ -298,7 +298,7 @@ fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: us
 fn render_ram(
     frame: &mut Frame,
     inventory: Option<&HardwareInventory>,
-    metrics: &OverviewMetrics,
+    metrics: &SystemMetrics,
     area: Rect,
 ) {
     if area.height == 0 {
@@ -845,13 +845,13 @@ mod tests {
     #[test]
     fn cpu_summary_uses_available_vertical_breathing_room() {
         let mut app = App::default();
-        app.update(crate::action::Action::OverviewUpdated(OverviewMetrics {
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
             cpu_percent: Some(12.0),
             logical_cpus: vec![LogicalCpuMetrics {
                 id: crate::linux::LogicalCpuId::for_test(0),
                 utilization_percent: Some(8.0),
             }],
-            ..OverviewMetrics::default()
+            ..SystemMetrics::default()
         }));
         let backend = TestBackend::new(60, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -861,7 +861,7 @@ mod tests {
                     frame,
                     &app,
                     None,
-                    app.overview(),
+                    app.system_metrics(),
                     cpu_grid_layout(1, 0, 60, 1),
                     frame.area(),
                 );
@@ -985,12 +985,12 @@ mod tests {
     #[test]
     fn ram_render_omits_the_redundant_total_row() {
         let mut app = App::default();
-        app.update(crate::action::Action::OverviewUpdated(OverviewMetrics {
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
             memory: Some(crate::linux::ByteUsage {
                 used: 8 * 1024 * 1024 * 1024,
                 total: 32 * 1024 * 1024 * 1024,
             }),
-            ..OverviewMetrics::default()
+            ..SystemMetrics::default()
         }));
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();

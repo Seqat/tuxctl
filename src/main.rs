@@ -39,7 +39,7 @@ fn main() -> io::Result<()> {
     let mut terminal = TerminalSession::new()?;
     let mut app = App::default();
     let mut events = EventHandler::new(TICK_RATE);
-    let metrics = linux::OverviewCollector::start(METRICS_REFRESH_RATE)?;
+    let metrics = linux::SystemMetricsCollector::start(METRICS_REFRESH_RATE)?;
     let processes = linux::ProcessCollector::start(METRICS_REFRESH_RATE)?;
     let services = linux::ServiceCollector::start(SERVICES_REFRESH_RATE)?;
     let journal = linux::JournalCollector::start();
@@ -51,7 +51,7 @@ fn main() -> io::Result<()> {
 
     while !app.should_quit() {
         let action = if let Some(metrics) = metrics.latest() {
-            Some(action::Action::OverviewUpdated(metrics))
+            Some(action::Action::SystemMetricsUpdated(metrics))
         } else if let Some(snapshot) = processes.latest() {
             Some(action::Action::ProcessesUpdated(snapshot))
         } else if let Some(snapshot) = services.latest() {

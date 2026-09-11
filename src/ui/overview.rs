@@ -66,7 +66,7 @@ fn render_system(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let metrics = app.overview();
+    let metrics = app.system_metrics();
     let summary = app.process_summary();
     let hostname = metrics.system_identity.hostname.as_deref().unwrap_or("N/A");
     let kernel = metrics

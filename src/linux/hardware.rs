@@ -7,7 +7,6 @@ use std::{
 };
 
 const CPUINFO: &str = "/proc/cpuinfo";
-const MEMINFO: &str = "/proc/meminfo";
 const EDAC_ROOT: &str = "/sys/devices/system/edac/mc";
 const DRM_ROOT: &str = "/sys/class/drm";
 const NVIDIA_ROOT: &str = "/proc/driver/nvidia/gpus";
@@ -18,7 +17,6 @@ const NETWORK_ROOT: &str = "/sys/class/net";
 pub struct HardwareInventory {
     pub cpus: Vec<CpuPackage>,
     pub memory_modules: Vec<MemoryModule>,
-    pub total_memory: Option<u64>,
     pub gpus: Vec<GpuDevice>,
     pub storage_devices: Vec<StorageDevice>,
     pub network_devices: Vec<NetworkDevice>,
@@ -104,9 +102,6 @@ fn discover() -> HardwareInventory {
             .map(|contents| parse_cpu_packages(&contents))
             .unwrap_or_default(),
         memory_modules: discover_memory_modules(Path::new(EDAC_ROOT)),
-        total_memory: fs::read_to_string(MEMINFO)
-            .ok()
-            .and_then(|contents| parse_total_memory(&contents)),
         gpus: discover_gpus(Path::new(DRM_ROOT), Path::new(NVIDIA_ROOT)),
         storage_devices: discover_storage(Path::new(BLOCK_ROOT)),
         network_devices: discover_network_devices(Path::new(NETWORK_ROOT)),
@@ -215,14 +210,6 @@ fn parse_cpu_packages(contents: &str) -> Vec<CpuPackage> {
             model,
         })
         .collect()
-}
-
-fn parse_total_memory(contents: &str) -> Option<u64> {
-    let kib = contents.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key == "MemTotal").then(|| value.split_whitespace().next()?.parse::<u64>().ok())?
-    })?;
-    kib.checked_mul(1024)
 }
 
 fn discover_memory_modules(root: &Path) -> Vec<MemoryModule> {
@@ -565,17 +552,6 @@ mod tests {
         assert_eq!(module.memory_type.as_deref(), Some("DDR5"));
         assert_eq!(module.speed_mts, Some(6000));
         assert!(parse_edac_memory_module("0", None, None, None).is_none());
-    }
-
-    #[test]
-    fn ram_gracefully_falls_back_to_total_only() {
-        let inventory = HardwareInventory {
-            total_memory: parse_total_memory("MemTotal: 33554432 kB\n"),
-            ..HardwareInventory::default()
-        };
-
-        assert!(inventory.memory_modules.is_empty());
-        assert_eq!(inventory.total_memory, Some(32 * 1024 * 1024 * 1024));
     }
 
     #[test]

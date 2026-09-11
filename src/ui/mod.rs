@@ -98,6 +98,19 @@ impl UiRegions {
         }
     }
 
+    fn suppress_background_interaction(&mut self) {
+        self.tabs.clear();
+        self.process_rows.clear();
+        self.process_headers.clear();
+        self.process_scroll_area = None;
+        self.service_rows.clear();
+        self.service_scroll_area = None;
+        self.log_rows.clear();
+        self.log_scroll_area = None;
+        self.network_rows.clear();
+        self.network_scroll_area = None;
+    }
+
     pub fn target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
         if self
             .process_signal_cancel
@@ -385,84 +398,30 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
 
     if app.process_detail_visible() {
         processes::render_detail(frame, app.selected_process(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.service_detail_visible() {
         services::render_detail(frame, app.selected_service(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.log_detail_visible() {
         logs::render_detail(frame, app.selected_log(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.network_detail_visible() {
         network::render_detail(frame, app.selected_network(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if let Some(confirmation) = app.process_signal_confirmation() {
         let (cancel_rect, confirm_rect) =
             processes::render_signal_confirmation(frame, confirmation, app.hovered(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
         regions.process_signal_cancel = Some(cancel_rect);
         regions.process_signal_confirm = Some(confirm_rect);
     }
     if app.help_visible() {
         render_help(frame, area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
         regions.process_signal_cancel = None;
         regions.process_signal_confirm = None;
     }
@@ -690,7 +649,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::linux::{
-        ByteUsage, LogicalCpuId, LogicalCpuMetrics, OverviewMetrics, ProcessIdentity,
+        ByteUsage, LogicalCpuId, LogicalCpuMetrics, ProcessIdentity, SystemMetrics,
     };
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -833,6 +792,83 @@ mod tests {
     }
 
     #[test]
+    fn modal_suppression_clears_background_targets_but_preserves_viewports() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_time: 9001,
+        };
+        let target_area = Rect::new(2, 6, 20, 1);
+        let mut regions = UiRegions {
+            tabs: vec![TabRegion {
+                tab: Tab::Overview,
+                area: target_area,
+            }],
+            process_rows: vec![ProcessRowRegion {
+                identity,
+                area: target_area,
+            }],
+            process_headers: vec![ProcessHeaderRegion {
+                field: ProcessSortField::Cpu,
+                area: target_area,
+            }],
+            process_scroll_area: Some(target_area),
+            process_viewport: Some((3, 7)),
+            service_rows: vec![ServiceRowRegion {
+                unit: Arc::from("dbus.service"),
+                area: target_area,
+            }],
+            service_scroll_area: Some(target_area),
+            service_viewport: Some((4, 8)),
+            log_rows: vec![LogRowRegion {
+                id: 77,
+                area: target_area,
+            }],
+            log_scroll_area: Some(target_area),
+            log_viewport: Some((5, 9)),
+            network_rows: vec![NetworkRowRegion {
+                name: Arc::from("enp6s0"),
+                area: target_area,
+            }],
+            network_scroll_area: Some(target_area),
+            network_viewport: Some((6, 10)),
+            process_signal_cancel: None,
+            process_signal_confirm: None,
+            input_mode: InputMode::ProcessSignalConfirm,
+        };
+
+        regions.suppress_background_interaction();
+
+        assert!(regions.tabs.is_empty());
+        assert!(regions.process_rows.is_empty());
+        assert!(regions.process_headers.is_empty());
+        assert!(regions.process_scroll_area.is_none());
+        assert!(regions.service_rows.is_empty());
+        assert!(regions.service_scroll_area.is_none());
+        assert!(regions.log_rows.is_empty());
+        assert!(regions.log_scroll_area.is_none());
+        assert!(regions.network_rows.is_empty());
+        assert!(regions.network_scroll_area.is_none());
+        assert_eq!(regions.process_viewport(), Some((3, 7)));
+        assert_eq!(regions.service_viewport(), Some((4, 8)));
+        assert_eq!(regions.log_viewport(), Some((5, 9)));
+        assert_eq!(regions.network_viewport(), Some((6, 10)));
+        assert_eq!(regions.target_at(2, 6), None);
+
+        let cancel = Rect::new(10, 12, 12, 1);
+        let confirm = Rect::new(26, 12, 15, 1);
+        regions.process_signal_cancel = Some(cancel);
+        regions.process_signal_confirm = Some(confirm);
+        assert_eq!(
+            regions.target_at(cancel.x, cancel.y),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(
+            regions.target_at(confirm.x, confirm.y),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+    }
+
+    #[test]
     fn implemented_screens_use_the_warning_path_in_tiny_terminals() {
         for tab in [
             Tab::Overview,
@@ -925,7 +961,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for sample in 0..65 {
-            let mut metrics = OverviewMetrics {
+            let mut metrics = SystemMetrics {
                 cpu_percent: Some(f64::from(sample)),
                 logical_cpus: logical_cpus.clone(),
                 memory: Some(ByteUsage {
@@ -937,11 +973,11 @@ mod tests {
                     used: 120 * 1024 * 1024 * 1024,
                     total: 500 * 1024 * 1024 * 1024,
                 }),
-                ..OverviewMetrics::default()
+                ..SystemMetrics::default()
             };
             metrics.system_identity.hostname = Some("build-host".into());
             metrics.system_identity.kernel_release = Some("6.12.0-tuxctl".into());
-            app.update(Action::OverviewUpdated(metrics));
+            app.update(Action::SystemMetricsUpdated(metrics));
         }
 
         for (width, height) in [
