@@ -3,10 +3,12 @@ use std::{
     ffi::CString,
     fs, io,
     mem::MaybeUninit,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+use super::latest_snapshot::{self, LatestReceiver};
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
@@ -76,14 +78,14 @@ pub struct LoadAverage {
 }
 
 pub struct SystemMetricsCollector {
-    receiver: Receiver<SystemMetrics>,
+    receiver: LatestReceiver<SystemMetrics>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl SystemMetricsCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
-        let (metrics_tx, receiver) = mpsc::channel();
+        let (metrics_tx, receiver) = latest_snapshot::channel();
         let (stop, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("system-metrics".into())
@@ -92,7 +94,7 @@ impl SystemMetricsCollector {
                 let mut sampler = SystemMetricsSampler::new(identity);
 
                 loop {
-                    if metrics_tx.send(sampler.collect()).is_err() {
+                    if !metrics_tx.publish(sampler.collect()) {
                         break;
                     }
 
@@ -111,7 +113,7 @@ impl SystemMetricsCollector {
     }
 
     pub fn latest(&self) -> Option<SystemMetrics> {
-        self.receiver.try_iter().last()
+        self.receiver.take_latest()
     }
 }
 

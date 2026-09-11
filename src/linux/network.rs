@@ -4,10 +4,12 @@ use std::{
     fs, io,
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use super::latest_snapshot::{self, LatestReceiver};
 
 const PROC_NET_DEV: &str = "/proc/net/dev";
 const SYS_CLASS_NET: &str = "/sys/class/net";
@@ -232,14 +234,14 @@ impl NetworkSampler {
 }
 
 pub struct NetworkCollector {
-    receiver: Receiver<NetworkSnapshot>,
+    receiver: LatestReceiver<NetworkSnapshot>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl NetworkCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
-        let (snapshot_tx, receiver) = mpsc::channel();
+        let (snapshot_tx, receiver) = latest_snapshot::channel();
         let (stop, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("network-metrics".into())
@@ -247,7 +249,7 @@ impl NetworkCollector {
                 let mut sampler = NetworkSampler::default();
 
                 loop {
-                    if snapshot_tx.send(sampler.collect()).is_err() {
+                    if !snapshot_tx.publish(sampler.collect()) {
                         break;
                     }
 
@@ -266,7 +268,7 @@ impl NetworkCollector {
     }
 
     pub fn latest(&self) -> Option<NetworkSnapshot> {
-        self.receiver.try_iter().last()
+        self.receiver.take_latest()
     }
 }
 

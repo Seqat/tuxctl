@@ -2,10 +2,12 @@ use std::{
     collections::HashMap,
     fs, io,
     path::Path,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+use super::latest_snapshot::{self, LatestReceiver};
 
 const PROC: &str = "/proc";
 
@@ -190,14 +192,14 @@ impl ProcessSnapshot {
 }
 
 pub struct ProcessCollector {
-    receiver: Receiver<ProcessSnapshot>,
+    receiver: LatestReceiver<ProcessSnapshot>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ProcessCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
-        let (snapshot_tx, receiver) = mpsc::channel();
+        let (snapshot_tx, receiver) = latest_snapshot::channel();
         let (stop, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("process-metrics".into())
@@ -205,7 +207,7 @@ impl ProcessCollector {
                 let mut sampler = ProcessSampler::default();
 
                 loop {
-                    if snapshot_tx.send(sampler.collect()).is_err() {
+                    if !snapshot_tx.publish(sampler.collect()) {
                         break;
                     }
 
@@ -224,7 +226,7 @@ impl ProcessCollector {
     }
 
     pub fn latest(&self) -> Option<ProcessSnapshot> {
-        self.receiver.try_iter().last()
+        self.receiver.take_latest()
     }
 }
 

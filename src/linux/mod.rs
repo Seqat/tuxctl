@@ -1,5 +1,6 @@
 mod hardware;
 mod journal;
+mod latest_snapshot;
 mod network;
 mod process;
 mod service;
