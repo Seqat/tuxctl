@@ -10,7 +10,7 @@ use crate::{
     action::{MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton},
     app::calculate_scroll,
     app::{App, ProcessSignalConfirmation},
-    linux::{ProcessIdentity, ProcessInfo, ProcessSignal},
+    linux::{OverviewMetrics, ProcessIdentity, ProcessInfo, ProcessSignal},
 };
 
 use super::{format_bytes, layout};
@@ -32,10 +32,16 @@ const COLUMN_WIDTHS: [Constraint; 4] = [
 ];
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    render_status(frame, app, sections[0]);
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    render_resource_summary(frame, app, sections[0]);
+    render_controls(frame, app, sections[1]);
 
-    let table_area = sections[1];
+    let table_area = sections[2];
     let row_area = Rect::new(
         table_area.x,
         table_area.y.saturating_add(table_area.height.min(1)),
@@ -180,7 +186,80 @@ fn sort_header(
     Cell::from(label).style(style)
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+fn render_resource_summary(frame: &mut Frame, app: &App, area: Rect) {
+    let text = resource_summary_text(app.process_count(), app.overview(), usize::from(area.width));
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn resource_summary_text(count: usize, metrics: &OverviewMetrics, width: usize) -> String {
+    let cpu = metrics.cpu_percent;
+    let ram = metrics.memory.map(|memory| memory.percent());
+    let values = metrics.memory.map(|memory| {
+        format!(
+            "{} / {}",
+            format_bytes(memory.used),
+            format_bytes(memory.total)
+        )
+    });
+    let count_long = format!("{count} processes");
+    let count_short = format!("{count} proc");
+    let candidates = [
+        resource_summary_candidate(&count_long, cpu, ram, values.as_deref(), Some(10)),
+        resource_summary_candidate(&count_long, cpu, ram, values.as_deref(), Some(6)),
+        resource_summary_candidate(&count_long, cpu, ram, values.as_deref(), None),
+        resource_summary_candidate(&count_long, cpu, ram, None, Some(6)),
+        resource_summary_candidate(&count_long, cpu, ram, None, None),
+        resource_summary_candidate(&count_short, cpu, ram, None, None),
+    ];
+    let summary = candidates
+        .into_iter()
+        .find(|candidate| candidate.chars().count().saturating_add(1) <= width)
+        .unwrap_or(count_short);
+
+    layout::truncate(&format!(" {summary}"), width)
+}
+
+fn resource_summary_candidate(
+    count: &str,
+    cpu: Option<f64>,
+    ram: Option<f64>,
+    values: Option<&str>,
+    gauge_width: Option<usize>,
+) -> String {
+    let cpu = resource_metric("CPU", cpu, gauge_width);
+    let ram = resource_metric("RAM", ram, gauge_width);
+    let values = values.map_or_else(String::new, |values| format!("  {values}"));
+    format!("{count}   {cpu}   {ram}{values}")
+}
+
+fn resource_metric(label: &str, percent: Option<f64>, gauge_width: Option<usize>) -> String {
+    let percent_text = system_percent(percent);
+    gauge_width.map_or_else(
+        || format!("{label} {percent_text}"),
+        |width| {
+            format!(
+                "{label} {percent_text} [{}]",
+                utilization_bar(percent, width)
+            )
+        },
+    )
+}
+
+fn utilization_bar(percent: Option<f64>, width: usize) -> String {
+    let filled = percent
+        .map(|percent| ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize)
+        .unwrap_or(0)
+        .min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn system_percent(percent: Option<f64>) -> String {
+    percent
+        .map(|percent| format!("{:>4}", format!("{:.0}%", percent.clamp(0.0, 100.0))))
+        .unwrap_or_else(|| " N/A".into())
+}
+
+fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.process_searching() {
         format!(" Search: {}_", app.process_search_query())
     } else if let Some(msg) = app.process_action_message() {
@@ -198,30 +277,19 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             }
         );
         if area.width >= 85 {
-            format!(
-                " {} processes   {sort_info}   / search   Enter details   t term   K kill",
-                app.process_count()
-            )
+            format!(" {sort_info}   / search   Enter details   t term   K kill")
         } else if area.width >= 60 {
-            format!(
-                " {} processes   / search   Enter details   t term   K kill",
-                app.process_count()
-            )
+            " / search   Enter details   t term   K kill".into()
         } else {
-            format!(" {} procs   / find   Enter view", app.process_count())
+            " / find   Enter view".into()
         }
     } else if area.width >= 75 {
         format!(
-            " Filter: \"{}\" ({} matches)   / edit   Esc clear   t term   K kill",
-            app.process_search_query(),
-            app.process_count()
+            " Filter: \"{}\"   / edit   Esc clear   t term   K kill",
+            app.process_search_query()
         )
     } else {
-        format!(
-            " Filter: \"{}\" ({} matches)   Esc clear",
-            app.process_search_query(),
-            app.process_count()
-        )
+        format!(" Filter: \"{}\"   Esc clear", app.process_search_query())
     };
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -413,4 +481,97 @@ fn format_cpu(percent: Option<f64>) -> String {
     percent
         .map(|percent| format!("{percent:.1}%"))
         .unwrap_or_else(|| "N/A".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::{action::Action, linux::ByteUsage};
+
+    use super::*;
+
+    fn metrics() -> OverviewMetrics {
+        OverviewMetrics {
+            cpu_percent: Some(14.0),
+            memory: Some(ByteUsage {
+                used: 8 * 1024 * 1024 * 1024,
+                total: 32 * 1024 * 1024 * 1024,
+            }),
+            ..OverviewMetrics::default()
+        }
+    }
+
+    #[test]
+    fn wide_resource_summary_includes_values_and_full_gauges() {
+        let text = resource_summary_text(393, &metrics(), 120);
+
+        assert!(text.contains("393 processes"));
+        assert!(text.contains("CPU  14%"));
+        assert!(text.contains("RAM  25%"));
+        assert!(text.contains("8.0 GiB / 32.0 GiB"));
+        assert_eq!(text.matches(['█', '░']).count(), 20);
+        assert!(text.chars().count() <= 120);
+    }
+
+    #[test]
+    fn medium_resource_summary_preserves_values_before_gauges() {
+        let text = resource_summary_text(393, &metrics(), 70);
+
+        assert!(text.contains("CPU  14%"));
+        assert!(text.contains("RAM  25%"));
+        assert!(text.contains("8.0 GiB / 32.0 GiB"));
+        assert!(!text.contains(['█', '░']));
+        assert!(text.chars().count() <= 70);
+    }
+
+    #[test]
+    fn compact_resource_summary_uses_short_gauges_when_they_fit() {
+        let text = resource_summary_text(393, &metrics(), 54);
+
+        assert!(text.contains("CPU  14%"));
+        assert!(text.contains("RAM  25%"));
+        assert_eq!(text.matches(['█', '░']).count(), 12);
+        assert!(!text.contains("GiB"));
+        assert!(text.chars().count() <= 54);
+    }
+
+    #[test]
+    fn narrow_resource_summary_keeps_count_and_percentages() {
+        let text = resource_summary_text(393, &metrics(), 40);
+
+        assert!(text.contains("393 processes"));
+        assert!(text.contains("CPU  14%"));
+        assert!(text.contains("RAM  25%"));
+        assert!(!text.contains(['█', '░']));
+        assert!(!text.contains("GiB"));
+        assert!(text.chars().count() <= 40);
+    }
+
+    #[test]
+    fn processes_render_uses_cached_metrics_without_overlapping_table_geometry() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(crate::action::Tab::Processes));
+        app.update(Action::OverviewUpdated(metrics()));
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rendered = None;
+        terminal
+            .draw(|frame| rendered = Some(render(frame, &app, frame.area())))
+            .unwrap();
+        let rendered = rendered.unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("CPU  14%"));
+        assert!(text.contains("RAM  25%"));
+        assert!(rendered.headers.iter().all(|(_, area)| area.y == 2));
+        assert_eq!(rendered.scroll_area.y, 3);
+        assert_eq!(rendered.scroll_area.height, 12);
+    }
 }

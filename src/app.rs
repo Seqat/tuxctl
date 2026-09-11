@@ -438,6 +438,8 @@ impl App {
                 false
             }
             Action::OverviewUpdated(metrics) => {
+                let process_metrics_changed = self.overview.cpu_percent != metrics.cpu_percent
+                    || self.overview.memory != metrics.memory;
                 let history_changed = metrics
                     .cpu_percent
                     .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
@@ -445,7 +447,11 @@ impl App {
                 if metrics_changed {
                     self.overview = metrics;
                 }
-                self.active_tab == Tab::Overview && (metrics_changed || history_changed)
+                match self.active_tab {
+                    Tab::Overview => metrics_changed || history_changed,
+                    Tab::Processes => process_metrics_changed,
+                    _ => false,
+                }
             }
             Action::HardwareDiscovered(hardware) => {
                 if self.hardware.as_ref() == Some(&hardware) {
@@ -2526,13 +2532,23 @@ mod tests {
         // Switching to Processes tab triggers redraw
         assert!(app.update(Action::SelectTab(Tab::Processes)));
 
-        // Overview update while on Processes tab should NOT trigger redraw
+        // Visible system metrics update the active Processes summary.
         let metrics2 = OverviewMetrics {
             cpu_percent: Some(99.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
             ..Default::default()
         };
-        let ov_redraw_inactive = app.update(Action::OverviewUpdated(metrics2));
-        assert!(!ov_redraw_inactive);
+        let process_metrics_redraw = app.update(Action::OverviewUpdated(metrics2.clone()));
+        assert!(process_metrics_redraw);
+
+        let mut memory_only_metrics = metrics2;
+        memory_only_metrics.memory = Some(crate::linux::ByteUsage { used: 2, total: 4 });
+        assert!(app.update(Action::OverviewUpdated(memory_only_metrics.clone())));
+
+        // Unrelated Overview-only fields do not redraw Processes.
+        let mut overview_only_metrics = memory_only_metrics;
+        overview_only_metrics.uptime = Some(std::time::Duration::from_secs(60));
+        assert!(!app.update(Action::OverviewUpdated(overview_only_metrics)));
 
         let net_redraw_inactive = app.update(Action::NetworkUpdated(NetworkSnapshot {
             interfaces: vec![dummy_network("wlan0")],
@@ -2544,6 +2560,14 @@ mod tests {
         let proc_redraw_active =
             app.update(Action::ProcessesUpdated(processes(vec![process(2, "new")])));
         assert!(proc_redraw_active);
+
+        // System metrics remain cached without redrawing unrelated active tabs.
+        assert!(app.update(Action::SelectTab(Tab::Services)));
+        assert!(!app.update(Action::OverviewUpdated(OverviewMetrics {
+            cpu_percent: Some(12.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
+            ..Default::default()
+        })));
     }
 
     #[test]
