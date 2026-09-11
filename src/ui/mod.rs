@@ -2,23 +2,24 @@ mod hardware;
 mod layout;
 mod logs;
 mod network;
+mod overview;
 mod processes;
 mod services;
 
 use std::sync::Arc;
 
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, Gauge, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::{
     action::{InputMode, MouseTarget, ProcessSortField, Tab},
     app::App,
-    linux::{ByteUsage, OverviewMetrics},
+    linux::ByteUsage,
 };
 
 #[derive(Debug, Default)]
@@ -515,9 +516,7 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     frame.render_widget(block, area);
 
     if active_tab == Tab::Overview {
-        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-        render_overview_status(frame, app, sections[0]);
-        render_overview(frame, app, sections[1]);
+        overview::render(frame, app, inner);
         return ContentRender::None;
     }
 
@@ -547,168 +546,7 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     ContentRender::None
 }
 
-fn render_overview_status(frame: &mut Frame, app: &App, area: Rect) {
-    let uptime = app
-        .overview()
-        .uptime
-        .map(format_uptime)
-        .unwrap_or_else(|| "N/A".into());
-    let load = app
-        .overview()
-        .load_average
-        .map(|l| format!("{:.2}  {:.2}  {:.2}", l.one, l.five, l.fifteen))
-        .unwrap_or_else(|| "N/A".into());
-    let text = if area.width >= 80 {
-        format!(" Live System Metrics   Load: {load}   Uptime: {uptime}   ? help")
-    } else if area.width >= 50 {
-        format!(" System Overview   Uptime: {uptime}   ? help")
-    } else {
-        format!(" Overview   Up: {uptime}")
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
-        area,
-    );
-}
-
-fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let (live_area, hardware_area) = if area.width >= 85 {
-        let live_width = 42.min(area.width.saturating_sub(35));
-        let columns =
-            Layout::horizontal([Constraint::Length(live_width), Constraint::Min(35)]).split(area);
-        (columns[0], columns[1])
-    } else if area.height >= 20 {
-        let rows = Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).split(area);
-        (rows[0], rows[1])
-    } else if area.height >= 12 {
-        let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).split(area);
-        (rows[0], rows[1])
-    } else {
-        (area, Rect::default())
-    };
-
-    render_live_metrics(frame, app.overview(), live_area);
-    if hardware_area.width > 0 && hardware_area.height > 0 {
-        let fallback_memory = app.overview().memory.map(|memory| memory.total);
-        hardware::render(frame, app.hardware(), fallback_memory, hardware_area);
-    }
-}
-
-fn render_live_metrics(frame: &mut Frame, metrics: &OverviewMetrics, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Live Metrics ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let load = metrics
-        .load_average
-        .map(|load| format!("{:.2}  {:.2}  {:.2}", load.one, load.five, load.fifteen))
-        .unwrap_or_else(|| "N/A".into());
-    let uptime = metrics
-        .uptime
-        .map(format_uptime)
-        .unwrap_or_else(|| "N/A".into());
-    let filesystem = metrics
-        .root_filesystem
-        .map(format_usage)
-        .unwrap_or_else(|| "N/A".into());
-
-    if inner.height >= 12 {
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
-        render_gauge(
-            frame,
-            rows[1],
-            " Memory ",
-            metrics.memory.map(ByteUsage::percent),
-            metrics.memory.map(format_usage),
-        );
-        render_gauge(
-            frame,
-            rows[2],
-            " Root FS ",
-            metrics.root_filesystem.map(ByteUsage::percent),
-            metrics.root_filesystem.map(format_usage),
-        );
-
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!("Load:    {load}")),
-                Line::from(format!("Uptime:  {uptime}")),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" System ")),
-            rows[3],
-        );
-    } else if inner.height >= 7 {
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
-        render_gauge(
-            frame,
-            rows[1],
-            " Memory ",
-            metrics.memory.map(ByteUsage::percent),
-            metrics.memory.map(format_usage),
-        );
-
-        if rows[2].height > 0 {
-            frame.render_widget(
-                Paragraph::new(format!("Load: {load}  Root: {filesystem}"))
-                    .style(Style::default().fg(Color::DarkGray)),
-                rows[2],
-            );
-        }
-    } else {
-        render_gauge(frame, inner, " CPU ", metrics.cpu_percent, None);
-    }
-}
-
-fn render_gauge(
-    frame: &mut Frame,
-    area: Rect,
-    title: &'static str,
-    percent: Option<f64>,
-    detail: Option<String>,
-) {
-    let ratio = percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
-    let label = match (percent, detail) {
-        (Some(percent), Some(detail)) => format!("{detail}  ({percent:.0}%)"),
-        (Some(percent), None) => format!("{percent:.0}%"),
-        (None, _) => "N/A".into(),
-    };
-
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(ratio)
-            .label(label),
-        area,
-    );
-}
-
-fn format_usage(usage: ByteUsage) -> String {
+pub(super) fn format_usage(usage: ByteUsage) -> String {
     format!(
         "{} / {}",
         format_bytes(usage.used),
@@ -716,7 +554,7 @@ fn format_usage(usage: ByteUsage) -> String {
     )
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
     let mut value = bytes as f64;
@@ -733,7 +571,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_uptime(uptime: std::time::Duration) -> String {
+pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
     let total_minutes = uptime.as_secs() / 60;
     let days = total_minutes / (24 * 60);
     let hours = (total_minutes / 60) % 24;
@@ -812,7 +650,9 @@ mod tests {
 
     use super::*;
     use crate::action::Action;
-    use crate::linux::ProcessIdentity;
+    use crate::linux::{
+        ByteUsage, LogicalCpuId, LogicalCpuMetrics, OverviewMetrics, ProcessIdentity,
+    };
 
     #[test]
     fn hit_testing_includes_top_left_and_excludes_bottom_right() {
@@ -964,6 +804,55 @@ mod tests {
                     })
                     .unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn overview_dashboard_renders_cached_data_across_responsive_sizes() {
+        let mut app = App::default();
+        let logical_cpus = (0..64)
+            .map(|index| LogicalCpuMetrics {
+                id: LogicalCpuId::for_test(index),
+                utilization_percent: Some(f64::from(index % 101)),
+            })
+            .collect::<Vec<_>>();
+
+        for sample in 0..65 {
+            let mut metrics = OverviewMetrics {
+                cpu_percent: Some(f64::from(sample)),
+                logical_cpus: logical_cpus.clone(),
+                memory: Some(ByteUsage {
+                    used: 8 * 1024 * 1024 * 1024,
+                    total: 32 * 1024 * 1024 * 1024,
+                }),
+                uptime: Some(std::time::Duration::from_secs(90_000)),
+                root_filesystem: Some(ByteUsage {
+                    used: 120 * 1024 * 1024 * 1024,
+                    total: 500 * 1024 * 1024 * 1024,
+                }),
+                ..OverviewMetrics::default()
+            };
+            metrics.system_identity.hostname = Some("build-host".into());
+            metrics.system_identity.kernel_release = Some("6.12.0-tuxctl".into());
+            app.update(Action::OverviewUpdated(metrics));
+        }
+
+        for (width, height) in [
+            (180, 50),
+            (120, 35),
+            (80, 24),
+            (60, 18),
+            (39, 15),
+            (12, 6),
+            (1, 1),
+        ] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render(frame, &app);
+                })
+                .unwrap();
         }
     }
 

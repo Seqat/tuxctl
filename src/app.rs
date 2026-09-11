@@ -51,9 +51,7 @@ impl AggregateCpuHistory {
         true
     }
 
-    // Consumed by the Overview v2 rendering phase.
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = f64> + '_ {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = f64> + ExactSizeIterator + '_ {
         self.samples.iter().copied()
     }
 }
@@ -184,8 +182,6 @@ impl App {
         &self.overview
     }
 
-    // Consumed by the Overview v2 rendering phase.
-    #[allow(dead_code)]
     pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
         &self.aggregate_cpu_history
     }
@@ -228,8 +224,6 @@ impl App {
         self.filtered_processes.len()
     }
 
-    // Consumed by the Overview v2 rendering phase.
-    #[allow(dead_code)]
     pub fn process_summary(&self) -> ProcessSummary {
         self.process_summary
     }
@@ -652,14 +646,16 @@ impl App {
     }
 
     fn update_processes(&mut self, snapshot: ProcessSnapshot) -> bool {
-        let visible = self.active_tab == Tab::Processes;
+        let processes_visible = self.active_tab == Tab::Processes;
         let summary = snapshot.summary();
+        let overview_summary_changed =
+            self.active_tab == Tab::Overview && self.process_summary != summary;
         if let Some(error) = snapshot.error {
             if self.process_error.as_ref() == Some(&error) {
                 return false;
             }
             self.process_error = Some(error);
-            return visible;
+            return processes_visible;
         }
 
         if self.process_error.is_none() && self.processes == snapshot.processes {
@@ -702,7 +698,7 @@ impl App {
         }
         self.reconcile_hovered_process();
         self.ensure_process_visible();
-        visible
+        processes_visible || overview_summary_changed
     }
 
     fn begin_process_search(&mut self) -> bool {
@@ -2484,12 +2480,19 @@ mod tests {
         let mut app = App::default();
         assert_eq!(app.active_tab(), Tab::Overview);
 
-        // Processes update while on Overview tab should return false, but update state
+        // Process summary changes affect the active Overview and require a redraw.
         let proc_redraw = app.update(Action::ProcessesUpdated(processes(vec![process(
             1, "test",
         )])));
-        assert!(!proc_redraw);
+        assert!(proc_redraw);
         assert_eq!(app.process_count(), 1);
+
+        // Process details may refresh without changing the summary shown on Overview.
+        let same_summary_redraw = app.update(Action::ProcessesUpdated(processes(vec![process(
+            2,
+            "replacement",
+        )])));
+        assert!(!same_summary_redraw);
 
         // Services update while on Overview tab should return false, but update state
         let srv_redraw = app.update(Action::ServicesUpdated(services(vec![service(
@@ -2561,7 +2564,7 @@ mod tests {
         zombie.state = "Z (zombie)".into();
         zombie.state_code = 'Z';
 
-        assert!(!app.update(Action::ProcessesUpdated(processes(vec![
+        assert!(app.update(Action::ProcessesUpdated(processes(vec![
             running,
             zombie,
             process(3, "sleeping"),

@@ -64,6 +64,23 @@ pub fn centered_rows(area: Rect, requested_height: u16) -> Rect {
     centered_rect(area, area.width, requested_height)
 }
 
+pub fn truncate(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+
+    let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +109,14 @@ mod tests {
 
         assert_eq!(centered_rect(area, 20, 3), Rect::new(9, 5, 20, 3));
         assert_eq!(centered_rect(area, 40, 12), area);
+    }
+
+    #[test]
+    fn truncates_long_text_without_splitting_characters() {
+        assert_eq!(truncate("short", 8), "short");
+        assert_eq!(truncate("processor model", 10), "processor…");
+        assert_eq!(truncate("CPU λ model", 6), "CPU λ…");
+        assert_eq!(truncate("anything", 1), "…");
+        assert_eq!(truncate("anything", 0), "");
     }
 }

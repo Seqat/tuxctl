@@ -36,10 +36,13 @@ pub struct LogicalCpuMetrics {
 pub struct LogicalCpuId(u32);
 
 impl LogicalCpuId {
-    // Consumed by the Overview v2 rendering phase.
-    #[allow(dead_code)]
     pub const fn index(self) -> u32 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(index: u32) -> Self {
+        Self(index)
     }
 }
 

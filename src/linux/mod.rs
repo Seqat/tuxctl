@@ -10,10 +10,9 @@ pub use hardware::{
 };
 pub use journal::{JournalBatch, JournalCollector, JournalEntry};
 pub use network::{NetworkCollector, NetworkInterfaceInfo, NetworkSnapshot, OperState};
-#[allow(unused_imports)]
-pub use overview::{
-    ByteUsage, LogicalCpuId, LogicalCpuMetrics, OverviewCollector, OverviewMetrics, SystemIdentity,
-};
+#[cfg(test)]
+pub(crate) use overview::LogicalCpuId;
+pub use overview::{ByteUsage, LogicalCpuMetrics, OverviewCollector, OverviewMetrics};
 #[cfg(test)]
 pub use process::verify_and_send_signal_at;
 pub use process::{
