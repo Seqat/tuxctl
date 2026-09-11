@@ -1,0 +1,1034 @@
+mod hardware;
+mod layout;
+mod logs;
+mod network;
+mod processes;
+mod services;
+
+use std::sync::Arc;
+
+use ratatui::{
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, Clear, Gauge, Paragraph},
+    Frame,
+};
+
+use crate::{
+    action::{InputMode, MouseTarget, ProcessSortField, Tab},
+    app::App,
+    linux::{ByteUsage, OverviewMetrics},
+};
+
+#[derive(Debug, Default)]
+pub struct UiRegions {
+    tabs: Vec<TabRegion>,
+    process_rows: Vec<ProcessRowRegion>,
+    process_headers: Vec<ProcessHeaderRegion>,
+    process_scroll_area: Option<Rect>,
+    process_viewport: Option<(usize, usize)>,
+    service_rows: Vec<ServiceRowRegion>,
+    service_scroll_area: Option<Rect>,
+    service_viewport: Option<(usize, usize)>,
+    log_rows: Vec<LogRowRegion>,
+    log_scroll_area: Option<Rect>,
+    log_viewport: Option<(usize, usize)>,
+    network_rows: Vec<NetworkRowRegion>,
+    network_scroll_area: Option<Rect>,
+    network_viewport: Option<(usize, usize)>,
+    process_signal_cancel: Option<Rect>,
+    process_signal_confirm: Option<Rect>,
+    input_mode: InputMode,
+}
+
+#[derive(Debug)]
+struct TabRegion {
+    tab: Tab,
+    area: Rect,
+}
+
+#[derive(Debug)]
+struct ProcessRowRegion {
+    identity: crate::linux::ProcessIdentity,
+    area: Rect,
+}
+
+#[derive(Debug)]
+struct ProcessHeaderRegion {
+    field: ProcessSortField,
+    area: Rect,
+}
+
+#[derive(Debug)]
+struct ServiceRowRegion {
+    unit: Arc<str>,
+    area: Rect,
+}
+
+#[derive(Debug)]
+struct LogRowRegion {
+    id: u64,
+    area: Rect,
+}
+
+#[derive(Debug)]
+struct NetworkRowRegion {
+    name: Arc<str>,
+    area: Rect,
+}
+
+enum ContentRender {
+    None,
+    Processes(processes::ProcessRender),
+    Services(services::ServiceRender),
+    Logs(logs::LogRender),
+    Network(network::NetworkRender),
+}
+
+impl UiRegions {
+    pub(crate) fn from_tabs(tabs: impl IntoIterator<Item = (Tab, Rect)>) -> Self {
+        Self {
+            tabs: tabs
+                .into_iter()
+                .map(|(tab, area)| TabRegion { tab, area })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        if self
+            .process_signal_cancel
+            .is_some_and(|area| contains(area, column, row))
+        {
+            return Some(MouseTarget::ProcessSignalCancel);
+        }
+        if self
+            .process_signal_confirm
+            .is_some_and(|area| contains(area, column, row))
+        {
+            return Some(MouseTarget::ProcessSignalConfirm);
+        }
+
+        self.tabs
+            .iter()
+            .find(|region| contains(region.area, column, row))
+            .map(|region| MouseTarget::Tab(region.tab))
+            .or_else(|| {
+                self.process_headers
+                    .iter()
+                    .find(|region| contains(region.area, column, row))
+                    .map(|region| MouseTarget::ProcessSortHeader(region.field))
+            })
+            .or_else(|| {
+                self.process_rows
+                    .iter()
+                    .find(|region| contains(region.area, column, row))
+                    .map(|region| MouseTarget::ProcessRow(region.identity))
+            })
+            .or_else(|| {
+                self.service_rows
+                    .iter()
+                    .find(|region| contains(region.area, column, row))
+                    .map(|region| MouseTarget::ServiceRow(region.unit.clone()))
+            })
+            .or_else(|| {
+                self.log_rows
+                    .iter()
+                    .find(|region| contains(region.area, column, row))
+                    .map(|region| MouseTarget::LogRow(region.id))
+            })
+            .or_else(|| {
+                self.network_rows
+                    .iter()
+                    .find(|region| contains(region.area, column, row))
+                    .map(|region| MouseTarget::NetworkRow(region.name.clone()))
+            })
+    }
+
+    pub fn process_viewport(&self) -> Option<(usize, usize)> {
+        self.process_viewport
+    }
+
+    pub fn process_scroll_at(&self, column: u16, row: u16) -> bool {
+        self.process_scroll_area
+            .is_some_and(|area| contains(area, column, row))
+            && matches!(
+                self.input_mode,
+                InputMode::Normal | InputMode::ProcessSearch
+            )
+    }
+
+    pub fn service_viewport(&self) -> Option<(usize, usize)> {
+        self.service_viewport
+    }
+
+    pub fn service_scroll_at(&self, column: u16, row: u16) -> bool {
+        self.service_scroll_area
+            .is_some_and(|area| contains(area, column, row))
+            && matches!(
+                self.input_mode,
+                InputMode::Services | InputMode::ServiceSearch
+            )
+    }
+
+    pub fn log_viewport(&self) -> Option<(usize, usize)> {
+        self.log_viewport
+    }
+
+    pub fn log_scroll_at(&self, column: u16, row: u16) -> bool {
+        self.log_scroll_area
+            .is_some_and(|area| contains(area, column, row))
+            && matches!(self.input_mode, InputMode::Logs | InputMode::LogSearch)
+    }
+
+    pub fn network_viewport(&self) -> Option<(usize, usize)> {
+        self.network_viewport
+    }
+
+    pub fn network_scroll_at(&self, column: u16, row: u16) -> bool {
+        self.network_scroll_area
+            .is_some_and(|area| contains(area, column, row))
+            && self.input_mode == InputMode::Network
+    }
+
+    pub fn input_mode(&self) -> InputMode {
+        self.input_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_process_rows(
+        rows: impl IntoIterator<Item = (crate::linux::ProcessIdentity, Rect)>,
+        input_mode: InputMode,
+    ) -> Self {
+        let process_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(identity, area)| ProcessRowRegion { identity, area })
+            .collect();
+        let process_scroll_area = process_rows.first().map(|region| region.area);
+
+        Self {
+            process_rows,
+            process_viewport: Some((0, 1)),
+            process_scroll_area,
+            input_mode,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_process_headers(
+        headers: impl IntoIterator<Item = (ProcessSortField, Rect)>,
+    ) -> Self {
+        Self {
+            process_headers: headers
+                .into_iter()
+                .map(|(field, area)| ProcessHeaderRegion { field, area })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_service_rows(
+        rows: impl IntoIterator<Item = (Arc<str>, Rect)>,
+        input_mode: InputMode,
+    ) -> Self {
+        let service_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(unit, area)| ServiceRowRegion { unit, area })
+            .collect();
+        let service_scroll_area = service_rows.first().map(|region| region.area);
+
+        Self {
+            service_rows,
+            service_viewport: Some((0, 1)),
+            service_scroll_area,
+            input_mode,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_log_rows(
+        rows: impl IntoIterator<Item = (u64, Rect)>,
+        input_mode: InputMode,
+    ) -> Self {
+        let log_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(id, area)| LogRowRegion { id, area })
+            .collect();
+        let log_scroll_area = log_rows.first().map(|region| region.area);
+
+        Self {
+            log_rows,
+            log_viewport: Some((0, 1)),
+            log_scroll_area,
+            input_mode,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_network_rows(
+        rows: impl IntoIterator<Item = (Arc<str>, Rect)>,
+        input_mode: InputMode,
+    ) -> Self {
+        let network_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(name, area)| NetworkRowRegion { name, area })
+            .collect();
+        let network_scroll_area = network_rows.first().map(|region| region.area);
+
+        Self {
+            network_rows,
+            network_viewport: Some((0, 1)),
+            network_scroll_area,
+            input_mode,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_process_signal_buttons(cancel: Rect, confirm: Rect) -> Self {
+        Self {
+            process_signal_cancel: Some(cancel),
+            process_signal_confirm: Some(confirm),
+            input_mode: InputMode::ProcessSignalConfirm,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_input_mode(mut self, input_mode: InputMode) -> Self {
+        self.input_mode = input_mode;
+        self
+    }
+}
+
+pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return UiRegions::default();
+    }
+
+    let outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let screen = layout::screen(inner);
+    let tab_areas = layout::tab_areas(screen.tabs);
+    frame.render_widget(Clear, screen.tabs);
+    render_tabs(
+        frame,
+        app.active_tab(),
+        app.hovered(),
+        &tab_areas,
+        screen.tabs.width,
+        screen.tabs.y,
+    );
+    let content_render = render_content(frame, app, screen.content);
+
+    let mut regions = UiRegions::from_tabs(tab_areas);
+    regions.input_mode = app.input_mode();
+    match content_render {
+        ContentRender::Processes(process_render) => {
+            regions.process_rows = process_render
+                .rows
+                .into_iter()
+                .map(|(identity, area)| ProcessRowRegion { identity, area })
+                .collect();
+            regions.process_headers = process_render
+                .headers
+                .into_iter()
+                .map(|(field, area)| ProcessHeaderRegion { field, area })
+                .collect();
+            regions.process_viewport = Some((process_render.start, process_render.height));
+            regions.process_scroll_area = Some(process_render.scroll_area);
+        }
+        ContentRender::Services(service_render) => {
+            regions.service_rows = service_render
+                .rows
+                .into_iter()
+                .map(|(unit, area)| ServiceRowRegion { unit, area })
+                .collect();
+            regions.service_viewport = Some((service_render.start, service_render.height));
+            regions.service_scroll_area = Some(service_render.scroll_area);
+        }
+        ContentRender::Logs(log_render) => {
+            regions.log_rows = log_render
+                .rows
+                .into_iter()
+                .map(|(id, area)| LogRowRegion { id, area })
+                .collect();
+            regions.log_viewport = Some((log_render.start, log_render.height));
+            regions.log_scroll_area = Some(log_render.scroll_area);
+        }
+        ContentRender::Network(network_render) => {
+            regions.network_rows = network_render
+                .rows
+                .into_iter()
+                .map(|(name, area)| NetworkRowRegion { name, area })
+                .collect();
+            regions.network_viewport = Some((network_render.start, network_render.height));
+            regions.network_scroll_area = Some(network_render.scroll_area);
+        }
+        ContentRender::None => {}
+    }
+
+    if app.process_detail_visible() {
+        processes::render_detail(frame, app.selected_process(), area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+    }
+    if app.service_detail_visible() {
+        services::render_detail(frame, app.selected_service(), area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+    }
+    if app.log_detail_visible() {
+        logs::render_detail(frame, app.selected_log(), area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+    }
+    if app.network_detail_visible() {
+        network::render_detail(frame, app.selected_network(), area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+    }
+    if let Some(confirmation) = app.process_signal_confirmation() {
+        let (cancel_rect, confirm_rect) =
+            processes::render_signal_confirmation(frame, confirmation, app.hovered(), area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+        regions.process_signal_cancel = Some(cancel_rect);
+        regions.process_signal_confirm = Some(confirm_rect);
+    }
+    if app.help_visible() {
+        render_help(frame, area);
+        regions.tabs.clear();
+        regions.process_rows.clear();
+        regions.process_headers.clear();
+        regions.process_scroll_area = None;
+        regions.service_rows.clear();
+        regions.service_scroll_area = None;
+        regions.log_rows.clear();
+        regions.log_scroll_area = None;
+        regions.network_rows.clear();
+        regions.network_scroll_area = None;
+        regions.process_signal_cancel = None;
+        regions.process_signal_confirm = None;
+    }
+
+    regions
+}
+
+fn render_tabs(
+    frame: &mut Frame,
+    active_tab: Tab,
+    hovered: Option<&MouseTarget>,
+    tabs: &[(Tab, Rect)],
+    tabs_width: u16,
+    tabs_y: u16,
+) {
+    for &(tab, area) in tabs {
+        let style = if tab == active_tab {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if hovered == Some(&MouseTarget::Tab(tab)) {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", tab.label())).style(style),
+            area,
+        );
+    }
+
+    if tabs_width >= 75 {
+        let hint_text = "1-5 Tabs   ? Help ";
+        let hint_width = hint_text.len() as u16;
+        let hint_x = tabs_width.saturating_sub(hint_width);
+        if hint_x >= 48 {
+            let hint_rect = Rect::new(hint_x, tabs_y, hint_width, 1);
+            frame.render_widget(
+                Paragraph::new(hint_text)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Right),
+                hint_rect,
+            );
+        }
+    }
+}
+
+fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
+    let active_tab = app.active_tab();
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(format!(" {} ", active_tab.label()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if active_tab == Tab::Overview {
+        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        render_overview_status(frame, app, sections[0]);
+        render_overview(frame, app, sections[1]);
+        return ContentRender::None;
+    }
+
+    if active_tab == Tab::Processes {
+        return ContentRender::Processes(processes::render(frame, app, inner));
+    }
+
+    if active_tab == Tab::Services {
+        return ContentRender::Services(services::render(frame, app, inner));
+    }
+
+    if active_tab == Tab::Logs {
+        return ContentRender::Logs(logs::render(frame, app, inner));
+    }
+
+    if active_tab == Tab::Network {
+        return ContentRender::Network(network::render(frame, app, inner));
+    }
+
+    let content = Paragraph::new(vec![
+        Line::from(format!("{} screen", active_tab.label())),
+        Line::from(""),
+        Line::from("Press ? for help"),
+    ])
+    .alignment(Alignment::Center);
+    frame.render_widget(content, layout::centered_rows(inner, 3));
+    ContentRender::None
+}
+
+fn render_overview_status(frame: &mut Frame, app: &App, area: Rect) {
+    let uptime = app
+        .overview()
+        .uptime
+        .map(format_uptime)
+        .unwrap_or_else(|| "N/A".into());
+    let load = app
+        .overview()
+        .load_average
+        .map(|l| format!("{:.2}  {:.2}  {:.2}", l.one, l.five, l.fifteen))
+        .unwrap_or_else(|| "N/A".into());
+    let text = if area.width >= 80 {
+        format!(" Live System Metrics   Load: {load}   Uptime: {uptime}   ? help")
+    } else if area.width >= 50 {
+        format!(" System Overview   Uptime: {uptime}   ? help")
+    } else {
+        format!(" Overview   Up: {uptime}")
+    };
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
+        area,
+    );
+}
+
+fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let (live_area, hardware_area) = if area.width >= 85 {
+        let live_width = 42.min(area.width.saturating_sub(35));
+        let columns =
+            Layout::horizontal([Constraint::Length(live_width), Constraint::Min(35)]).split(area);
+        (columns[0], columns[1])
+    } else if area.height >= 20 {
+        let rows = Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).split(area);
+        (rows[0], rows[1])
+    } else if area.height >= 12 {
+        let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).split(area);
+        (rows[0], rows[1])
+    } else {
+        (area, Rect::default())
+    };
+
+    render_live_metrics(frame, app.overview(), live_area);
+    if hardware_area.width > 0 && hardware_area.height > 0 {
+        let fallback_memory = app.overview().memory.map(|memory| memory.total);
+        hardware::render(frame, app.hardware(), fallback_memory, hardware_area);
+    }
+}
+
+fn render_live_metrics(frame: &mut Frame, metrics: &OverviewMetrics, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Live Metrics ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let load = metrics
+        .load_average
+        .map(|load| format!("{:.2}  {:.2}  {:.2}", load.one, load.five, load.fifteen))
+        .unwrap_or_else(|| "N/A".into());
+    let uptime = metrics
+        .uptime
+        .map(format_uptime)
+        .unwrap_or_else(|| "N/A".into());
+    let filesystem = metrics
+        .root_filesystem
+        .map(format_usage)
+        .unwrap_or_else(|| "N/A".into());
+
+    if inner.height >= 12 {
+        let rows = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
+        render_gauge(
+            frame,
+            rows[1],
+            " Memory ",
+            metrics.memory.map(ByteUsage::percent),
+            metrics.memory.map(format_usage),
+        );
+        render_gauge(
+            frame,
+            rows[2],
+            " Root FS ",
+            metrics.root_filesystem.map(ByteUsage::percent),
+            metrics.root_filesystem.map(format_usage),
+        );
+
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Load:    {load}")),
+                Line::from(format!("Uptime:  {uptime}")),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" System ")),
+            rows[3],
+        );
+    } else if inner.height >= 7 {
+        let rows = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
+        render_gauge(
+            frame,
+            rows[1],
+            " Memory ",
+            metrics.memory.map(ByteUsage::percent),
+            metrics.memory.map(format_usage),
+        );
+
+        if rows[2].height > 0 {
+            frame.render_widget(
+                Paragraph::new(format!("Load: {load}  Root: {filesystem}"))
+                    .style(Style::default().fg(Color::DarkGray)),
+                rows[2],
+            );
+        }
+    } else {
+        render_gauge(frame, inner, " CPU ", metrics.cpu_percent, None);
+    }
+}
+
+fn render_gauge(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    percent: Option<f64>,
+    detail: Option<String>,
+) {
+    let ratio = percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
+    let label = match (percent, detail) {
+        (Some(percent), Some(detail)) => format!("{detail}  ({percent:.0}%)"),
+        (Some(percent), None) => format!("{percent:.0}%"),
+        (None, _) => "N/A".into(),
+    };
+
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .ratio(ratio)
+            .label(label),
+        area,
+    );
+}
+
+fn format_usage(usage: ByteUsage) -> String {
+    format!(
+        "{} / {}",
+        format_bytes(usage.used),
+        format_bytes(usage.total)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_uptime(uptime: std::time::Duration) -> String {
+    let total_minutes = uptime.as_secs() / 60;
+    let days = total_minutes / (24 * 60);
+    let hours = (total_minutes / 60) % 24;
+    let minutes = total_minutes % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn render_help(frame: &mut Frame, area: Rect) {
+    let popup = layout::centered_rect(area, 64, 21);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("General:").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  1-5                 Select tab"),
+            Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
+            Line::from("  ?                   Toggle help"),
+            Line::from("  Esc                 Close popup / cancel search"),
+            Line::from("  q / Ctrl+C          Quit application"),
+            Line::from(""),
+            Line::from("Navigation:").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
+            Line::from("  Home / End          Jump to top / bottom"),
+            Line::from("  /                   Search / filter current view"),
+            Line::from("  Enter               Open item details"),
+            Line::from(""),
+            Line::from("Screen Controls:").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
+            Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+            Line::from("  Services            r refresh system services"),
+            Line::from("  Logs                f follow, Space toggle pause"),
+            Line::from(""),
+            Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" Help ")),
+        popup,
+    );
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    let column = u32::from(column);
+    let row = u32::from(row);
+    let left = u32::from(area.x);
+    let top = u32::from(area.y);
+    let right = left + u32::from(area.width);
+    let bottom = top + u32::from(area.height);
+
+    column >= left && column < right && row >= top && row < bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+    use crate::action::Action;
+    use crate::linux::ProcessIdentity;
+
+    #[test]
+    fn hit_testing_includes_top_left_and_excludes_bottom_right() {
+        let regions = UiRegions::from_tabs([(Tab::Overview, Rect::new(10, 5, 8, 2))]);
+
+        assert_eq!(
+            regions.target_at(10, 5),
+            Some(MouseTarget::Tab(Tab::Overview))
+        );
+        assert_eq!(
+            regions.target_at(17, 6),
+            Some(MouseTarget::Tab(Tab::Overview))
+        );
+        assert_eq!(regions.target_at(18, 6), None);
+        assert_eq!(regions.target_at(17, 7), None);
+    }
+
+    #[test]
+    fn hit_testing_does_not_overflow_at_terminal_limits() {
+        let last_cell = u16::MAX - 1;
+        let regions = UiRegions::from_tabs([(Tab::Network, Rect::new(last_cell, last_cell, 1, 1))]);
+
+        assert_eq!(
+            regions.target_at(last_cell, last_cell),
+            Some(MouseTarget::Tab(Tab::Network))
+        );
+    }
+
+    #[test]
+    fn process_header_hit_testing_excludes_borders_and_spacing() {
+        let regions = UiRegions::from_process_headers([
+            (ProcessSortField::Pid, Rect::new(2, 4, 8, 1)),
+            (ProcessSortField::Name, Rect::new(12, 4, 16, 1)),
+        ]);
+
+        assert_eq!(regions.target_at(1, 4), None);
+        assert_eq!(
+            regions.target_at(2, 4),
+            Some(MouseTarget::ProcessSortHeader(ProcessSortField::Pid))
+        );
+        assert_eq!(regions.target_at(10, 4), None);
+        assert_eq!(regions.target_at(11, 4), None);
+        assert_eq!(regions.target_at(12, 3), None);
+        assert_eq!(
+            regions.target_at(12, 4),
+            Some(MouseTarget::ProcessSortHeader(ProcessSortField::Name))
+        );
+        assert_eq!(regions.target_at(12, 5), None);
+    }
+
+    #[test]
+    fn process_row_hit_testing_excludes_adjacent_lines() {
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 456,
+        };
+        let regions =
+            UiRegions::from_process_rows([(identity, Rect::new(2, 6, 40, 1))], InputMode::Normal);
+
+        assert_eq!(regions.target_at(1, 6), None);
+        assert_eq!(regions.target_at(2, 5), None);
+        assert_eq!(
+            regions.target_at(2, 6),
+            Some(MouseTarget::ProcessRow(identity))
+        );
+        assert_eq!(regions.target_at(42, 6), None);
+        assert_eq!(regions.target_at(2, 7), None);
+    }
+
+    #[test]
+    fn service_row_hit_testing_uses_unit_identity_and_excludes_borders() {
+        let regions = UiRegions::from_service_rows(
+            [(Arc::from("dbus.service"), Rect::new(2, 6, 40, 1))],
+            InputMode::Services,
+        );
+
+        assert_eq!(regions.target_at(1, 6), None);
+        assert_eq!(
+            regions.target_at(2, 6),
+            Some(MouseTarget::ServiceRow(Arc::from("dbus.service")))
+        );
+        assert_eq!(regions.target_at(42, 6), None);
+        assert_eq!(regions.target_at(2, 7), None);
+    }
+
+    #[test]
+    fn log_row_hit_testing_uses_entry_identity_and_excludes_borders() {
+        let regions = UiRegions::from_log_rows([(77, Rect::new(2, 6, 40, 1))], InputMode::Logs);
+
+        assert_eq!(regions.target_at(1, 6), None);
+        assert_eq!(regions.target_at(2, 6), Some(MouseTarget::LogRow(77)));
+        assert_eq!(regions.target_at(42, 6), None);
+        assert_eq!(regions.target_at(2, 7), None);
+    }
+
+    #[test]
+    fn formats_uptime_at_day_hour_and_minute_boundaries() {
+        let uptime = std::time::Duration::from_secs(3 * 86_400 + 14 * 3_600 + 22 * 60);
+
+        assert_eq!(format_uptime(uptime), "3d 14h 22m");
+        assert_eq!(
+            format_uptime(std::time::Duration::from_secs(65 * 60)),
+            "1h 5m"
+        );
+        assert_eq!(format_uptime(std::time::Duration::from_secs(59)), "0m");
+    }
+
+    #[test]
+    fn formats_bytes_with_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(10 * 1024 * 1024 * 1024), "10.0 GiB");
+    }
+
+    #[test]
+    fn network_row_hit_testing_uses_interface_name_and_excludes_borders() {
+        let regions = UiRegions::from_network_rows(
+            [(Arc::from("enp6s0"), Rect::new(2, 6, 40, 1))],
+            InputMode::Network,
+        );
+
+        assert_eq!(regions.target_at(1, 6), None);
+        assert_eq!(
+            regions.target_at(2, 6),
+            Some(MouseTarget::NetworkRow(Arc::from("enp6s0")))
+        );
+        assert_eq!(regions.target_at(42, 6), None);
+        assert_eq!(regions.target_at(2, 7), None);
+    }
+
+    #[test]
+    fn implemented_screens_render_in_tiny_terminals() {
+        for tab in [
+            Tab::Overview,
+            Tab::Processes,
+            Tab::Services,
+            Tab::Logs,
+            Tab::Network,
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(tab));
+
+            for (width, height) in [(1, 1), (2, 2), (10, 3)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render(frame, &app);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn process_signal_button_hit_testing() {
+        let regions = UiRegions::from_process_signal_buttons(
+            Rect::new(10, 5, 12, 1),
+            Rect::new(26, 5, 15, 1),
+        );
+
+        assert_eq!(regions.target_at(9, 5), None);
+        assert_eq!(
+            regions.target_at(10, 5),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(
+            regions.target_at(21, 5),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(regions.target_at(22, 5), None);
+
+        assert_eq!(
+            regions.target_at(26, 5),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+        assert_eq!(
+            regions.target_at(40, 5),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+        assert_eq!(regions.target_at(41, 5), None);
+        assert_eq!(regions.target_at(10, 6), None);
+    }
+
+    #[test]
+    fn process_signal_modal_renders_in_all_terminal_sizes() {
+        for signal in [
+            crate::linux::ProcessSignal::Term,
+            crate::linux::ProcessSignal::Kill,
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(Tab::Processes));
+            app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+                processes: vec![crate::linux::ProcessInfo {
+                    pid: 1234,
+                    name: "testproc".into(),
+                    cpu_percent: Some(5.0),
+                    memory_bytes: 4096,
+                    command: Some("/bin/testproc".into()),
+                    state: "R (running)".into(),
+                    parent_pid: 1,
+                    start_time: 100,
+                }],
+                error: None,
+            }));
+            app.update(Action::RequestProcessSignal(signal));
+
+            for (width, height) in [(1, 1), (5, 5), (20, 8), (60, 15), (120, 40)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render(frame, &app);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+}

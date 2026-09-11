@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+
+# Agent Files
+AGENT.md
+
+# Local environment files
+.env
+.env.*
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
