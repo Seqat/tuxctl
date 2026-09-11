@@ -1,4 +1,6 @@
 mod hardware;
+mod hardware_cpu;
+mod hardware_network_summary;
 mod layout;
 mod logs;
 mod network;

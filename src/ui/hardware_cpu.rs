@@ -1,0 +1,428 @@
+use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
+
+use crate::{
+    app::App,
+    linux::{HardwareInventory, LogicalCpuMetrics, SystemMetrics},
+};
+
+use super::{
+    hardware::{section_heading, utilization_bar},
+    layout,
+};
+
+const PREFERRED_CPU_CELL_WIDTH: usize = 20;
+const MIN_DETAILED_CPU_CELL_WIDTH: usize = 16;
+const MAX_DETAILED_CPU_COLUMNS: usize = 4;
+const MIN_USEFUL_CPU_GAUGE_WIDTH: usize = 6;
+const CPU_CELL_GAP: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CpuGridLayout {
+    columns: usize,
+    rows: usize,
+    visible: usize,
+    dense: bool,
+}
+
+pub(super) fn grid_layout(metrics: &SystemMetrics, width: usize, max_rows: usize) -> CpuGridLayout {
+    let max_cpu_id = metrics
+        .logical_cpus
+        .iter()
+        .map(|cpu| cpu.id.index())
+        .max()
+        .unwrap_or(0);
+    cpu_grid_layout(metrics.logical_cpus.len(), max_cpu_id, width, max_rows)
+}
+
+pub(super) fn desired_height(metrics: &SystemMetrics, grid: CpuGridLayout) -> u16 {
+    6_u16
+        .saturating_add(u16::try_from(grid.rows).unwrap_or(u16::MAX))
+        .saturating_add(u16::from(grid.visible < metrics.logical_cpus.len()))
+}
+
+pub(super) fn render(
+    frame: &mut Frame,
+    app: &App,
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    grid: CpuGridLayout,
+    area: Rect,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    let grid_lines = cpu_grid_lines(&metrics.logical_cpus, width, grid);
+    let has_overflow = grid.visible < metrics.logical_cpus.len();
+    let content_height = 4_usize
+        .saturating_add(grid_lines.len())
+        .saturating_add(usize::from(has_overflow));
+    let spacing = height.saturating_sub(content_height).min(2);
+    let mut lines = vec![section_heading("CPU")];
+
+    if lines.len() < height {
+        let model = inventory
+            .and_then(|inventory| inventory.cpus.first())
+            .map(|cpu| cpu.model.as_str())
+            .unwrap_or("Discovering hardware…");
+        lines.push(Line::from(layout::truncate(model, width)));
+    }
+    if spacing >= 1 && lines.len() < height {
+        lines.push(Line::from(""));
+    }
+    if lines.len() < height {
+        let percent = format_percent(metrics.cpu_percent);
+        let prefix = format!("Util  {percent:>4}  ");
+        let history_width = width.saturating_sub(prefix.chars().count());
+        let history = history_sparkline(app.aggregate_cpu_history().iter(), history_width);
+        lines.push(Line::from(layout::truncate(
+            &format!("{prefix}{history}"),
+            width,
+        )));
+    }
+    if lines.len() < height {
+        let load = metrics.load_average.map_or_else(
+            || "Load  1m N/A  5m N/A  15m N/A".into(),
+            |load| {
+                format!(
+                    "Load  1m {:.2}  5m {:.2}  15m {:.2}",
+                    load.one, load.five, load.fifteen
+                )
+            },
+        );
+        lines.push(Line::from(layout::truncate(&load, width)));
+    }
+    if spacing >= 2 && lines.len() < height {
+        lines.push(Line::from(""));
+    }
+
+    let remaining = height.saturating_sub(lines.len());
+    lines.extend(grid_lines.into_iter().take(remaining).map(Line::from));
+    if has_overflow && lines.len() < height {
+        lines.push(Line::from(format!(
+            "… {} more logical CPUs",
+            metrics.logical_cpus.len() - grid.visible
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize) -> CpuGridLayout {
+    if count == 0 || width == 0 || max_rows == 0 {
+        return CpuGridLayout {
+            columns: 0,
+            rows: 0,
+            visible: 0,
+            dense: false,
+        };
+    }
+
+    let needed_columns = count.div_ceil(max_rows);
+    let preferred_columns = cpu_columns_that_fit(width, PREFERRED_CPU_CELL_WIDTH)
+        .clamp(1, MAX_DETAILED_CPU_COLUMNS)
+        .min(count);
+    let detailed_capacity = cpu_columns_that_fit(width, MIN_DETAILED_CPU_CELL_WIDTH)
+        .clamp(1, MAX_DETAILED_CPU_COLUMNS)
+        .min(count);
+    let dense_cell_width = format!("CPU{max_cpu_id}█100%").chars().count().max(8);
+    let dense_columns = cpu_columns_that_fit(width, dense_cell_width)
+        .max(1)
+        .min(count);
+    let dense = needed_columns > detailed_capacity;
+    let columns = if dense {
+        dense_columns.max(detailed_capacity)
+    } else {
+        preferred_columns.max(needed_columns.min(detailed_capacity))
+    };
+    let visible = count.min(columns.saturating_mul(max_rows));
+
+    CpuGridLayout {
+        columns,
+        rows: visible.div_ceil(columns),
+        visible,
+        dense,
+    }
+}
+
+fn cpu_columns_that_fit(width: usize, cell_width: usize) -> usize {
+    width.saturating_add(CPU_CELL_GAP) / cell_width.saturating_add(CPU_CELL_GAP)
+}
+
+fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
+    if grid.columns == 0 || grid.visible == 0 {
+        return Vec::new();
+    }
+
+    let total_gap = CPU_CELL_GAP.saturating_mul(grid.columns.saturating_sub(1));
+    let cell_width = width.saturating_sub(total_gap) / grid.columns;
+    let gap = " ".repeat(CPU_CELL_GAP);
+    let label_width = cpus[..grid.visible]
+        .iter()
+        .map(|cpu| format!("CPU{}", cpu.id.index()).chars().count())
+        .max()
+        .unwrap_or(3);
+    cpus[..grid.visible]
+        .chunks(grid.columns)
+        .map(|row| {
+            row.iter()
+                .map(|cpu| {
+                    let text = if grid.dense {
+                        format!(
+                            "CPU{}{}{}",
+                            cpu.id.index(),
+                            utilization_level(cpu.utilization_percent),
+                            format_percent(cpu.utilization_percent)
+                        )
+                    } else {
+                        detailed_cpu_cell(cpu, cell_width, label_width)
+                    };
+                    pad_cell(&layout::truncate(&text, cell_width), cell_width)
+                })
+                .collect::<Vec<_>>()
+                .join(&gap)
+        })
+        .collect()
+}
+
+fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize) -> String {
+    let label = format!("CPU{}", cpu.id.index());
+    let percent = format_percent(cpu.utilization_percent);
+    let fixed_width = label_width + 6;
+    let gauge_width = cell_width.saturating_sub(fixed_width);
+    if gauge_width < MIN_USEFUL_CPU_GAUGE_WIDTH {
+        return layout::truncate(&format!("{label:<label_width$} {percent:>4}"), cell_width);
+    }
+    format!(
+        "{label:<label_width$} {percent:>4} {}",
+        utilization_bar(cpu.utilization_percent, gauge_width)
+    )
+}
+
+fn history_sparkline(samples: impl ExactSizeIterator<Item = f64>, width: usize) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if width == 0 {
+        return String::new();
+    }
+    let skip = samples.len().saturating_sub(width);
+    let result = samples
+        .skip(skip)
+        .map(|sample| {
+            let index = ((sample.clamp(0.0, 100.0) / 100.0) * 7.0).round() as usize;
+            LEVELS[index.min(LEVELS.len() - 1)]
+        })
+        .collect::<String>();
+    if result.is_empty() {
+        "—".into()
+    } else {
+        result
+    }
+}
+
+fn utilization_level(percent: Option<f64>) -> char {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    percent.map_or('·', |percent| {
+        let index = ((percent.clamp(0.0, 100.0) / 100.0) * 7.0).round() as usize;
+        LEVELS[index.min(LEVELS.len() - 1)]
+    })
+}
+
+fn format_percent(percent: Option<f64>) -> String {
+    percent
+        .map(|percent| format!("{:.0}%", percent.clamp(0.0, 100.0)))
+        .unwrap_or_else(|| "N/A".into())
+}
+
+fn pad_cell(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(text.chars().count());
+    format!("{text}{}", " ".repeat(padding))
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+
+    #[test]
+    fn one_logical_cpu_uses_one_detailed_cell() {
+        assert_eq!(
+            cpu_grid_layout(1, 0, 80, 6),
+            CpuGridLayout {
+                columns: 1,
+                rows: 1,
+                visible: 1,
+                dense: false,
+            }
+        );
+    }
+
+    #[test]
+    fn twelve_logical_cpus_form_a_balanced_detailed_grid() {
+        let grid = cpu_grid_layout(12, 11, 80, 6);
+        assert_eq!(grid.columns, 3);
+        assert_eq!(grid.rows, 4);
+        assert_eq!(grid.visible, 12);
+        assert!(!grid.dense);
+    }
+
+    #[test]
+    fn thirty_two_logical_cpus_switch_to_dense_cells() {
+        let grid = cpu_grid_layout(32, 31, 48, 10);
+        assert!(grid.dense);
+        assert_eq!(grid.columns, 4);
+        assert_eq!(grid.rows, 8);
+        assert_eq!(grid.visible, 32);
+    }
+
+    #[test]
+    fn high_logical_cpu_count_uses_width_and_height_budget() {
+        let grid = cpu_grid_layout(128, 127, 100, 16);
+        assert!(grid.dense);
+        assert_eq!(grid.visible, 112);
+        assert!(grid.visible < 128);
+        assert!(grid.rows <= 16);
+    }
+
+    #[test]
+    fn narrow_and_tiny_cpu_grids_remain_bounded() {
+        let narrow = cpu_grid_layout(12, 11, 9, 4);
+        assert_eq!(narrow.columns, 1);
+        assert_eq!(narrow.rows, 4);
+        assert_eq!(narrow.visible, 4);
+        assert!(narrow.visible < 12);
+
+        assert_eq!(cpu_grid_layout(32, 31, 0, 10).visible, 0);
+        assert_eq!(cpu_grid_layout(32, 31, 10, 0).visible, 0);
+    }
+
+    #[test]
+    fn history_sparkline_keeps_the_newest_samples_that_fit() {
+        let samples = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 100.0];
+
+        assert_eq!(history_sparkline(samples.into_iter(), 4), "▅▆▇█");
+        assert_eq!(history_sparkline(samples.into_iter(), 0), "");
+        assert_eq!(history_sparkline([].into_iter(), 4), "—");
+    }
+
+    #[test]
+    fn cpu_summary_uses_available_vertical_breathing_room() {
+        let mut app = App::default();
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+            cpu_percent: Some(12.0),
+            logical_cpus: vec![LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(0),
+                utilization_percent: Some(8.0),
+            }],
+            ..SystemMetrics::default()
+        }));
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &app,
+                    None,
+                    app.system_metrics(),
+                    cpu_grid_layout(1, 0, 60, 1),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert!(rows[0].starts_with("CPU"));
+        assert!(rows[1].starts_with("Discovering hardware"));
+        assert!(rows[2].trim().is_empty());
+        assert!(rows[3].starts_with("Util"));
+        assert!(rows[4].starts_with("Load"));
+        assert!(rows[5].trim().is_empty());
+        assert!(rows[6].starts_with("CPU0"));
+    }
+
+    #[test]
+    fn wide_cpu_grid_caps_columns_and_provides_useful_gauges() {
+        let grid = cpu_grid_layout(12, 11, 120, 6);
+        assert_eq!(grid.columns, 4);
+        assert!(!grid.dense);
+
+        let cpus = (0..12)
+            .map(|index| LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(index),
+                utilization_percent: Some(48.0),
+            })
+            .collect::<Vec<_>>();
+        let lines = cpu_grid_lines(&cpus, 120, grid);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].matches(['█', '░']).count() >= 4 * MIN_USEFUL_CPU_GAUGE_WIDTH);
+        assert!(lines[2].contains("CPU10"));
+        assert!(lines[2].contains("CPU11"));
+    }
+
+    #[test]
+    fn medium_and_narrow_cpu_grids_prefer_readable_columns() {
+        assert_eq!(cpu_grid_layout(12, 11, 72, 6).columns, 3);
+        assert_eq!(cpu_grid_layout(12, 11, 44, 6).columns, 2);
+    }
+
+    #[test]
+    fn logical_cpu_cells_have_an_explicit_gutter() {
+        let cpus = (0..2)
+            .map(|index| LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(index),
+                utilization_percent: Some(50.0),
+            })
+            .collect::<Vec<_>>();
+        let grid = cpu_grid_layout(2, 1, 44, 2);
+        let line = &cpu_grid_lines(&cpus, 44, grid)[0];
+        let cell_width = (44 - CPU_CELL_GAP) / 2;
+
+        assert_eq!(line.chars().count(), 44);
+        assert_eq!(
+            line.chars()
+                .skip(cell_width)
+                .take(CPU_CELL_GAP)
+                .collect::<String>(),
+            "  "
+        );
+        assert_eq!(
+            line.chars()
+                .skip(cell_width + CPU_CELL_GAP)
+                .take(4)
+                .collect::<String>(),
+            "CPU1"
+        );
+    }
+
+    #[test]
+    fn logical_cpu_percentages_and_gauges_align() {
+        let cells = [1.0, 10.0, 100.0].map(|percent| {
+            detailed_cpu_cell(
+                &LogicalCpuMetrics {
+                    id: crate::linux::LogicalCpuId::for_test(0),
+                    utilization_percent: Some(percent),
+                },
+                24,
+                5,
+            )
+        });
+        let gauge_starts = cells.clone().map(|cell| {
+            cell.chars()
+                .position(|character| matches!(character, '█' | '░'))
+                .unwrap()
+        });
+
+        assert_eq!(gauge_starts, [11, 11, 11]);
+        assert!(cells[0].contains("  1%"));
+        assert!(cells[1].contains(" 10%"));
+        assert!(cells[2].contains("100%"));
+    }
+}
