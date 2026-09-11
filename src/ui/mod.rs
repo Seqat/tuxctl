@@ -865,7 +865,7 @@ mod tests {
     #[test]
     fn minimum_terminal_size_render_boundary_is_global() {
         let app = App::default();
-        for (width, height) in [(39, 40), (40, 39), (39, 39)] {
+        for (width, height) in [(39, 15), (40, 14), (39, 14)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             assert!(rendered_regions_are_empty(&mut terminal, &app));
@@ -874,7 +874,7 @@ mod tests {
             assert!(text.contains(&format!("Current: {width}x{height}")));
         }
 
-        let backend = TestBackend::new(40, 40);
+        let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         assert!(!rendered_regions_are_empty(&mut terminal, &app));
         assert!(!buffer_text(&terminal).contains("Terminal too small"));
@@ -944,7 +944,15 @@ mod tests {
             app.update(Action::OverviewUpdated(metrics));
         }
 
-        for (width, height) in [(180, 50), (120, 40), (90, 40), (80, 40), (46, 60), (40, 40)] {
+        for (width, height) in [
+            (180, 50),
+            (120, 40),
+            (90, 40),
+            (80, 40),
+            (46, 60),
+            (40, 40),
+            (40, 15),
+        ] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal

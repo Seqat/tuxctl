@@ -1,7 +1,7 @@
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
@@ -9,18 +9,20 @@ use ratatui::{
 use crate::{
     app::App,
     linux::{
-        GpuKind, HardwareInventory, LogicalCpuMetrics, MemoryModule, OverviewMetrics,
-        StorageDevice, StorageKind,
+        GpuKind, HardwareInventory, LogicalCpuMetrics, MemoryModule, NetworkInterfaceInfo,
+        OperState, OverviewMetrics, StorageDevice, StorageKind,
     },
 };
 
 use super::{format_bytes, layout};
 
-const PREFERRED_CPU_CELL_WIDTH: usize = 22;
+const PREFERRED_CPU_CELL_WIDTH: usize = 20;
 const MIN_DETAILED_CPU_CELL_WIDTH: usize = 16;
 const MAX_DETAILED_CPU_COLUMNS: usize = 4;
 const MIN_USEFUL_CPU_GAUGE_WIDTH: usize = 6;
+const CPU_CELL_GAP: usize = 2;
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
+const MAX_NETWORK_INTERFACES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CpuGridLayout {
@@ -51,7 +53,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .map(|cpu| cpu.id.index())
         .max()
         .unwrap_or(0);
-    let grid_row_budget = usize::from(inner.height.saturating_sub(8).max(1));
+    let grid_row_budget = usize::from(inner.height.saturating_sub(10).max(1));
     let grid = cpu_grid_layout(
         cpu_count,
         max_cpu_id,
@@ -59,11 +61,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         grid_row_budget,
     );
 
+    let network_count = app.network_count();
     let desired = [
         4_u16
             .saturating_add(u16::try_from(grid.rows).unwrap_or(u16::MAX))
             .saturating_add(u16::from(grid.visible < cpu_count)),
-        3_u16.saturating_add(
+        2_u16.saturating_add(
             inventory
                 .map(|inventory| inventory.memory_modules.len().min(2) as u16)
                 .unwrap_or(0),
@@ -80,6 +83,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 })
                 .unwrap_or(1),
         ),
+        1_u16
+            .saturating_add(u16::try_from(network_count.min(MAX_NETWORK_INTERFACES)).unwrap_or(3))
+            .saturating_add(u16::from(network_count > MAX_NETWORK_INTERFACES)),
     ];
     let (heights, spacing) = allocate_section_heights(inner.height, desired);
     let areas = vertical_areas(inner, heights, spacing);
@@ -88,12 +94,13 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_ram(frame, inventory, metrics, areas[1]);
     render_gpu(frame, inventory, areas[2]);
     render_storage(frame, inventory, areas[3]);
+    render_network(frame, app, inventory, areas[4]);
 }
 
-fn allocate_section_heights(total: u16, desired: [u16; 4]) -> ([u16; 4], u16) {
-    let mut heights = [0; 4];
-    let spacing = u16::from(total >= 18);
-    let mut remaining = total.saturating_sub(spacing.saturating_mul(3));
+fn allocate_section_heights(total: u16, desired: [u16; 5]) -> ([u16; 5], u16) {
+    let mut heights = [0; 5];
+    let spacing = u16::from(total >= 21);
+    let mut remaining = total.saturating_sub(spacing.saturating_mul(4));
 
     for height in &mut heights {
         if remaining == 0 {
@@ -113,7 +120,7 @@ fn allocate_section_heights(total: u16, desired: [u16; 4]) -> ([u16; 4], u16) {
     (heights, spacing)
 }
 
-fn vertical_areas(area: Rect, heights: [u16; 4], spacing: u16) -> [Rect; 4] {
+fn vertical_areas(area: Rect, heights: [u16; 5], spacing: u16) -> [Rect; 5] {
     let mut y = area.y;
     let mut index = 0;
     heights.map(|height| {
@@ -200,14 +207,16 @@ fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize)
     }
 
     let needed_columns = count.div_ceil(max_rows);
-    let preferred_columns = (width / PREFERRED_CPU_CELL_WIDTH)
+    let preferred_columns = cpu_columns_that_fit(width, PREFERRED_CPU_CELL_WIDTH)
         .clamp(1, MAX_DETAILED_CPU_COLUMNS)
         .min(count);
-    let detailed_capacity = (width / MIN_DETAILED_CPU_CELL_WIDTH)
+    let detailed_capacity = cpu_columns_that_fit(width, MIN_DETAILED_CPU_CELL_WIDTH)
         .clamp(1, MAX_DETAILED_CPU_COLUMNS)
         .min(count);
     let dense_cell_width = format!("CPU{max_cpu_id}█100%").chars().count().max(8);
-    let dense_columns = (width / dense_cell_width).max(1).min(count);
+    let dense_columns = cpu_columns_that_fit(width, dense_cell_width)
+        .max(1)
+        .min(count);
     let dense = needed_columns > detailed_capacity;
     let columns = if dense {
         dense_columns.max(detailed_capacity)
@@ -224,12 +233,23 @@ fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize)
     }
 }
 
+fn cpu_columns_that_fit(width: usize, cell_width: usize) -> usize {
+    width.saturating_add(CPU_CELL_GAP) / cell_width.saturating_add(CPU_CELL_GAP)
+}
+
 fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
     if grid.columns == 0 || grid.visible == 0 {
         return Vec::new();
     }
 
-    let cell_width = width / grid.columns;
+    let total_gap = CPU_CELL_GAP.saturating_mul(grid.columns.saturating_sub(1));
+    let cell_width = width.saturating_sub(total_gap) / grid.columns;
+    let gap = " ".repeat(CPU_CELL_GAP);
+    let label_width = cpus[..grid.visible]
+        .iter()
+        .map(|cpu| format!("CPU{}", cpu.id.index()).chars().count())
+        .max()
+        .unwrap_or(3);
     cpus[..grid.visible]
         .chunks(grid.columns)
         .map(|row| {
@@ -243,26 +263,26 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
                             format_percent(cpu.utilization_percent)
                         )
                     } else {
-                        detailed_cpu_cell(cpu, cell_width)
+                        detailed_cpu_cell(cpu, cell_width, label_width)
                     };
                     pad_cell(&layout::truncate(&text, cell_width), cell_width)
                 })
-                .collect::<String>()
+                .collect::<Vec<_>>()
+                .join(&gap)
         })
         .collect()
 }
 
-fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize) -> String {
+fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize) -> String {
     let label = format!("CPU{}", cpu.id.index());
     let percent = format_percent(cpu.utilization_percent);
-    let percent_width = percent.chars().count().max(4);
-    let fixed_width = label.chars().count() + percent_width + 2;
+    let fixed_width = label_width + 6;
     let gauge_width = cell_width.saturating_sub(fixed_width);
     if gauge_width < MIN_USEFUL_CPU_GAUGE_WIDTH {
-        return layout::truncate(&format!("{label} {percent}"), cell_width);
+        return layout::truncate(&format!("{label:<label_width$} {percent:>4}"), cell_width);
     }
     format!(
-        "{label} {} {percent:>4}",
+        "{label:<label_width$} {percent:>4} {}",
         utilization_bar(cpu.utilization_percent, gauge_width)
     )
 }
@@ -277,28 +297,14 @@ fn render_ram(
         return;
     }
     let width = usize::from(area.width);
-    let total = inventory
-        .and_then(|inventory| inventory.total_memory)
-        .or_else(|| metrics.memory.map(|memory| memory.total));
     let mut lines = vec![section_heading("RAM")];
 
     if lines.len() < usize::from(area.height) {
-        let total_line = format!(
-            "Total  {}",
-            total
-                .map(format_binary_capacity)
-                .unwrap_or_else(|| "N/A".into())
-        );
         let usage_line = metrics.memory.map_or_else(
             || "Used  N/A".into(),
             |memory| ram_usage_line(memory, width),
         );
-        if area.height >= 3 {
-            lines.push(Line::from(layout::truncate(&total_line, width)));
-        }
-        if lines.len() < usize::from(area.height) {
-            lines.push(Line::from(layout::truncate(&usage_line, width)));
-        }
+        lines.push(Line::from(layout::truncate(&usage_line, width)));
     }
 
     if let Some(inventory) = inventory {
@@ -416,6 +422,154 @@ fn render_storage(frame: &mut Frame, inventory: Option<&HardwareInventory>, area
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_network(frame: &mut Frame, app: &App, inventory: Option<&HardwareInventory>, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.width);
+    let mut lines = vec![section_heading("NETWORK")];
+    let remaining = usize::from(area.height).saturating_sub(1);
+    if remaining == 0 {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    if app.networks().is_empty() {
+        lines.push(Line::from(if app.network_error().is_some() {
+            "Network data unavailable"
+        } else {
+            "No interfaces found"
+        }));
+    } else {
+        let show_overflow = app.network_count() > MAX_NETWORK_INTERFACES && remaining > 1;
+        let interface_limit = app
+            .network_count()
+            .min(MAX_NETWORK_INTERFACES)
+            .min(remaining.saturating_sub(usize::from(show_overflow)));
+        lines.extend(
+            app.networks()
+                .iter()
+                .take(interface_limit)
+                .map(|interface| {
+                    let model = inventory.and_then(|inventory| {
+                        inventory
+                            .network_devices
+                            .iter()
+                            .find(|device| device.interface_name == interface.name)
+                            .map(|device| device.model.as_str())
+                    });
+                    network_summary_line(interface, model, width)
+                }),
+        );
+        if show_overflow {
+            lines.push(Line::from(format!(
+                "… {} more interfaces",
+                app.network_count() - interface_limit
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn network_summary_line(
+    interface: &NetworkInterfaceInfo,
+    model: Option<&str>,
+    width: usize,
+) -> Line<'static> {
+    let (prefix, state, suffix) = network_summary_parts(interface, model, width);
+    let (_, state_style) = super::network::state_display(interface.operstate);
+    Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(state, state_style),
+        Span::raw(suffix),
+    ])
+}
+
+fn network_summary_parts(
+    interface: &NetworkInterfaceInfo,
+    model: Option<&str>,
+    width: usize,
+) -> (String, String, String) {
+    let (state_text, _) = super::network::state_display(interface.operstate);
+    let state = layout::truncate(state_text, width);
+    let separator_width = usize::from(width > state.chars().count()) * 2;
+    let name_width = width
+        .saturating_sub(state.chars().count() + separator_width)
+        .min(16);
+    let name = layout::truncate(&interface.name, name_width);
+    let mut prefix = if name.is_empty() {
+        String::new()
+    } else {
+        format!("{name}  ")
+    };
+
+    let traffic = network_traffic(interface).and_then(|traffic| {
+        let full = format!("  RX {}  TX {}", traffic.0, traffic.1);
+        let compact = format!("  R {}  T {}", traffic.0, traffic.1);
+        let tight = format!(
+            "  R{} T{}",
+            format_rate_tight(interface.rx_rate_bytes_per_sec),
+            format_rate_tight(interface.tx_rate_bytes_per_sec)
+        );
+        let base_width = prefix.chars().count() + state.chars().count();
+        if base_width + full.chars().count() <= width {
+            Some(full)
+        } else if base_width + compact.chars().count() <= width {
+            Some(compact)
+        } else if base_width + tight.chars().count() <= width {
+            Some(tight)
+        } else {
+            None
+        }
+    });
+    let suffix = traffic.unwrap_or_default();
+
+    if let Some(model) = model {
+        let occupied = prefix.chars().count() + state.chars().count() + suffix.chars().count();
+        let model_width = width.saturating_sub(occupied + 2);
+        if model_width >= 4 {
+            prefix.push_str(&layout::truncate(model, model_width));
+            prefix.push_str("  ");
+        }
+    }
+
+    (prefix, state, suffix)
+}
+
+fn network_traffic(interface: &NetworkInterfaceInfo) -> Option<(String, String)> {
+    let has_traffic = [
+        interface.rx_rate_bytes_per_sec,
+        interface.tx_rate_bytes_per_sec,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|rate| rate >= 1.0);
+    if interface.operstate != OperState::Up && !has_traffic {
+        return None;
+    }
+    Some((
+        super::network::format_rate(interface.rx_rate_bytes_per_sec),
+        super::network::format_rate(interface.tx_rate_bytes_per_sec),
+    ))
+}
+
+fn format_rate_tight(rate: Option<f64>) -> String {
+    const UNITS: [&str; 5] = ["B/s", "K/s", "M/s", "G/s", "T/s"];
+    let Some(mut value) = rate else {
+        return "--".into();
+    };
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || value >= 10.0 {
+        format!("{value:.0}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
 }
 
 fn section_heading(label: &'static str) -> Line<'static> {
@@ -547,7 +701,30 @@ fn format_capacity(bytes: u64, base: u64, units: [&str; 5]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
     use super::*;
+
+    fn test_interface(name: &str, state: OperState) -> NetworkInterfaceInfo {
+        NetworkInterfaceInfo {
+            name: name.into(),
+            operstate: state,
+            mac_address: None,
+            mtu: None,
+            ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_dropped: 0,
+            tx_dropped: 0,
+            rx_rate_bytes_per_sec: Some(1.2 * 1024.0 * 1024.0),
+            tx_rate_bytes_per_sec: Some(84.2 * 1024.0),
+        }
+    }
 
     #[test]
     fn one_logical_cpu_uses_one_detailed_cell() {
@@ -584,7 +761,8 @@ mod tests {
     fn high_logical_cpu_count_uses_width_and_height_budget() {
         let grid = cpu_grid_layout(128, 127, 100, 16);
         assert!(grid.dense);
-        assert_eq!(grid.visible, 128);
+        assert_eq!(grid.visible, 112);
+        assert!(grid.visible < 128);
         assert!(grid.rows <= 16);
     }
 
@@ -635,6 +813,59 @@ mod tests {
     }
 
     #[test]
+    fn logical_cpu_cells_have_an_explicit_gutter() {
+        let cpus = (0..2)
+            .map(|index| LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(index),
+                utilization_percent: Some(50.0),
+            })
+            .collect::<Vec<_>>();
+        let grid = cpu_grid_layout(2, 1, 44, 2);
+        let line = &cpu_grid_lines(&cpus, 44, grid)[0];
+        let cell_width = (44 - CPU_CELL_GAP) / 2;
+
+        assert_eq!(line.chars().count(), 44);
+        assert_eq!(
+            line.chars()
+                .skip(cell_width)
+                .take(CPU_CELL_GAP)
+                .collect::<String>(),
+            "  "
+        );
+        assert_eq!(
+            line.chars()
+                .skip(cell_width + CPU_CELL_GAP)
+                .take(4)
+                .collect::<String>(),
+            "CPU1"
+        );
+    }
+
+    #[test]
+    fn logical_cpu_percentages_and_gauges_align() {
+        let cells = [1.0, 10.0, 100.0].map(|percent| {
+            detailed_cpu_cell(
+                &LogicalCpuMetrics {
+                    id: crate::linux::LogicalCpuId::for_test(0),
+                    utilization_percent: Some(percent),
+                },
+                24,
+                5,
+            )
+        });
+        let gauge_starts = cells.clone().map(|cell| {
+            cell.chars()
+                .position(|character| matches!(character, '█' | '░'))
+                .unwrap()
+        });
+
+        assert_eq!(gauge_starts, [11, 11, 11]);
+        assert!(cells[0].contains("  1%"));
+        assert!(cells[1].contains(" 10%"));
+        assert!(cells[2].contains("100%"));
+    }
+
+    #[test]
     fn ram_gauge_expands_but_remains_bounded() {
         let memory = crate::linux::ByteUsage {
             used: 8 * 1024 * 1024 * 1024,
@@ -646,6 +877,118 @@ mod tests {
         assert_eq!(wide.matches(['█', '░']).count(), MAX_RAM_GAUGE_WIDTH);
         assert!(wide.chars().count() <= 100);
         assert!(narrow.chars().count() <= 32);
+    }
+
+    #[test]
+    fn ram_render_omits_the_redundant_total_row() {
+        let mut app = App::default();
+        app.update(crate::action::Action::OverviewUpdated(OverviewMetrics {
+            memory: Some(crate::linux::ByteUsage {
+                used: 8 * 1024 * 1024 * 1024,
+                total: 32 * 1024 * 1024 * 1024,
+            }),
+            ..OverviewMetrics::default()
+        }));
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("RAM"));
+        assert!(text.contains("Used"));
+        assert!(!text.contains("Total"));
+    }
+
+    #[test]
+    fn network_summary_handles_models_rates_and_down_interfaces() {
+        let up = test_interface("enp8s0", OperState::Up);
+        let with_model = network_summary_parts(&up, Some("Realtek RTL8125 2.5GbE"), 100);
+        let with_model = format!("{}{}{}", with_model.0, with_model.1, with_model.2);
+        assert!(with_model.contains("enp8s0  Realtek RTL8125 2.5GbE  ● up"));
+        assert!(with_model.contains("RX 1.2 MiB/s"));
+        assert!(with_model.contains("TX 84.2 KiB/s"));
+
+        let without_model = network_summary_parts(&up, None, 100);
+        let without_model = format!("{}{}{}", without_model.0, without_model.1, without_model.2);
+        assert!(without_model.starts_with("enp8s0  ● up"));
+
+        let mut down = test_interface("wlp5s0", OperState::Down);
+        down.rx_rate_bytes_per_sec = Some(0.0);
+        down.tx_rate_bytes_per_sec = None;
+        let down = network_summary_parts(&down, Some("Intel Wi-Fi 6E AX210"), 80);
+        let down = format!("{}{}{}", down.0, down.1, down.2);
+        assert!(down.contains("○ down"));
+        assert!(!down.contains("RX"));
+        assert!(!down.contains("TX"));
+    }
+
+    #[test]
+    fn network_summary_truncates_long_models_to_available_width() {
+        let interface = test_interface("enp8s0", OperState::Up);
+        let parts = network_summary_parts(
+            &interface,
+            Some("A deliberately very long network adapter model description"),
+            60,
+        );
+        let text = format!("{}{}{}", parts.0, parts.1, parts.2);
+
+        assert!(text.chars().count() <= 60);
+        assert!(text.contains('…'));
+        assert!(text.contains("● up"));
+        assert!(text.contains("RX"));
+    }
+
+    #[test]
+    fn narrow_network_summary_keeps_status_and_compact_rates() {
+        let interface = test_interface("enp8s0", OperState::Up);
+        let parts = network_summary_parts(&interface, Some("Realtek RTL8125 2.5GbE"), 36);
+        let text = format!("{}{}{}", parts.0, parts.1, parts.2);
+
+        assert!(text.chars().count() <= 36);
+        assert!(text.starts_with("enp8s0"));
+        assert!(text.contains("● up"));
+        assert!(text.contains("R1.2M/s"));
+        assert!(text.contains("T84K/s"));
+    }
+
+    #[test]
+    fn network_section_limits_visible_interfaces() {
+        let mut app = App::default();
+        let interfaces = (0..5)
+            .map(|index| test_interface(&format!("eth{index}"), OperState::Up))
+            .collect();
+        app.update(crate::action::Action::NetworkUpdated(
+            crate::linux::NetworkSnapshot {
+                interfaces,
+                error: None,
+            },
+        ));
+        let backend = TestBackend::new(100, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("eth0"));
+        assert!(text.contains("eth1"));
+        assert!(text.contains("eth2"));
+        assert!(!text.contains("eth3"));
+        assert!(text.contains("2 more interfaces"));
     }
 
     #[test]
@@ -687,10 +1030,10 @@ mod tests {
     #[test]
     fn section_height_allocation_never_exceeds_the_available_area() {
         for height in 0..40 {
-            let (allocated, spacing) = allocate_section_heights(height, [20, 5, 4, 8]);
-            let used = allocated.into_iter().sum::<u16>() + spacing * 3;
+            let (allocated, spacing) = allocate_section_heights(height, [20, 4, 4, 8, 5]);
+            let used = allocated.into_iter().sum::<u16>() + spacing * 4;
             assert!(used <= height);
-            if height >= 18 {
+            if height >= 21 {
                 assert_eq!(spacing, 1);
             }
         }

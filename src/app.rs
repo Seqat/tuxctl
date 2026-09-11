@@ -396,6 +396,10 @@ impl App {
         self.networks.len()
     }
 
+    pub fn networks(&self) -> &[NetworkInterfaceInfo] {
+        &self.networks
+    }
+
     pub fn network_at(&self, index: usize) -> Option<&NetworkInterfaceInfo> {
         self.networks.get(index)
     }
@@ -1368,7 +1372,7 @@ impl App {
     }
 
     fn update_networks(&mut self, snapshot: NetworkSnapshot) -> bool {
-        let visible = self.active_tab == Tab::Network;
+        let visible = matches!(self.active_tab, Tab::Overview | Tab::Network);
         if let Some(error) = snapshot.error {
             if self.network_error.as_ref() == Some(&error) {
                 return false;
@@ -2503,12 +2507,12 @@ mod tests {
         assert!(!srv_redraw);
         assert_eq!(app.service_count(), 1);
 
-        // Network update while on Overview tab should return false, but update state
+        // Network updates affect the summary shown on the active Overview.
         let net_redraw = app.update(Action::NetworkUpdated(NetworkSnapshot {
             interfaces: vec![dummy_network("eth0")],
             error: None,
         }));
-        assert!(!net_redraw);
+        assert!(net_redraw);
         assert_eq!(app.network_count(), 1);
 
         // Overview update while on Overview tab DOES trigger redraw
@@ -2529,6 +2533,12 @@ mod tests {
         };
         let ov_redraw_inactive = app.update(Action::OverviewUpdated(metrics2));
         assert!(!ov_redraw_inactive);
+
+        let net_redraw_inactive = app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("wlan0")],
+            error: None,
+        }));
+        assert!(!net_redraw_inactive);
 
         // Process update while on Processes tab DOES trigger redraw
         let proc_redraw_active =
