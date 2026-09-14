@@ -6,7 +6,11 @@ use ratatui::{
     Frame,
 };
 
-use crate::{action::MouseTarget, app::App, linux::JournalEntry};
+use crate::{
+    action::MouseTarget,
+    app::App,
+    linux::{priority_label, JournalEntry},
+};
 
 use super::layout;
 
@@ -209,7 +213,7 @@ pub fn render_detail(frame: &mut Frame, entry: Option<&JournalEntry>, area: Rect
     let lines = entry.map_or_else(
         || vec![Line::from("Journal entry is no longer available")],
         |entry| {
-            vec![
+            let mut lines = vec![
                 Line::from(format!(
                     "Time:     {}",
                     format_timestamp(entry.timestamp_micros)
@@ -218,11 +222,20 @@ pub fn render_detail(frame: &mut Frame, entry: Option<&JournalEntry>, area: Rect
                 Line::from(format!("Priority: {}", priority_label(entry.priority))),
                 Line::from(""),
                 Line::from("Message:"),
-                Line::from(entry.message.as_str()),
-                Line::from(""),
+            ];
+            if entry.message.is_empty() {
+                lines.push(Line::from(""));
+            } else {
+                for line in entry.message.lines() {
+                    lines.push(Line::from(line));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(
                 Line::from("Read-only inspection; Esc closes")
                     .style(Style::default().fg(Color::DarkGray)),
-            ]
+            );
+            lines
         },
     );
 
@@ -260,20 +273,6 @@ fn format_timestamp(timestamp_micros: Option<u64>) -> String {
     )
 }
 
-fn priority_label(priority: Option<u8>) -> &'static str {
-    match priority {
-        Some(0) => "emerg",
-        Some(1) => "alert",
-        Some(2) => "crit",
-        Some(3) => "error",
-        Some(4) => "warn",
-        Some(5) => "notice",
-        Some(6) => "info",
-        Some(7) => "debug",
-        _ => "-",
-    }
-}
-
 fn single_line(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -281,6 +280,8 @@ fn single_line(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn formats_timestamp_and_priorities() {
@@ -293,5 +294,23 @@ mod tests {
     #[test]
     fn table_messages_are_flattened_to_one_visual_row() {
         assert_eq!(single_line("first\n second\tthird"), "first second third");
+    }
+
+    #[test]
+    fn detail_renders_multiline_messages_safely() {
+        let entry = JournalEntry {
+            id: 1,
+            timestamp_micros: Some(1_000_000),
+            source: "test".into(),
+            priority: Some(3),
+            message: "line1\nline2\nline3".into(),
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_detail(frame, Some(&entry), Rect::new(0, 0, 100, 30));
+            })
+            .unwrap();
     }
 }

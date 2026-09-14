@@ -22,6 +22,26 @@ pub struct JournalEntry {
     pub message: String,
 }
 
+impl JournalEntry {
+    pub fn priority_label(&self) -> &'static str {
+        priority_label(self.priority)
+    }
+}
+
+pub fn priority_label(priority: Option<u8>) -> &'static str {
+    match priority {
+        Some(0) => "emerg",
+        Some(1) => "alert",
+        Some(2) => "crit",
+        Some(3) => "error",
+        Some(4) => "warn",
+        Some(5) => "notice",
+        Some(6) => "info",
+        Some(7) => "debug",
+        _ => "-",
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JournalBatch {
     pub entries: Vec<JournalEntry>,

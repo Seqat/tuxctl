@@ -504,6 +504,10 @@ impl App {
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
+            Action::Resize => {
+                self.hovered = None;
+                true
+            }
             _ if self.help_visible
                 || self.process_signal_confirmation.is_some()
                 || self.process_detail_visible
@@ -585,10 +589,6 @@ impl App {
             Action::NetworkLast => self.select_network_index(self.networks.len().saturating_sub(1)),
             Action::SelectNetwork(name) => self.select_network(&name),
             Action::OpenNetworkDetails => self.open_network_details(),
-            Action::Resize => {
-                self.hovered = None;
-                true
-            }
             Action::Tick => false,
         }
     }
@@ -636,23 +636,32 @@ impl App {
         } else if self.network_detail_visible {
             self.network_detail_visible = false;
             true
-        } else if self.process_searching || !self.process_search_query.is_empty() {
-            self.process_searching = false;
-            self.process_search_query.clear();
-            self.rebuild_process_filter();
-            true
-        } else if self.service_searching || !self.service_search_query.is_empty() {
-            self.service_searching = false;
-            self.service_search_query.clear();
-            self.rebuild_service_filter();
-            true
-        } else if self.log_searching || !self.log_search_query.is_empty() {
-            self.log_searching = false;
-            self.log_search_query.clear();
-            self.rebuild_log_filter();
-            true
         } else {
-            false
+            match self.active_tab {
+                Tab::Processes
+                    if self.process_searching || !self.process_search_query.is_empty() =>
+                {
+                    self.process_searching = false;
+                    self.process_search_query.clear();
+                    self.rebuild_process_filter();
+                    true
+                }
+                Tab::Services
+                    if self.service_searching || !self.service_search_query.is_empty() =>
+                {
+                    self.service_searching = false;
+                    self.service_search_query.clear();
+                    self.rebuild_service_filter();
+                    true
+                }
+                Tab::Logs if self.log_searching || !self.log_search_query.is_empty() => {
+                    self.log_searching = false;
+                    self.log_search_query.clear();
+                    self.rebuild_log_filter();
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
@@ -1425,6 +1434,9 @@ impl App {
     }
 
     pub fn select_network(&mut self, name: &str) -> bool {
+        if self.active_tab != Tab::Network {
+            return false;
+        }
         if self.selected_network.as_deref() == Some(name) {
             return false;
         }
@@ -1439,6 +1451,9 @@ impl App {
     }
 
     fn select_network_index(&mut self, index: usize) -> bool {
+        if self.active_tab != Tab::Network {
+            return false;
+        }
         let Some(iface) = self.networks.get(index) else {
             return false;
         };
@@ -1454,9 +1469,10 @@ impl App {
 
     fn open_network_details(&mut self) -> bool {
         if self.active_tab == Tab::Network && self.selected_network.is_some() {
-            self.network_detail_visible = !self.network_detail_visible;
+            let changed = !self.network_detail_visible;
+            self.network_detail_visible = true;
             self.hovered = None;
-            true
+            changed
         } else {
             false
         }
@@ -1542,9 +1558,11 @@ fn log_matches(entry: &JournalEntry, query: &str) -> bool {
     query.is_empty()
         || entry.source.to_lowercase().contains(query)
         || entry.message.to_lowercase().contains(query)
-        || entry
-            .priority
-            .is_some_and(|priority| priority.to_string().contains(query))
+        || entry.priority.is_some_and(|priority| {
+            priority.to_string().contains(query)
+                || entry.priority_label().contains(query)
+                || (priority == 4 && "warning".contains(query))
+        })
 }
 
 pub(crate) fn calculate_scroll(
@@ -2623,5 +2641,109 @@ mod tests {
 
         app.update(Action::BeginProcessSearch);
         assert!(app.process_action_message().is_none());
+    }
+
+    #[test]
+    fn resize_triggers_redraw_even_when_modal_is_open() {
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        assert!(app.help_visible());
+        assert!(app.update(Action::Resize));
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "proc",
+        )])));
+        app.update(Action::OpenProcessDetails);
+        assert!(app.process_detail_visible());
+        assert!(app.update(Action::Resize));
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "proc",
+        )])));
+        app.update(Action::RequestProcessSignal(ProcessSignal::Term));
+        assert!(app.process_signal_confirmation().is_some());
+        assert!(app.update(Action::Resize));
+    }
+
+    #[test]
+    fn escape_clears_search_only_for_active_tab() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('f'));
+        assert_eq!(app.process_search_query(), "f");
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert_eq!(app.process_search_query(), "f");
+        app.update(Action::BeginServiceSearch);
+        app.update(Action::AppendServiceSearch('s'));
+        assert_eq!(app.service_search_query(), "s");
+
+        // Esc on Services tab should clear Services search, not Processes search
+        app.update(Action::Escape);
+        assert_eq!(app.service_search_query(), "");
+        assert!(!app.service_searching());
+        assert_eq!(app.process_search_query(), "f");
+    }
+
+    #[test]
+    fn network_selection_and_details_guarded_by_active_tab() {
+        let mut app = App::default();
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0"), dummy_network("eth1")],
+            error: None,
+        }));
+
+        // On Overview tab, network selection actions should return false
+        assert_eq!(app.active_tab(), Tab::Overview);
+        assert!(!app.update(Action::SelectNetwork("eth1".into())));
+        assert!(!app.update(Action::NetworkFirst));
+        assert!(!app.update(Action::NetworkNext));
+
+        // Switch to Network tab
+        app.update(Action::SelectTab(Tab::Network));
+        assert!(app.update(Action::SelectNetwork("eth1".into())));
+        assert_eq!(
+            app.selected_network().map(|n| n.name.as_str()),
+            Some("eth1")
+        );
+
+        // Open network details should open, not toggle
+        assert!(app.update(Action::OpenNetworkDetails));
+        assert!(app.network_detail_visible());
+        assert!(!app.update(Action::OpenNetworkDetails));
+        assert!(app.network_detail_visible());
+    }
+
+    #[test]
+    fn log_matches_matches_priority_names_and_numbers() {
+        let error_entry = JournalEntry {
+            id: 1,
+            timestamp_micros: None,
+            source: "app".into(),
+            priority: Some(3),
+            message: "something happened".into(),
+        };
+        let warn_entry = JournalEntry {
+            id: 2,
+            timestamp_micros: None,
+            source: "app".into(),
+            priority: Some(4),
+            message: "look out".into(),
+        };
+
+        assert!(log_matches(&error_entry, "error"));
+        assert!(log_matches(&error_entry, "err"));
+        assert!(log_matches(&error_entry, "3"));
+        assert!(!log_matches(&error_entry, "warn"));
+
+        assert!(log_matches(&warn_entry, "warn"));
+        assert!(log_matches(&warn_entry, "warning"));
+        assert!(log_matches(&warn_entry, "4"));
+        assert!(!log_matches(&warn_entry, "crit"));
     }
 }

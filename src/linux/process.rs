@@ -104,6 +104,10 @@ pub fn verify_and_send_signal_at<F>(
 where
     F: FnOnce(libc::pid_t, libc::c_int) -> io::Result<()>,
 {
+    if identity.pid == 0 {
+        return Err(ProcessSignalError::Failed("cannot signal PID 0".into()));
+    }
+
     let stat_path = proc_dir.join(identity.pid.to_string()).join("stat");
     let stat_contents = match fs::read_to_string(&stat_path) {
         Ok(contents) => contents,
@@ -388,7 +392,9 @@ fn parse_process_stat(contents: &str, page_size: u64) -> Option<RawProcess> {
     let system_ticks = fields[12].parse::<u64>().ok()?;
     let start_time = fields[19].parse::<u64>().ok()?;
     let resident_pages = fields[21].parse::<i64>().ok()?;
-    let memory_bytes = u64::try_from(resident_pages).ok()?.checked_mul(page_size)?;
+    let memory_bytes = u64::try_from(resident_pages.max(0))
+        .unwrap_or(0)
+        .saturating_mul(page_size);
 
     Some(RawProcess {
         pid,
@@ -671,5 +677,34 @@ mod tests {
 
         assert_eq!(res, Err(ProcessSignalError::PermissionDenied));
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn signal_verification_rejects_pid_zero() {
+        let temp_dir = std::env::temp_dir();
+        let identity = ProcessIdentity {
+            pid: 0,
+            start_time: 0,
+        };
+        let mut called = false;
+        let res =
+            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Term, |_pid, _sig| {
+                called = true;
+                Ok(())
+            });
+
+        assert_eq!(
+            res,
+            Err(ProcessSignalError::Failed("cannot signal PID 0".into()))
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn parses_process_stat_with_negative_resident_pages() {
+        let stat = "123 (test) S 1 123 123 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 500 1000 -5";
+        let proc = parse_process_stat(stat, 4096).expect("process stat should parse successfully");
+        assert_eq!(proc.pid, 123);
+        assert_eq!(proc.memory_bytes, 0);
     }
 }

@@ -50,7 +50,9 @@ fn main() -> io::Result<()> {
     let mut regions = draw_app(&mut terminal, &mut app)?;
 
     while !app.should_quit() {
-        let action = if let Some(metrics) = metrics.latest() {
+        let action = if let Some(user_action) = events.poll_action(&regions, app.hovered())? {
+            Some(user_action)
+        } else if let Some(metrics) = metrics.latest() {
             Some(action::Action::SystemMetricsUpdated(metrics))
         } else if let Some(snapshot) = processes.latest() {
             Some(action::Action::ProcessesUpdated(snapshot))

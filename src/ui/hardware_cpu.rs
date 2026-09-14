@@ -62,10 +62,14 @@ pub(super) fn render(
     let mut lines = vec![section_heading("CPU")];
 
     if lines.len() < height {
-        let model = inventory
-            .and_then(|inventory| inventory.cpus.first())
-            .map(|cpu| cpu.model.as_str())
-            .unwrap_or("Discovering hardware…");
+        let model = match inventory {
+            None => "Discovering hardware…",
+            Some(inventory) => inventory
+                .cpus
+                .first()
+                .map(|cpu| cpu.model.as_str())
+                .unwrap_or("Unavailable / none detected"),
+        };
         lines.push(Line::from(layout::truncate(model, width)));
     }
     if spacing >= 1 && lines.len() < height {
@@ -424,5 +428,34 @@ mod tests {
         assert!(cells[0].contains("  1%"));
         assert!(cells[1].contains(" 10%"));
         assert!(cells[2].contains("100%"));
+    }
+
+    #[test]
+    fn cpu_model_shows_unavailable_when_inventory_has_no_cpus() {
+        let app = App::default();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let inventory = crate::linux::HardwareInventory::default();
+        let metrics = SystemMetrics::default();
+        let grid = cpu_grid_layout(metrics.logical_cpus.len(), 0, 80, 20);
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &app,
+                    Some(&inventory),
+                    &metrics,
+                    grid,
+                    Rect::new(0, 0, 80, 20),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Unavailable / none detected"));
     }
 }

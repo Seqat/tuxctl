@@ -55,6 +55,19 @@ impl EventHandler {
             }
         }
     }
+
+    pub fn poll_action(
+        &mut self,
+        regions: &UiRegions,
+        hovered: Option<&MouseTarget>,
+    ) -> io::Result<Option<Action>> {
+        while event::poll(Duration::ZERO)? {
+            if let Some(action) = translate_event(event::read()?, regions, hovered) {
+                return Ok(Some(action));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn translate_event(
@@ -202,6 +215,7 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         return match key.code {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Esc => Some(Action::Escape),
+            KeyCode::Char('?') if input_mode == InputMode::Help => Some(Action::Escape),
             _ => None,
         };
     }
@@ -874,5 +888,18 @@ mod tests {
                 "Ctrl+C failed in mode {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn question_mark_toggles_help_closed() {
+        let help_regions = UiRegions::default().with_input_mode(InputMode::Help);
+        let question_key = Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(
+            translate_event(question_key.clone(), &help_regions, None),
+            Some(Action::Escape)
+        );
+
+        let detail_regions = UiRegions::default().with_input_mode(InputMode::ProcessDetail);
+        assert_eq!(translate_event(question_key, &detail_regions, None), None);
     }
 }

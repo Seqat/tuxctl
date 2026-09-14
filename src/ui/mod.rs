@@ -346,8 +346,7 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         app.active_tab(),
         app.hovered(),
         &tab_areas,
-        screen.tabs.width,
-        screen.tabs.y,
+        screen.tabs,
     );
     let content_render = render_content(frame, app, screen.content);
 
@@ -470,8 +469,7 @@ fn render_tabs(
     active_tab: Tab,
     hovered: Option<&MouseTarget>,
     tabs: &[(Tab, Rect)],
-    tabs_width: u16,
-    tabs_y: u16,
+    tabs_area: Rect,
 ) {
     for &(tab, area) in tabs {
         let style = if tab == active_tab {
@@ -491,12 +489,17 @@ fn render_tabs(
         );
     }
 
-    if tabs_width >= 75 {
+    if tabs_area.width >= 75 {
         let hint_text = "1-5 Tabs   ? Help ";
         let hint_width = hint_text.len() as u16;
-        let hint_x = tabs_width.saturating_sub(hint_width);
+        let hint_x = tabs_area.width.saturating_sub(hint_width);
         if hint_x >= 48 {
-            let hint_rect = Rect::new(hint_x, tabs_y, hint_width, 1);
+            let hint_rect = Rect::new(
+                tabs_area.x.saturating_add(hint_x),
+                tabs_area.y,
+                hint_width,
+                1,
+            );
             frame.render_widget(
                 Paragraph::new(hint_text)
                     .style(Style::default().fg(Color::DarkGray))
@@ -1110,5 +1113,22 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn tabs_hint_includes_horizontal_offset() {
+        let app = App::default();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line_chars = (81..99)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert_eq!(line_chars, "1-5 Tabs   ? Help ");
     }
 }

@@ -11,7 +11,7 @@ pub(crate) use hardware::NetworkDevice;
 pub use hardware::{
     GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
 };
-pub use journal::{JournalBatch, JournalCollector, JournalEntry};
+pub use journal::{priority_label, JournalBatch, JournalCollector, JournalEntry};
 pub use network::{NetworkCollector, NetworkInterfaceInfo, NetworkSnapshot, OperState};
 #[cfg(test)]
 pub use process::verify_and_send_signal_at;
