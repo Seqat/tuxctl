@@ -909,13 +909,15 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn confirm_process_signal_at<F>(
+    pub(crate) fn confirm_process_signal_at<H, O, S>(
         &mut self,
         proc_dir: &std::path::Path,
-        kill_fn: F,
+        open_pidfd: O,
+        send_signal: S,
     ) -> bool
     where
-        F: FnOnce(libc::pid_t, libc::c_int) -> std::io::Result<()>,
+        O: FnOnce(libc::pid_t) -> std::io::Result<H>,
+        S: FnOnce(&H, libc::c_int) -> std::io::Result<()>,
     {
         let Some(confirmation) = self.process_signal_confirmation.take() else {
             return false;
@@ -924,7 +926,8 @@ impl App {
             proc_dir,
             confirmation.identity,
             confirmation.signal,
-            kill_fn,
+            open_pidfd,
+            send_signal,
         );
         self.finish_process_signal(confirmation, result)
     }
@@ -959,6 +962,12 @@ impl App {
                 self.process_action_message = Some(format!(
                     "Failed to send {}: permission denied for {} ({})",
                     sig_name, confirmation.name, confirmation.identity.pid
+                ));
+            }
+            Err(ProcessSignalError::Unsupported) => {
+                self.process_action_message = Some(format!(
+                    "Failed to send {}: pidfd signaling is not supported",
+                    sig_name
                 ));
             }
             Err(ProcessSignalError::Failed(err)) => {
@@ -2456,8 +2465,8 @@ mod tests {
         // Success case
         app.update(Action::RequestProcessSignal(ProcessSignal::Term));
         let mut signal_received = None;
-        app.confirm_process_signal_at(&temp_dir, |pid, sig| {
-            signal_received = Some((pid, sig));
+        app.confirm_process_signal_at(&temp_dir, Ok, |pidfd, sig| {
+            signal_received = Some((*pidfd, sig));
             Ok(())
         });
 
@@ -2472,15 +2481,19 @@ mod tests {
         std::fs::write(proc_100.join("stat"), stat_reused).unwrap();
 
         app.update(Action::RequestProcessSignal(ProcessSignal::Kill));
-        let mut kill_called = false;
-        app.confirm_process_signal_at(&temp_dir, |_pid, _sig| {
-            kill_called = true;
-            Ok(())
-        });
+        let mut signal_called_stale = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Ok(()),
+            |_, _| {
+                signal_called_stale = true;
+                Ok(())
+            },
+        );
 
         assert!(
-            !kill_called,
-            "Kill must NOT be called when start_time differs"
+            !signal_called_stale,
+            "Signal must NOT be sent when start_time differs"
         );
         assert_eq!(
             app.process_action_message(),
@@ -2491,16 +2504,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         app.update(Action::RequestProcessSignal(ProcessSignal::Term));
-        let mut kill_called_missing = false;
-        app.confirm_process_signal_at(&temp_dir, |_pid, _sig| {
-            kill_called_missing = true;
-            Ok(())
-        });
+        let mut signal_called_missing = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Ok(()),
+            |_, _| {
+                signal_called_missing = true;
+                Ok(())
+            },
+        );
 
-        assert!(!kill_called_missing);
+        assert!(!signal_called_missing);
         assert_eq!(
             app.process_action_message(),
             Some("Failed to send SIGTERM: process bash (100) not found")
+        );
+
+        // Unsupported pidfd syscalls are reported without a signal attempt.
+        app.update(Action::RequestProcessSignal(ProcessSignal::Kill));
+        let mut signal_called_unsupported = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+            |_, _| {
+                signal_called_unsupported = true;
+                Ok(())
+            },
+        );
+
+        assert!(!signal_called_unsupported);
+        assert_eq!(
+            app.process_action_message(),
+            Some("Failed to send SIGKILL: pidfd signaling is not supported")
         );
     }
 

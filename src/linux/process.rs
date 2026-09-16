@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs, io,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
@@ -64,6 +65,7 @@ pub enum ProcessSignalError {
     ProcessNotFound,
     StaleIdentity,
     PermissionDenied,
+    Unsupported,
     Failed(String),
 }
 
@@ -73,6 +75,7 @@ impl std::fmt::Display for ProcessSignalError {
             Self::ProcessNotFound => write!(f, "process already exited"),
             Self::StaleIdentity => write!(f, "process identity changed (PID reused)"),
             Self::PermissionDenied => write!(f, "permission denied"),
+            Self::Unsupported => write!(f, "pidfd signaling is not supported"),
             Self::Failed(msg) => write!(f, "{msg}"),
         }
     }
@@ -95,18 +98,24 @@ pub fn read_process_start_time(stat_contents: &str) -> Option<u64> {
     fields[19].parse::<u64>().ok()
 }
 
-pub fn verify_and_send_signal_at<F>(
+pub fn verify_and_send_signal_at<H, O, S>(
     proc_dir: &Path,
     identity: ProcessIdentity,
     signal: ProcessSignal,
-    kill_fn: F,
+    open_pidfd: O,
+    send_signal: S,
 ) -> Result<(), ProcessSignalError>
 where
-    F: FnOnce(libc::pid_t, libc::c_int) -> io::Result<()>,
+    O: FnOnce(libc::pid_t) -> io::Result<H>,
+    S: FnOnce(&H, libc::c_int) -> io::Result<()>,
 {
     if identity.pid == 0 {
         return Err(ProcessSignalError::Failed("cannot signal PID 0".into()));
     }
+
+    let pid = libc::pid_t::try_from(identity.pid)
+        .map_err(|_| ProcessSignalError::Failed(format!("invalid PID {}", identity.pid)))?;
+    let pidfd = open_pidfd(pid).map_err(map_signal_error)?;
 
     let stat_path = proc_dir.join(identity.pid.to_string()).join("stat");
     let stat_contents = match fs::read_to_string(&stat_path) {
@@ -127,17 +136,47 @@ where
         return Err(ProcessSignalError::StaleIdentity);
     }
 
-    match kill_fn(identity.pid as libc::pid_t, signal.as_c_int()) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                Err(ProcessSignalError::ProcessNotFound)
-            } else if err.raw_os_error() == Some(libc::EPERM) {
-                Err(ProcessSignalError::PermissionDenied)
-            } else {
-                Err(ProcessSignalError::Failed(err.to_string()))
-            }
-        }
+    send_signal(&pidfd, signal.as_c_int()).map_err(map_signal_error)
+}
+
+fn map_signal_error(error: io::Error) -> ProcessSignalError {
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => ProcessSignalError::ProcessNotFound,
+        Some(libc::EPERM) | Some(libc::EACCES) => ProcessSignalError::PermissionDenied,
+        Some(libc::ENOSYS) => ProcessSignalError::Unsupported,
+        _ => ProcessSignalError::Failed(error.to_string()),
+    }
+}
+
+fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY: `SYS_pidfd_open` accepts a PID value and zero flags. On success it
+    // returns a new file descriptor, which is immediately transferred to `OwnedFd`.
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: A successful `pidfd_open` result is a newly owned nonnegative
+        // file descriptor. `OwnedFd` closes it on every subsequent exit path.
+        Ok(unsafe { OwnedFd::from_raw_fd(result as libc::c_int) })
+    }
+}
+
+fn pidfd_send_signal(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: `pidfd` is live for the duration of the call, `signal` is one of
+    // the fixed supported signals, and null siginfo with zero flags is valid.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -145,14 +184,13 @@ pub fn send_process_signal(
     identity: ProcessIdentity,
     signal: ProcessSignal,
 ) -> Result<(), ProcessSignalError> {
-    verify_and_send_signal_at(Path::new(PROC), identity, signal, |pid, sig| {
-        let res = unsafe { libc::kill(pid, sig) };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    })
+    verify_and_send_signal_at(
+        Path::new(PROC),
+        identity,
+        signal,
+        pidfd_open,
+        pidfd_send_signal,
+    )
 }
 
 impl ProcessInfo {
@@ -472,7 +510,15 @@ fn page_size() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::*;
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn stat_line(name: &str) -> String {
         let fields = [
@@ -480,6 +526,31 @@ mod tests {
             "0", "0", "900", "0", "25",
         ];
         format!("42 ({name}) {}", fields.join(" "))
+    }
+
+    fn temp_proc_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tuxctl_process_{label}_{}_{}",
+            std::process::id(),
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn write_process_stat(proc_dir: &Path, pid: u32, name: &str, start_time: u64) {
+        let pid_dir = proc_dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        let stat = format!(
+            "{pid} ({name}) S 1 {pid} {pid} 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 {start_time} 1000 200"
+        );
+        fs::write(pid_dir.join("stat"), stat).unwrap();
+    }
+
+    struct FakePidFd(Rc<Cell<usize>>);
+
+    impl Drop for FakePidFd {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
     }
 
     #[test]
@@ -561,121 +632,360 @@ mod tests {
 
     #[test]
     fn signal_verification_succeeds_with_matching_identity() {
-        let unique = format!(
-            "tuxctl_test_sig_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let temp_dir = std::env::temp_dir().join(unique);
-        let pid_dir = temp_dir.join("123");
-        fs::create_dir_all(&pid_dir).unwrap();
-        let stat = "123 (test) S 1 123 123 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 500 1000 200";
-        fs::write(pid_dir.join("stat"), stat).unwrap();
+        let temp_dir = temp_proc_dir("success");
+        write_process_stat(&temp_dir, 123, "test", 500);
 
         let identity = ProcessIdentity {
             pid: 123,
             start_time: 500,
         };
+        let mut opened_pid = None;
         let mut called_sig = None;
-        let res =
-            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Term, |pid, sig| {
-                called_sig = Some((pid, sig));
+        let res = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |pid| {
+                opened_pid = Some(pid);
+                Ok(pid)
+            },
+            |pidfd, sig| {
+                called_sig = Some((*pidfd, sig));
                 Ok(())
-            });
+            },
+        );
 
         assert_eq!(res, Ok(()));
+        assert_eq!(opened_pid, Some(123));
         assert_eq!(called_sig, Some((123, libc::SIGTERM)));
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
+    fn pidfd_is_opened_before_identity_validation_for_both_signals() {
+        for (signal, expected_signal) in [
+            (ProcessSignal::Term, libc::SIGTERM),
+            (ProcessSignal::Kill, libc::SIGKILL),
+        ] {
+            let temp_dir = temp_proc_dir(signal.name());
+            let identity = ProcessIdentity {
+                pid: 123,
+                start_time: 500,
+            };
+            let proc_dir_for_open = temp_dir.clone();
+            let mut sent_signal = None;
+
+            let result = verify_and_send_signal_at(
+                &temp_dir,
+                identity,
+                signal,
+                |pid| {
+                    assert_eq!(pid, 123);
+                    write_process_stat(&proc_dir_for_open, 123, "test", 500);
+                    Ok(())
+                },
+                |_, signal| {
+                    sent_signal = Some(signal);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(sent_signal, Some(expected_signal));
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+    }
+
+    #[test]
     fn signal_verification_rejects_stale_identity_without_sending_signal() {
-        let unique = format!(
-            "tuxctl_test_stale_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let temp_dir = std::env::temp_dir().join(unique);
-        let pid_dir = temp_dir.join("123");
-        fs::create_dir_all(&pid_dir).unwrap();
-        // Start time in stat is 999, but identity has start_time 500
-        let stat =
-            "123 (new_proc) S 1 123 123 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 999 1000 200";
-        fs::write(pid_dir.join("stat"), stat).unwrap();
+        let temp_dir = temp_proc_dir("stale");
+        write_process_stat(&temp_dir, 123, "new_proc", 999);
 
         let identity = ProcessIdentity {
             pid: 123,
             start_time: 500,
         };
-        let mut called = false;
-        let res =
-            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Kill, |_pid, _sig| {
-                called = true;
+        let mut opened = false;
+        let mut signal_called = false;
+        let res = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Kill,
+            |_| {
+                opened = true;
                 Ok(())
-            });
+            },
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
+        );
 
         assert_eq!(res, Err(ProcessSignalError::StaleIdentity));
-        assert!(!called, "Signal must NEVER be sent to a stale PID identity");
+        assert!(opened);
+        assert!(
+            !signal_called,
+            "Signal must NEVER be sent to a stale PID identity"
+        );
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn simulated_pid_reuse_after_pidfd_open_does_not_signal_replacement() {
+        let temp_dir = temp_proc_dir("reused_after_open");
+        write_process_stat(&temp_dir, 123, "original", 500);
+        let proc_dir_for_open = temp_dir.clone();
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let mut signal_called = false;
+
+        let result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Kill,
+            |_| {
+                write_process_stat(&proc_dir_for_open, 123, "replacement", 999);
+                Ok(())
+            },
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(ProcessSignalError::StaleIdentity));
+        assert!(!signal_called);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn signal_verification_reports_missing_process_without_sending_signal() {
-        let unique = format!(
-            "tuxctl_test_missing_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let temp_dir = std::env::temp_dir().join(unique);
+        let temp_dir = temp_proc_dir("missing");
         let _ = fs::create_dir_all(&temp_dir);
 
         let identity = ProcessIdentity {
             pid: 99999,
             start_time: 500,
         };
-        let mut called = false;
-        let res =
-            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Term, |_pid, _sig| {
-                called = true;
+        let mut opened = false;
+        let mut signal_called = false;
+        let res = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| {
+                opened = true;
                 Ok(())
-            });
+            },
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
+        );
 
         assert_eq!(res, Err(ProcessSignalError::ProcessNotFound));
-        assert!(!called);
+        assert!(opened);
+        assert!(!signal_called);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn signal_verification_handles_permission_denied() {
-        let unique = format!(
-            "tuxctl_test_eperm_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+    fn process_disappearing_after_pidfd_open_does_not_send_signal() {
+        let temp_dir = temp_proc_dir("disappears_after_open");
+        write_process_stat(&temp_dir, 123, "original", 500);
+        let pid_dir_for_open = temp_dir.join("123");
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let mut signal_called = false;
+
+        let result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| {
+                fs::remove_dir_all(&pid_dir_for_open).unwrap();
+                Ok(())
+            },
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
         );
-        let temp_dir = std::env::temp_dir().join(unique);
-        let pid_dir = temp_dir.join("1");
-        fs::create_dir_all(&pid_dir).unwrap();
-        let stat = "1 (systemd) S 0 1 1 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 1 1000 200";
-        fs::write(pid_dir.join("stat"), stat).unwrap();
+
+        assert_eq!(result, Err(ProcessSignalError::ProcessNotFound));
+        assert!(!signal_called);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn process_missing_at_pidfd_open_fails_without_signaling() {
+        let temp_dir = temp_proc_dir("missing_at_open");
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let mut signal_called = false;
+
+        let result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| Err::<(), _>(io::Error::from_raw_os_error(libc::ESRCH)),
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(ProcessSignalError::ProcessNotFound));
+        assert!(!signal_called);
+    }
+
+    #[test]
+    fn signal_verification_handles_permission_denied() {
+        let temp_dir = temp_proc_dir("permission");
+        write_process_stat(&temp_dir, 1, "systemd", 1);
 
         let identity = ProcessIdentity {
             pid: 1,
             start_time: 1,
         };
-        let res =
-            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Kill, |_pid, _sig| {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
-            });
+        let res = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Kill,
+            |_| Ok(()),
+            |_, _| Err(io::Error::from_raw_os_error(libc::EPERM)),
+        );
 
         assert_eq!(res, Err(ProcessSignalError::PermissionDenied));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn pidfd_send_esrch_is_safe_and_never_retries_by_pid() {
+        let temp_dir = temp_proc_dir("send_esrch");
+        write_process_stat(&temp_dir, 123, "test", 500);
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let mut send_attempts = 0;
+
+        let result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| Ok(()),
+            |_, _| {
+                send_attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::ESRCH))
+            },
+        );
+
+        assert_eq!(result, Err(ProcessSignalError::ProcessNotFound));
+        assert_eq!(send_attempts, 1);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn unavailable_pidfd_syscalls_fail_closed() {
+        let temp_dir = temp_proc_dir("unsupported");
+        write_process_stat(&temp_dir, 123, "test", 500);
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let mut send_called = false;
+
+        let open_result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| Err::<(), _>(io::Error::from_raw_os_error(libc::ENOSYS)),
+            |_, _| {
+                send_called = true;
+                Ok(())
+            },
+        );
+        assert_eq!(open_result, Err(ProcessSignalError::Unsupported));
+        assert!(!send_called);
+
+        let send_result = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Kill,
+            |_| Ok(()),
+            |_, _| Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+        );
+        assert_eq!(send_result, Err(ProcessSignalError::Unsupported));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn pidfd_handle_is_released_on_success_and_every_post_open_error() {
+        let temp_dir = temp_proc_dir("pidfd_drop");
+        let identity = ProcessIdentity {
+            pid: 123,
+            start_time: 500,
+        };
+        let drops = Rc::new(Cell::new(0));
+
+        write_process_stat(&temp_dir, 123, "test", 500);
+        assert_eq!(
+            verify_and_send_signal_at(
+                &temp_dir,
+                identity,
+                ProcessSignal::Term,
+                |_| Ok(FakePidFd(Rc::clone(&drops))),
+                |_, _| Ok(())
+            ),
+            Ok(())
+        );
+        assert_eq!(drops.get(), 1);
+
+        write_process_stat(&temp_dir, 123, "replacement", 999);
+        assert_eq!(
+            verify_and_send_signal_at(
+                &temp_dir,
+                identity,
+                ProcessSignal::Kill,
+                |_| Ok(FakePidFd(Rc::clone(&drops))),
+                |_, _| panic!("stale identity must not be signaled")
+            ),
+            Err(ProcessSignalError::StaleIdentity)
+        );
+        assert_eq!(drops.get(), 2);
+
+        fs::remove_dir_all(temp_dir.join("123")).unwrap();
+        assert_eq!(
+            verify_and_send_signal_at(
+                &temp_dir,
+                identity,
+                ProcessSignal::Term,
+                |_| Ok(FakePidFd(Rc::clone(&drops))),
+                |_, _| panic!("missing process must not be signaled")
+            ),
+            Err(ProcessSignalError::ProcessNotFound)
+        );
+        assert_eq!(drops.get(), 3);
+
+        write_process_stat(&temp_dir, 123, "test", 500);
+        assert_eq!(
+            verify_and_send_signal_at(
+                &temp_dir,
+                identity,
+                ProcessSignal::Kill,
+                |_| Ok(FakePidFd(Rc::clone(&drops))),
+                |_, _| Err(io::Error::from_raw_os_error(libc::EPERM))
+            ),
+            Err(ProcessSignalError::PermissionDenied)
+        );
+        assert_eq!(drops.get(), 4);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
@@ -686,18 +996,28 @@ mod tests {
             pid: 0,
             start_time: 0,
         };
-        let mut called = false;
-        let res =
-            verify_and_send_signal_at(&temp_dir, identity, ProcessSignal::Term, |_pid, _sig| {
-                called = true;
+        let mut open_called = false;
+        let mut signal_called = false;
+        let res = verify_and_send_signal_at(
+            &temp_dir,
+            identity,
+            ProcessSignal::Term,
+            |_| {
+                open_called = true;
                 Ok(())
-            });
+            },
+            |_, _| {
+                signal_called = true;
+                Ok(())
+            },
+        );
 
         assert_eq!(
             res,
             Err(ProcessSignalError::Failed("cannot signal PID 0".into()))
         );
-        assert!(!called);
+        assert!(!open_called);
+        assert!(!signal_called);
     }
 
     #[test]
