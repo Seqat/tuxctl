@@ -50,22 +50,17 @@ fn main() -> io::Result<()> {
     let mut regions = draw_app(&mut terminal, &mut app)?;
 
     while !app.should_quit() {
-        let action = if let Some(user_action) = events.poll_action(&regions, app.hovered())? {
-            Some(user_action)
-        } else if let Some(metrics) = metrics.latest() {
-            Some(action::Action::SystemMetricsUpdated(metrics))
-        } else if let Some(snapshot) = processes.latest() {
-            Some(action::Action::ProcessesUpdated(snapshot))
-        } else if let Some(snapshot) = services.latest() {
-            Some(action::Action::ServicesUpdated(snapshot))
-        } else if let Some(batch) = journal.latest() {
-            Some(action::Action::LogsUpdated(batch))
-        } else if let Some(snapshot) = network.latest() {
-            Some(action::Action::NetworkUpdated(snapshot))
-        } else if let Some(inventory) = hardware.latest() {
-            Some(action::Action::HardwareDiscovered(inventory))
-        } else {
-            events.next_action(&regions, app.hovered(), redraws.deadline())?
+        let action = match poll_ready_action(
+            || events.poll_action(&regions, app.hovered()),
+            || metrics.latest().map(action::Action::SystemMetricsUpdated),
+            || processes.latest().map(action::Action::ProcessesUpdated),
+            || services.latest().map(action::Action::ServicesUpdated),
+            || network.latest().map(action::Action::NetworkUpdated),
+            || hardware.latest().map(action::Action::HardwareDiscovered),
+            || journal.latest().map(action::Action::LogsUpdated),
+        )? {
+            Some(action) => Some(action),
+            None => events.next_action(&regions, app.hovered(), redraws.deadline())?,
         };
 
         if let Some(action) = action {
@@ -93,6 +88,36 @@ fn main() -> io::Result<()> {
 
     drop(terminal);
     Ok(())
+}
+
+fn poll_ready_action(
+    terminal: impl FnOnce() -> io::Result<Option<action::Action>>,
+    metrics: impl FnOnce() -> Option<action::Action>,
+    processes: impl FnOnce() -> Option<action::Action>,
+    services: impl FnOnce() -> Option<action::Action>,
+    network: impl FnOnce() -> Option<action::Action>,
+    hardware: impl FnOnce() -> Option<action::Action>,
+    journal: impl FnOnce() -> Option<action::Action>,
+) -> io::Result<Option<action::Action>> {
+    if let Some(action) = terminal()? {
+        return Ok(Some(action));
+    }
+    if let Some(action) = metrics() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = processes() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = services() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = network() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = hardware() {
+        return Ok(Some(action));
+    }
+    Ok(journal())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +261,10 @@ mod tests {
     use super::*;
     use crate::action::{Action, MouseTarget, Tab};
 
+    fn no_ready_action() -> Option<Action> {
+        None
+    }
+
     #[test]
     fn idle_scheduler_does_not_request_continuous_frames() {
         let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
@@ -313,6 +342,80 @@ mod tests {
         scheduler.rendered();
 
         assert_eq!(scheduler.deadline(), None);
+    }
+
+    #[test]
+    fn continuous_journal_readiness_cannot_delay_quit() {
+        let mut journal_polls = 0;
+
+        for _ in 0..100 {
+            let action = poll_ready_action(
+                || Ok(Some(Action::Quit)),
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                || {
+                    journal_polls += 1;
+                    Some(Action::LogsUpdated(Default::default()))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(action, Some(Action::Quit));
+        }
+        assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
+    fn continuous_journal_readiness_cannot_delay_resize() {
+        let mut journal_polls = 0;
+
+        for _ in 0..100 {
+            let action = poll_ready_action(
+                || Ok(Some(Action::Resize)),
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                || {
+                    journal_polls += 1;
+                    Some(Action::LogsUpdated(Default::default()))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(action, Some(Action::Resize));
+        }
+        assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
+    fn continuous_journal_readiness_cannot_delay_network_updates() {
+        let mut journal_polls = 0;
+
+        let action = poll_ready_action(
+            || Ok(None),
+            no_ready_action,
+            no_ready_action,
+            no_ready_action,
+            || {
+                Some(Action::NetworkUpdated(
+                    crate::linux::NetworkSnapshot::default(),
+                ))
+            },
+            no_ready_action,
+            || {
+                journal_polls += 1;
+                Some(Action::LogsUpdated(Default::default()))
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(action, Some(Action::NetworkUpdated(_))));
+        assert_eq!(journal_polls, 0);
     }
 
     #[test]
