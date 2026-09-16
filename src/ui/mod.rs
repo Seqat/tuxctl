@@ -667,6 +667,39 @@ mod tests {
             .collect()
     }
 
+    fn process_confirmation_app() -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: vec![crate::linux::ProcessInfo {
+                pid: 1234,
+                name: "testproc".into(),
+                cpu_percent: Some(5.0),
+                memory_bytes: 4096,
+                command: Some("/bin/testproc".into()),
+                state: "R (running)".into(),
+                parent_pid: 1,
+                state_code: 'R',
+                start_time: 100,
+            }],
+            error: None,
+        }));
+        app.update(Action::RequestProcessSignal(
+            crate::linux::ProcessSignal::Term,
+        ));
+        app
+    }
+
+    fn rendered_regions(terminal: &mut Terminal<TestBackend>, app: &App) -> UiRegions {
+        let mut regions = UiRegions::default();
+        terminal
+            .draw(|frame| {
+                regions = render(frame, app);
+            })
+            .unwrap();
+        regions
+    }
+
     #[test]
     fn hit_testing_includes_top_left_and_excludes_bottom_right() {
         let regions = UiRegions::from_tabs([(Tab::Overview, Rect::new(10, 5, 8, 2))]);
@@ -953,6 +986,82 @@ mod tests {
         let normal = buffer_text(&terminal);
         assert!(normal.contains("Processes"));
         assert!(!normal.contains("Terminal too small"));
+    }
+
+    #[test]
+    fn process_confirmation_regions_are_rebuilt_after_resize() {
+        let app = process_confirmation_app();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let old_regions = rendered_regions(&mut terminal, &app);
+        let old_confirm = old_regions.process_signal_confirm.unwrap();
+        let old_viewport = old_regions.process_viewport();
+
+        terminal.backend_mut().resize(50, 16);
+        terminal.autoresize().unwrap();
+        let new_regions = rendered_regions(&mut terminal, &app);
+        let new_cancel = new_regions.process_signal_cancel.unwrap();
+        let new_confirm = new_regions.process_signal_confirm.unwrap();
+
+        assert_ne!(new_confirm, old_confirm);
+        assert_ne!(new_regions.process_viewport(), old_viewport);
+        assert_eq!(
+            new_regions.target_at(new_cancel.x, new_cancel.y),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(
+            new_regions.target_at(new_confirm.x, new_confirm.y),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+        assert_eq!(
+            new_regions.target_at(old_confirm.x, old_confirm.y),
+            None,
+            "the prior confirmation coordinates must not remain active"
+        );
+        assert!(new_regions.tabs.is_empty());
+        assert!(new_regions.process_rows.is_empty());
+        assert!(new_regions.process_headers.is_empty());
+        assert!(new_regions.process_scroll_area.is_none());
+    }
+
+    #[test]
+    fn modal_resize_crosses_each_minimum_terminal_boundary() {
+        let mut app = process_confirmation_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        for (width, height) in [
+            (layout::MIN_TERMINAL_WIDTH - 1, layout::MIN_TERMINAL_HEIGHT),
+            (layout::MIN_TERMINAL_WIDTH, layout::MIN_TERMINAL_HEIGHT - 1),
+            (
+                layout::MIN_TERMINAL_WIDTH - 1,
+                layout::MIN_TERMINAL_HEIGHT - 1,
+            ),
+        ] {
+            let valid_regions = rendered_regions(&mut terminal, &app);
+            assert!(valid_regions.process_signal_confirm.is_some());
+            assert!(buffer_text(&terminal).contains("Terminate Process"));
+
+            terminal.backend_mut().resize(width, height);
+            terminal.autoresize().unwrap();
+            assert!(app.update(Action::Resize));
+            assert!(app.process_signal_confirmation().is_some());
+            let small_regions = rendered_regions(&mut terminal, &app);
+            assert!(small_regions.process_signal_confirm.is_none());
+            assert!(small_regions.tabs.is_empty());
+            assert!(buffer_text(&terminal).contains("Terminal too small"));
+
+            terminal.backend_mut().resize(80, 24);
+            terminal.autoresize().unwrap();
+            assert!(app.update(Action::Resize));
+            assert!(app.process_signal_confirmation().is_some());
+            let restored_regions = rendered_regions(&mut terminal, &app);
+            assert!(restored_regions.process_signal_confirm.is_some());
+            assert!(restored_regions.tabs.is_empty());
+            let restored = buffer_text(&terminal);
+            assert!(restored.contains("Terminate Process"));
+            assert!(!restored.contains("Terminal too small"));
+        }
     }
 
     #[test]

@@ -432,6 +432,12 @@ impl App {
 
     /// Applies an action and reports whether the rendered UI may have changed.
     pub fn update(&mut self, action: Action) -> bool {
+        // Terminal geometry is global state and must bypass every input/modal guard below.
+        if matches!(&action, Action::Resize) {
+            self.hovered = None;
+            return true;
+        }
+
         match action {
             Action::Quit => {
                 self.should_quit = true;
@@ -504,10 +510,7 @@ impl App {
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
-            Action::Resize => {
-                self.hovered = None;
-                true
-            }
+            Action::Resize => unreachable!("resize actions return before modal suppression"),
             _ if self.help_visible
                 || self.process_signal_confirmation.is_some()
                 || self.process_detail_visible
@@ -2678,12 +2681,23 @@ mod tests {
         assert!(app.process_action_message().is_none());
     }
 
+    fn assert_resize_preserves_overlay(app: &mut App, overlay_is_open: impl Fn(&App) -> bool) {
+        assert!(overlay_is_open(app));
+        assert!(app.update(Action::HoverMouseTarget(Some(MouseTarget::Tab(
+            Tab::Overview,
+        )))));
+
+        assert!(app.update(Action::Resize));
+
+        assert!(overlay_is_open(app));
+        assert_eq!(app.hovered(), None);
+    }
+
     #[test]
-    fn resize_triggers_redraw_even_when_modal_is_open() {
+    fn resize_is_global_and_preserves_every_overlay() {
         let mut app = App::default();
         app.update(Action::ShowHelp);
-        assert!(app.help_visible());
-        assert!(app.update(Action::Resize));
+        assert_resize_preserves_overlay(&mut app, App::help_visible);
 
         let mut app = App::default();
         app.update(Action::SelectTab(Tab::Processes));
@@ -2691,8 +2705,7 @@ mod tests {
             1, "proc",
         )])));
         app.update(Action::OpenProcessDetails);
-        assert!(app.process_detail_visible());
-        assert!(app.update(Action::Resize));
+        assert_resize_preserves_overlay(&mut app, App::process_detail_visible);
 
         let mut app = App::default();
         app.update(Action::SelectTab(Tab::Processes));
@@ -2700,8 +2713,62 @@ mod tests {
             1, "proc",
         )])));
         app.update(Action::RequestProcessSignal(ProcessSignal::Term));
-        assert!(app.process_signal_confirmation().is_some());
-        assert!(app.update(Action::Resize));
+        assert_resize_preserves_overlay(&mut app, |app| {
+            app.process_signal_confirmation().is_some()
+        });
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        app.update(Action::ServicesUpdated(services(vec![service(
+            "dbus.service",
+            "active",
+            "D-Bus System Message Bus",
+        )])));
+        app.update(Action::OpenServiceDetails);
+        assert_resize_preserves_overlay(&mut app, App::service_detail_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Logs));
+        app.update(Action::LogsUpdated(log_batch(vec![log_entry(
+            1, "kernel", 6, "ready",
+        )])));
+        app.update(Action::OpenLogDetails);
+        assert_resize_preserves_overlay(&mut app, App::log_detail_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Network));
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0")],
+            error: None,
+        }));
+        app.update(Action::OpenNetworkDetails);
+        assert_resize_preserves_overlay(&mut app, App::network_detail_visible);
+    }
+
+    #[test]
+    fn resize_is_global_in_search_input_modes() {
+        for (tab, begin_search, expected_mode) in [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                InputMode::ProcessSearch,
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                InputMode::ServiceSearch,
+            ),
+            (Tab::Logs, Action::BeginLogSearch, InputMode::LogSearch),
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(tab));
+            app.update(begin_search);
+            app.update(Action::HoverMouseTarget(Some(MouseTarget::Tab(tab))));
+
+            assert!(app.update(Action::Resize));
+            assert_eq!(app.input_mode(), expected_mode);
+            assert_eq!(app.hovered(), None);
+        }
     }
 
     #[test]
