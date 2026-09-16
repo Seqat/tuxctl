@@ -93,8 +93,8 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            if app.take_service_refresh_request() {
-                services.request_refresh();
+            if let Some(generation) = app.take_service_refresh_request() {
+                services.request_refresh(generation);
             }
 
             if redraws.take_due(Instant::now()) && !app.should_quit() {

@@ -7,7 +7,8 @@ use crate::{
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
         NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
-        ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceSnapshot, SystemMetrics,
+        ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot,
+        SystemMetrics,
     },
 };
 
@@ -86,8 +87,9 @@ pub struct App {
     service_searching: bool,
     service_detail_visible: bool,
     service_error: Option<String>,
-    service_refresh_requested: bool,
-    service_refreshing: bool,
+    service_refresh_generation: ServiceRefreshGeneration,
+    service_refresh_requested: Option<ServiceRefreshGeneration>,
+    pending_service_refresh_generation: Option<ServiceRefreshGeneration>,
     logs: VecDeque<JournalEntry>,
     filtered_logs: Vec<usize>,
     selected_log: Option<u64>,
@@ -140,8 +142,9 @@ impl Default for App {
             service_searching: false,
             service_detail_visible: false,
             service_error: None,
-            service_refresh_requested: false,
-            service_refreshing: false,
+            service_refresh_generation: 0,
+            service_refresh_requested: None,
+            pending_service_refresh_generation: None,
             logs: VecDeque::with_capacity(LOG_BUFFER_CAPACITY),
             filtered_logs: Vec::new(),
             selected_log: None,
@@ -329,11 +332,11 @@ impl App {
     }
 
     pub fn service_refreshing(&self) -> bool {
-        self.service_refreshing
+        self.pending_service_refresh_generation.is_some()
     }
 
-    pub fn take_service_refresh_request(&mut self) -> bool {
-        std::mem::take(&mut self.service_refresh_requested)
+    pub fn take_service_refresh_request(&mut self) -> Option<ServiceRefreshGeneration> {
+        self.service_refresh_requested.take()
     }
 
     pub fn log_count(&self) -> usize {
@@ -670,15 +673,16 @@ impl App {
 
     fn update_processes(&mut self, snapshot: ProcessSnapshot) -> bool {
         let processes_visible = self.active_tab == Tab::Processes;
+        let overview_visible = self.active_tab == Tab::Overview;
+        let was_stale = self.process_error.is_some();
         let summary = snapshot.summary();
-        let overview_summary_changed =
-            self.active_tab == Tab::Overview && self.process_summary != summary;
+        let overview_summary_changed = overview_visible && self.process_summary != summary;
         if let Some(error) = snapshot.error {
             if self.process_error.as_ref() == Some(&error) {
                 return false;
             }
             self.process_error = Some(error);
-            return processes_visible;
+            return processes_visible || overview_visible;
         }
 
         if self.process_error.is_none() && self.processes == snapshot.processes {
@@ -721,7 +725,7 @@ impl App {
         }
         self.reconcile_hovered_process();
         self.ensure_process_visible();
-        processes_visible || overview_summary_changed
+        processes_visible || overview_summary_changed || (overview_visible && was_stale)
     }
 
     fn begin_process_search(&mut self) -> bool {
@@ -1021,18 +1025,24 @@ impl App {
 
     fn update_services(&mut self, snapshot: ServiceSnapshot) -> bool {
         let visible = self.active_tab == Tab::Services;
-        let was_refreshing = self.service_refreshing;
-        self.service_refreshing = false;
+        let was_refreshing = self.service_refreshing();
+        if self
+            .pending_service_refresh_generation
+            .is_some_and(|pending| snapshot.completed_refresh_generation >= pending)
+        {
+            self.pending_service_refresh_generation = None;
+        }
+        let refresh_state_changed = was_refreshing != self.service_refreshing();
         if let Some(error) = snapshot.error {
             if self.service_error.as_ref() == Some(&error) {
-                return was_refreshing && visible;
+                return refresh_state_changed && visible;
             }
             self.service_error = Some(error);
             return visible;
         }
 
         if self.service_error.is_none() && self.services == snapshot.services {
-            return was_refreshing && visible;
+            return refresh_state_changed && visible;
         }
 
         let previous_index = self.selected_service_index().unwrap_or(0);
@@ -1169,9 +1179,11 @@ impl App {
         if self.active_tab != Tab::Services {
             return false;
         }
-        self.service_refresh_requested = true;
-        let changed = !self.service_refreshing;
-        self.service_refreshing = true;
+        self.service_refresh_generation = self.service_refresh_generation.saturating_add(1);
+        let generation = self.service_refresh_generation;
+        self.service_refresh_requested = Some(generation);
+        let changed = !self.service_refreshing();
+        self.pending_service_refresh_generation = Some(generation);
         changed
     }
 
@@ -1689,6 +1701,17 @@ mod tests {
         ServiceSnapshot {
             services: entries,
             error: None,
+            completed_refresh_generation: 0,
+        }
+    }
+
+    fn services_completed(
+        entries: Vec<ServiceInfo>,
+        generation: ServiceRefreshGeneration,
+    ) -> ServiceSnapshot {
+        ServiceSnapshot {
+            completed_refresh_generation: generation,
+            ..services(entries)
         }
     }
 
@@ -1849,8 +1872,38 @@ mod tests {
 
         assert!(app.update(Action::RefreshServices));
         assert!(app.service_refreshing());
-        assert!(app.take_service_refresh_request());
-        assert!(!app.take_service_refresh_request());
+        assert_eq!(app.take_service_refresh_request(), Some(1));
+        assert_eq!(app.take_service_refresh_request(), None);
+
+        app.update(Action::ServicesUpdated(services(vec![service(
+            "alpha.service",
+            "active",
+            "Alpha",
+        )])));
+        assert!(app.service_refreshing());
+
+        assert!(app.update(Action::ServicesUpdated(services_completed(
+            vec![service("alpha.service", "active", "Alpha")],
+            1,
+        ))));
+        assert!(!app.service_refreshing());
+    }
+
+    #[test]
+    fn service_refresh_waits_for_the_latest_coalesced_generation() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+
+        assert!(app.update(Action::RefreshServices));
+        assert!(!app.update(Action::RefreshServices));
+        assert!(!app.update(Action::RefreshServices));
+        assert_eq!(app.take_service_refresh_request(), Some(3));
+
+        app.update(Action::ServicesUpdated(services_completed(Vec::new(), 2)));
+        assert!(app.service_refreshing());
+
+        assert!(app.update(Action::ServicesUpdated(services_completed(Vec::new(), 3,))));
+        assert!(!app.service_refreshing());
     }
 
     #[test]
@@ -1866,6 +1919,7 @@ mod tests {
         app.update(Action::ServicesUpdated(ServiceSnapshot {
             services: Vec::new(),
             error: Some("system bus unavailable".into()),
+            completed_refresh_generation: 0,
         }));
 
         assert_eq!(visible_units(&app), vec!["alpha.service"]);
@@ -2625,6 +2679,51 @@ mod tests {
             memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
             ..Default::default()
         })));
+    }
+
+    #[test]
+    fn overview_collector_health_transitions_redraw_only_while_visible() {
+        let mut app = App::default();
+        let process_snapshot = processes(vec![process(1, "init")]);
+        let network_snapshot = NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0")],
+            error: None,
+        };
+        app.update(Action::ProcessesUpdated(process_snapshot.clone()));
+        app.update(Action::NetworkUpdated(network_snapshot.clone()));
+        let summary = app.process_summary();
+
+        assert!(app.update(Action::ProcessesUpdated(ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        })));
+        assert_eq!(app.process_summary(), summary);
+        assert_eq!(app.process_error(), Some("proc unavailable"));
+        assert!(app.update(Action::ProcessesUpdated(process_snapshot.clone())));
+        assert_eq!(app.process_error(), None);
+
+        assert!(app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("net unavailable".into()),
+        })));
+        assert_eq!(app.network_count(), 1);
+        assert_eq!(app.network_error(), Some("net unavailable"));
+        assert!(app.update(Action::NetworkUpdated(network_snapshot.clone())));
+        assert_eq!(app.network_error(), None);
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert!(!app.update(Action::ProcessesUpdated(ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        })));
+        assert!(!app.update(Action::ProcessesUpdated(process_snapshot)));
+        assert!(!app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("net unavailable".into()),
+        })));
+        assert!(!app.update(Action::NetworkUpdated(network_snapshot)));
+        assert_eq!(app.process_error(), None);
+        assert_eq!(app.network_error(), None);
     }
 
     #[test]

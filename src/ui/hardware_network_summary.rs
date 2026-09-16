@@ -38,12 +38,10 @@ pub(super) fn render(
         return;
     }
 
-    if app.networks().is_empty() {
-        lines.push(Line::from(if app.network_error().is_some() {
-            "Network data unavailable"
-        } else {
-            "No interfaces found"
-        }));
+    if app.network_error().is_some() {
+        lines.push(Line::from("Network data unavailable"));
+    } else if app.networks().is_empty() {
+        lines.push(Line::from("No interfaces found"));
     } else {
         let interfaces = overview_network_interfaces(app.networks(), inventory);
         if interfaces.is_empty() {
@@ -251,6 +249,16 @@ mod tests {
         }
     }
 
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn network_summary_handles_models_rates_and_down_interfaces() {
         let up = test_interface("enp8s0", OperState::Up);
@@ -359,5 +367,40 @@ mod tests {
         assert!(text.contains("eth2"));
         assert!(!text.contains("eth3"));
         assert!(text.contains("2 more interfaces"));
+    }
+
+    #[test]
+    fn network_summary_hides_cached_rates_until_collection_recovers() {
+        let mut app = App::default();
+        let healthy = crate::linux::NetworkSnapshot {
+            interfaces: vec![test_interface("enp6s0", OperState::Up)],
+            error: None,
+        };
+        app.update(crate::action::Action::NetworkUpdated(healthy.clone()));
+        app.update(crate::action::Action::NetworkUpdated(
+            crate::linux::NetworkSnapshot {
+                interfaces: Vec::new(),
+                error: Some("net unavailable".into()),
+            },
+        ));
+        let backend = TestBackend::new(100, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, None, frame.area()))
+            .unwrap();
+
+        let stale = rendered_text(&terminal);
+        assert!(stale.contains("Network data unavailable"));
+        assert!(!stale.contains("enp6s0"));
+        assert!(!stale.contains("RX"));
+
+        app.update(crate::action::Action::NetworkUpdated(healthy));
+        terminal
+            .draw(|frame| render(frame, &app, None, frame.area()))
+            .unwrap();
+        let recovered = rendered_text(&terminal);
+        assert!(recovered.contains("enp6s0"));
+        assert!(recovered.contains("RX"));
+        assert!(!recovered.contains("Network data unavailable"));
     }
 }

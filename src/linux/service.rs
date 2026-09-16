@@ -8,6 +8,8 @@ use std::{
 
 use super::latest_snapshot::{self, LatestReceiver};
 
+pub type ServiceRefreshGeneration = u64;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceInfo {
     pub unit: String,
@@ -21,18 +23,19 @@ pub struct ServiceInfo {
 pub struct ServiceSnapshot {
     pub services: Vec<ServiceInfo>,
     pub error: Option<String>,
+    pub completed_refresh_generation: ServiceRefreshGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectorWake {
-    Refresh,
+    Refresh(ServiceRefreshGeneration),
     Stop,
     Timeout,
 }
 
 #[derive(Default)]
 struct CollectorControlState {
-    refresh_pending: bool,
+    pending_refresh_generation: Option<ServiceRefreshGeneration>,
     stop: bool,
 }
 
@@ -43,12 +46,16 @@ struct CollectorControl {
 }
 
 impl CollectorControl {
-    fn request_refresh(&self) {
+    fn request_refresh(&self, generation: ServiceRefreshGeneration) {
         let mut state = lock(&self.state);
-        if state.stop || state.refresh_pending {
+        if state.stop {
             return;
         }
-        state.refresh_pending = true;
+        state.pending_refresh_generation = Some(
+            state
+                .pending_refresh_generation
+                .map_or(generation, |pending| pending.max(generation)),
+        );
         drop(state);
         self.wake.notify_one();
     }
@@ -62,11 +69,11 @@ impl CollectorControl {
 
     fn wait(&self, timeout: Duration) -> CollectorWake {
         let mut state = lock(&self.state);
-        if !state.refresh_pending && !state.stop {
+        if state.pending_refresh_generation.is_none() && !state.stop {
             let (next_state, _) = self
                 .wake
                 .wait_timeout_while(state, timeout, |state| {
-                    !state.refresh_pending && !state.stop
+                    state.pending_refresh_generation.is_none() && !state.stop
                 })
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next_state;
@@ -74,11 +81,30 @@ impl CollectorControl {
 
         if state.stop {
             CollectorWake::Stop
-        } else if std::mem::take(&mut state.refresh_pending) {
-            CollectorWake::Refresh
+        } else if let Some(generation) = state.pending_refresh_generation.take() {
+            CollectorWake::Refresh(generation)
         } else {
             CollectorWake::Timeout
         }
+    }
+}
+
+#[derive(Default)]
+struct ServiceRefreshProgress {
+    completed_generation: ServiceRefreshGeneration,
+}
+
+impl ServiceRefreshProgress {
+    fn finish_collection(
+        &mut self,
+        mut snapshot: ServiceSnapshot,
+        refresh_generation: Option<ServiceRefreshGeneration>,
+    ) -> ServiceSnapshot {
+        if let Some(generation) = refresh_generation {
+            self.completed_generation = self.completed_generation.max(generation);
+        }
+        snapshot.completed_refresh_generation = self.completed_generation;
+        snapshot
     }
 }
 
@@ -95,15 +121,13 @@ impl ServiceCollector {
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("systemd-services".into())
-            .spawn(move || loop {
-                if !snapshot_tx.publish(collect_services()) {
-                    break;
-                }
-
-                match worker_control.wait(refresh_rate) {
-                    CollectorWake::Refresh | CollectorWake::Timeout => {}
-                    CollectorWake::Stop => break,
-                }
+            .spawn(move || {
+                run_collector(
+                    refresh_rate,
+                    &worker_control,
+                    collect_services,
+                    |snapshot| snapshot_tx.publish(snapshot),
+                );
             })?;
 
         Ok(Self {
@@ -117,8 +141,8 @@ impl ServiceCollector {
         self.receiver.take_latest()
     }
 
-    pub fn request_refresh(&self) {
-        self.control.request_refresh();
+    pub fn request_refresh(&self, generation: ServiceRefreshGeneration) {
+        self.control.request_refresh(generation);
     }
 }
 
@@ -135,6 +159,29 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn run_collector(
+    refresh_rate: Duration,
+    control: &CollectorControl,
+    mut collect: impl FnMut() -> ServiceSnapshot,
+    mut publish: impl FnMut(ServiceSnapshot) -> bool,
+) {
+    let mut refresh_progress = ServiceRefreshProgress::default();
+    let mut collection_generation = None;
+
+    loop {
+        let snapshot = refresh_progress.finish_collection(collect(), collection_generation);
+        if !publish(snapshot) {
+            break;
+        }
+
+        collection_generation = match control.wait(refresh_rate) {
+            CollectorWake::Refresh(generation) => Some(generation),
+            CollectorWake::Timeout => None,
+            CollectorWake::Stop => break,
+        };
+    }
 }
 
 fn collect_services() -> ServiceSnapshot {
@@ -171,6 +218,7 @@ fn collect_services() -> ServiceSnapshot {
     ServiceSnapshot {
         services,
         error: None,
+        completed_refresh_generation: 0,
     }
 }
 
@@ -179,6 +227,7 @@ impl ServiceSnapshot {
         Self {
             services: Vec::new(),
             error: Some(message),
+            completed_refresh_generation: 0,
         }
     }
 }
@@ -220,18 +269,18 @@ mod tests {
     fn repeated_refresh_requests_coalesce_to_one_pending_wake() {
         let control = CollectorControl::default();
 
-        for _ in 0..10_000 {
-            control.request_refresh();
+        for generation in 1..=10_000 {
+            control.request_refresh(generation);
         }
 
-        assert_eq!(control.wait(Duration::ZERO), CollectorWake::Refresh);
+        assert_eq!(control.wait(Duration::ZERO), CollectorWake::Refresh(10_000));
         assert_eq!(control.wait(Duration::ZERO), CollectorWake::Timeout);
     }
 
     #[test]
     fn stop_takes_priority_over_a_pending_refresh() {
         let control = CollectorControl::default();
-        control.request_refresh();
+        control.request_refresh(1);
 
         control.stop();
 
@@ -247,6 +296,68 @@ mod tests {
         control.stop();
 
         assert_eq!(worker.join().unwrap(), CollectorWake::Stop);
+    }
+
+    #[test]
+    fn refresh_requested_during_collection_requires_the_follow_up_collection() {
+        let control = Arc::new(CollectorControl::default());
+        let worker_control = Arc::clone(&control);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut collection = 0;
+            run_collector(
+                Duration::from_secs(60),
+                &worker_control,
+                || {
+                    started_tx.send(collection).unwrap();
+                    release_rx.recv().unwrap();
+                    collection += 1;
+                    ServiceSnapshot::default()
+                },
+                |snapshot| snapshot_tx.send(snapshot).is_ok(),
+            );
+        });
+
+        assert_eq!(started_rx.recv().unwrap(), 0);
+        control.request_refresh(7);
+        release_tx.send(()).unwrap();
+        assert_eq!(snapshot_rx.recv().unwrap().completed_refresh_generation, 0);
+
+        assert_eq!(started_rx.recv().unwrap(), 1);
+        release_tx.send(()).unwrap();
+        assert_eq!(snapshot_rx.recv().unwrap().completed_refresh_generation, 7);
+
+        control.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn completed_generation_survives_latest_snapshot_replacement() {
+        let mut progress = ServiceRefreshProgress::default();
+        let completed = progress.finish_collection(ServiceSnapshot::default(), Some(11));
+        let periodic = progress.finish_collection(ServiceSnapshot::default(), None);
+        let (publisher, receiver) = latest_snapshot::channel();
+
+        assert!(publisher.publish(completed));
+        assert!(publisher.publish(periodic));
+
+        assert_eq!(
+            receiver.take_latest().unwrap().completed_refresh_generation,
+            11
+        );
+    }
+
+    #[test]
+    fn periodic_collections_do_not_invent_refresh_completion() {
+        let mut progress = ServiceRefreshProgress::default();
+
+        let first = progress.finish_collection(ServiceSnapshot::default(), None);
+        let second = progress.finish_collection(ServiceSnapshot::default(), None);
+
+        assert_eq!(first.completed_refresh_generation, 0);
+        assert_eq!(second.completed_refresh_generation, 0);
     }
 
     #[test]

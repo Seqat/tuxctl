@@ -192,17 +192,21 @@ impl NetworkSampler {
             let ipv4 = ipv4_map.remove(&name).unwrap_or_default();
             let ipv6 = ipv6_map.remove(&name).unwrap_or_default();
 
-            let (rx_rate, tx_rate) =
-                calculate_transfer_rates(self.previous.get(&name), rx_bytes, tx_bytes, now);
-
-            next_previous.insert(
-                name.clone(),
-                InterfacePrev {
-                    rx_bytes,
-                    tx_bytes,
-                    timestamp: now,
-                },
-            );
+            let (rx_rate, tx_rate) = if stats.is_some() {
+                let rates =
+                    calculate_transfer_rates(self.previous.get(&name), rx_bytes, tx_bytes, now);
+                next_previous.insert(
+                    name.clone(),
+                    InterfacePrev {
+                        rx_bytes,
+                        tx_bytes,
+                        timestamp: now,
+                    },
+                );
+                rates
+            } else {
+                (None, None)
+            };
 
             interfaces.push(NetworkInterfaceInfo {
                 name,
@@ -535,6 +539,100 @@ docker0:   16306     214    0    0    0     0          0         0   593023    1
 
         assert_eq!(third.interfaces[0].rx_rate_bytes_per_sec, Some(250.0));
         assert_eq!(third.interfaces[0].tx_rate_bytes_per_sec, Some(500.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sysfs_only_discovery_never_becomes_a_counter_baseline() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxctl-network-sysfs-baseline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let proc_net_dev = root.join("net-dev");
+        let sys_class_net = root.join("net");
+        let interface_dir = sys_class_net.join("tuxsys0");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&interface_dir).unwrap();
+
+        let mut sampler = NetworkSampler::default();
+        let t0 = Instant::now();
+        fs::write(&proc_net_dev, "").unwrap();
+        let sysfs_only = sampler.collect_at(t0, &proc_net_dev, &sys_class_net);
+
+        assert_eq!(sysfs_only.interfaces.len(), 1);
+        assert_eq!(sysfs_only.interfaces[0].name, "tuxsys0");
+        assert_eq!(sysfs_only.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(sysfs_only.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(!sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("tuxsys0", 8 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let first_counters =
+            sampler.collect_at(t0 + Duration::from_secs(1), &proc_net_dev, &sys_class_net);
+        assert_eq!(first_counters.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(first_counters.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "tuxsys0",
+                8 * 1024 * 1024 * 1024 + 4_096,
+                2 * 1024 * 1024 * 1024 + 2_048,
+            ),
+        )
+        .unwrap();
+        let next_counters =
+            sampler.collect_at(t0 + Duration::from_secs(2), &proc_net_dev, &sys_class_net);
+        assert_eq!(
+            next_counters.interfaces[0].rx_rate_bytes_per_sec,
+            Some(4_096.0)
+        );
+        assert_eq!(
+            next_counters.interfaces[0].tx_rate_bytes_per_sec,
+            Some(2_048.0)
+        );
+
+        fs::write(&proc_net_dev, "").unwrap();
+        let counters_lost =
+            sampler.collect_at(t0 + Duration::from_secs(3), &proc_net_dev, &sys_class_net);
+        assert_eq!(counters_lost.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert!(!sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("tuxsys0", 9 * 1024 * 1024 * 1024, 3 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let counters_return =
+            sampler.collect_at(t0 + Duration::from_secs(4), &proc_net_dev, &sys_class_net);
+        assert_eq!(counters_return.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(counters_return.interfaces[0].tx_rate_bytes_per_sec, None);
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "tuxsys0",
+                9 * 1024 * 1024 * 1024 + 1_024,
+                3 * 1024 * 1024 * 1024 + 512,
+            ),
+        )
+        .unwrap();
+        let counters_resume =
+            sampler.collect_at(t0 + Duration::from_secs(5), &proc_net_dev, &sys_class_net);
+        assert_eq!(
+            counters_resume.interfaces[0].rx_rate_bytes_per_sec,
+            Some(1_024.0)
+        );
+        assert_eq!(
+            counters_resume.interfaces[0].tx_rate_bytes_per_sec,
+            Some(512.0)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -19,7 +19,7 @@ pub use process::{
     send_process_signal, ProcessCollector, ProcessIdentity, ProcessInfo, ProcessSignal,
     ProcessSignalError, ProcessSnapshot, ProcessSummary,
 };
-pub use service::{ServiceCollector, ServiceInfo, ServiceSnapshot};
+pub use service::{ServiceCollector, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot};
 #[cfg(test)]
 pub(crate) use system::LogicalCpuId;
 pub use system::{ByteUsage, LogicalCpuMetrics, SystemMetrics, SystemMetricsCollector};

@@ -67,7 +67,7 @@ fn render_system(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let metrics = app.system_metrics();
-    let summary = app.process_summary();
+    let process_summary = app.process_error().is_none().then(|| app.process_summary());
     let hostname = metrics.system_identity.hostname.as_deref().unwrap_or("N/A");
     let kernel = metrics
         .system_identity
@@ -90,9 +90,7 @@ fn render_system(frame: &mut Frame, app: &App, area: Rect) {
         hostname,
         kernel,
         &uptime,
-        summary.total,
-        summary.running,
-        summary.zombies,
+        process_summary,
         &filesystem,
         width,
         usize::from(available_text_height),
@@ -125,22 +123,29 @@ fn system_lines(
     hostname: &str,
     kernel: &str,
     uptime: &str,
-    total: usize,
-    running: usize,
-    zombies: usize,
+    process_summary: Option<crate::linux::ProcessSummary>,
     filesystem: &str,
     width: usize,
     height: usize,
 ) -> Vec<Line<'static>> {
+    let summary_values = process_summary.map(|summary| {
+        (
+            summary.total.to_string(),
+            summary.running.to_string(),
+            summary.zombies.to_string(),
+        )
+    });
     if height >= 8 {
+        let (total, running, zombies) =
+            summary_values.unwrap_or_else(|| ("unavailable".into(), "--".into(), "--".into()));
         vec![
             info_line("Host", hostname, width),
             info_line("Kernel", kernel, width),
             info_line("Uptime", uptime, width),
             Line::from(""),
-            info_line("Processes", &total.to_string(), width),
-            info_line("Running", &running.to_string(), width),
-            info_line("Zombies", &zombies.to_string(), width),
+            info_line("Processes", &total, width),
+            info_line("Running", &running, width),
+            info_line("Zombies", &zombies, width),
             Line::from("Filesystem").style(
                 Style::default()
                     .fg(Color::Cyan)
@@ -148,14 +153,20 @@ fn system_lines(
             ),
         ]
     } else if height >= 5 {
+        let process_line = process_summary.map_or_else(
+            || "Proc  unavailable".to_owned(),
+            |summary| {
+                format!(
+                    "Proc  {}  R {}  Z {}",
+                    summary.total, summary.running, summary.zombies
+                )
+            },
+        );
         vec![
             info_line("Host", hostname, width),
             info_line("Kernel", kernel, width),
             info_line("Uptime", uptime, width),
-            Line::from(layout::truncate(
-                &format!("Proc  {total}  R {running}  Z {zombies}"),
-                width,
-            )),
+            Line::from(layout::truncate(&process_line, width)),
             Line::from("Filesystem").style(
                 Style::default()
                     .fg(Color::Cyan)
@@ -163,10 +174,19 @@ fn system_lines(
             ),
         ]
     } else {
+        let process_line = process_summary.map_or_else(
+            || "P unavailable".to_owned(),
+            |summary| {
+                format!(
+                    "P {} R {} Z {}",
+                    summary.total, summary.running, summary.zombies
+                )
+            },
+        );
         [
             format!("Host {hostname}"),
             format!("Up {uptime}"),
-            format!("P {total} R {running} Z {zombies}"),
+            process_line,
             format!("/ {filesystem}"),
         ]
         .into_iter()
@@ -188,7 +208,33 @@ fn info_line(label: &str, value: &str, width: usize) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
     use super::*;
+
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn process(pid: u32, name: &str, state_code: char) -> crate::linux::ProcessInfo {
+        crate::linux::ProcessInfo {
+            pid,
+            name: name.into(),
+            cpu_percent: None,
+            memory_bytes: 0,
+            command: None,
+            state: state_code.to_string(),
+            parent_pid: 1,
+            state_code,
+            start_time: u64::from(pid),
+        }
+    }
 
     #[test]
     fn overview_uses_side_by_side_areas_when_width_allows() {
@@ -225,5 +271,44 @@ mod tests {
         assert_eq!(result.system.y, result.hardware.y);
         assert!(result.system.width >= 26);
         assert!(result.hardware.width >= 52);
+    }
+
+    #[test]
+    fn process_summary_is_unavailable_while_cached_data_is_stale() {
+        let mut app = App::default();
+        app.update(crate::action::Action::ProcessesUpdated(
+            crate::linux::ProcessSnapshot {
+                processes: vec![process(1, "running", 'R'), process(2, "zombie", 'Z')],
+                error: None,
+            },
+        ));
+        app.update(crate::action::Action::ProcessesUpdated(
+            crate::linux::ProcessSnapshot {
+                processes: Vec::new(),
+                error: Some("proc unavailable".into()),
+            },
+        ));
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_system(frame, &app, frame.area()))
+            .unwrap();
+
+        let stale = rendered_text(&terminal);
+        assert!(stale.contains("Processes unavailable"));
+        assert!(!stale.contains("Processes 2"));
+
+        app.update(crate::action::Action::ProcessesUpdated(
+            crate::linux::ProcessSnapshot {
+                processes: vec![process(3, "healthy", 'S')],
+                error: None,
+            },
+        ));
+        terminal
+            .draw(|frame| render_system(frame, &app, frame.area()))
+            .unwrap();
+        let healthy = rendered_text(&terminal);
+        assert!(!healthy.contains("unavailable"));
+        assert!(healthy.contains("Processes 1"));
     }
 }
