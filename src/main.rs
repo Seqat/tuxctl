@@ -39,58 +39,113 @@ fn main() -> io::Result<()> {
     let mut terminal = TerminalSession::new()?;
     let mut app = App::default();
     let mut events = EventHandler::new(TICK_RATE);
-    let metrics = linux::OverviewCollector::start(METRICS_REFRESH_RATE)?;
-    let processes = linux::ProcessCollector::start(METRICS_REFRESH_RATE)?;
-    let services = linux::ServiceCollector::start(SERVICES_REFRESH_RATE)?;
+    let metrics = match linux::SystemMetricsCollector::start(METRICS_REFRESH_RATE) {
+        Ok(metrics) => metrics,
+        Err(error) => return finish_application(terminal, (), Err(error)),
+    };
+    let processes = match linux::ProcessCollector::start(METRICS_REFRESH_RATE) {
+        Ok(processes) => processes,
+        Err(error) => return finish_application(terminal, (), Err(error)),
+    };
+    let services = match linux::ServiceCollector::start(SERVICES_REFRESH_RATE) {
+        Ok(services) => services,
+        Err(error) => return finish_application(terminal, (), Err(error)),
+    };
     let journal = linux::JournalCollector::start();
-    let network = linux::NetworkCollector::start(METRICS_REFRESH_RATE)?;
-    let hardware = linux::HardwareCollector::start()?;
+    let network = match linux::NetworkCollector::start(METRICS_REFRESH_RATE) {
+        Ok(network) => network,
+        Err(error) => return finish_application(terminal, (), Err(error)),
+    };
+    let hardware = match linux::HardwareCollector::start() {
+        Ok(hardware) => hardware,
+        Err(error) => return finish_application(terminal, (), Err(error)),
+    };
     let mut redraws = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
 
-    let mut regions = draw_app(&mut terminal, &mut app)?;
+    let run_result = (|| -> io::Result<()> {
+        let mut regions = draw_app(&mut terminal, &mut app)?;
 
-    while !app.should_quit() {
-        let action = if let Some(metrics) = metrics.latest() {
-            Some(action::Action::OverviewUpdated(metrics))
-        } else if let Some(snapshot) = processes.latest() {
-            Some(action::Action::ProcessesUpdated(snapshot))
-        } else if let Some(snapshot) = services.latest() {
-            Some(action::Action::ServicesUpdated(snapshot))
-        } else if let Some(batch) = journal.latest() {
-            Some(action::Action::LogsUpdated(batch))
-        } else if let Some(snapshot) = network.latest() {
-            Some(action::Action::NetworkUpdated(snapshot))
-        } else if let Some(inventory) = hardware.latest() {
-            Some(action::Action::HardwareDiscovered(inventory))
-        } else {
-            events.next_action(&regions, app.hovered(), redraws.deadline())?
-        };
+        while !app.should_quit() {
+            let action = match poll_ready_action(
+                || events.poll_action(&regions, app.hovered()),
+                || metrics.latest().map(action::Action::SystemMetricsUpdated),
+                || processes.latest().map(action::Action::ProcessesUpdated),
+                || services.latest().map(action::Action::ServicesUpdated),
+                || network.latest().map(action::Action::NetworkUpdated),
+                || hardware.latest().map(action::Action::HardwareDiscovered),
+                || journal.latest().map(action::Action::LogsUpdated),
+            )? {
+                Some(action) => Some(action),
+                None => events.next_action(&regions, app.hovered(), redraws.deadline())?,
+            };
 
-        if let Some(action) = action {
-            let redraw_policy = RedrawPolicy::for_action(&action);
-            if app.update(action) {
-                match redraw_policy {
-                    RedrawPolicy::CoalescedHover => redraws.request_hover(Instant::now()),
-                    RedrawPolicy::Immediate if !app.should_quit() => {
-                        regions = draw_app(&mut terminal, &mut app)?;
-                        redraws.rendered();
+            if let Some(action) = action {
+                let redraw_policy = RedrawPolicy::for_action(&action);
+                if app.update(action) {
+                    match redraw_policy {
+                        RedrawPolicy::CoalescedHover => redraws.request_hover(Instant::now()),
+                        RedrawPolicy::Immediate if !app.should_quit() => {
+                            regions = draw_app(&mut terminal, &mut app)?;
+                            redraws.rendered();
+                        }
+                        RedrawPolicy::Immediate => {}
                     }
-                    RedrawPolicy::Immediate => {}
                 }
+            }
+
+            if let Some(generation) = app.take_service_refresh_request() {
+                services.request_refresh(generation);
+            }
+
+            if redraws.take_due(Instant::now()) && !app.should_quit() {
+                regions = draw_app(&mut terminal, &mut app)?;
             }
         }
 
-        if app.take_service_refresh_request() {
-            services.request_refresh();
-        }
+        Ok(())
+    })();
 
-        if redraws.take_due(Instant::now()) && !app.should_quit() {
-            regions = draw_app(&mut terminal, &mut app)?;
-        }
-    }
+    finish_application(
+        terminal,
+        (hardware, network, journal, services, processes, metrics),
+        run_result,
+    )
+}
 
+fn finish_application<T, W, R>(terminal: T, workers: W, result: io::Result<R>) -> io::Result<R> {
     drop(terminal);
-    Ok(())
+    drop(workers);
+    result
+}
+
+fn poll_ready_action(
+    terminal: impl FnOnce() -> io::Result<Option<action::Action>>,
+    metrics: impl FnOnce() -> Option<action::Action>,
+    processes: impl FnOnce() -> Option<action::Action>,
+    services: impl FnOnce() -> Option<action::Action>,
+    network: impl FnOnce() -> Option<action::Action>,
+    hardware: impl FnOnce() -> Option<action::Action>,
+    journal: impl FnOnce() -> Option<action::Action>,
+) -> io::Result<Option<action::Action>> {
+    if let Some(action) = terminal()? {
+        return Ok(Some(action));
+    }
+    if let Some(action) = metrics() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = processes() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = services() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = network() {
+        return Ok(Some(action));
+    }
+    if let Some(action) = hardware() {
+        return Ok(Some(action));
+    }
+    Ok(journal())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +288,44 @@ fn should_restore_terminal_for_panic(
 mod tests {
     use super::*;
     use crate::action::{Action, MouseTarget, Tab};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    struct RecordedDrop {
+        name: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for RecordedDrop {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push(self.name);
+        }
+    }
+
+    struct BlockingWorkerDrop {
+        started: mpsc::Sender<&'static str>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Drop for BlockingWorkerDrop {
+        fn drop(&mut self) {
+            self.started.send("worker").unwrap();
+            self.release.recv().unwrap();
+        }
+    }
+
+    struct SignalingDrop {
+        event: mpsc::Sender<&'static str>,
+    }
+
+    impl Drop for SignalingDrop {
+        fn drop(&mut self) {
+            self.event.send("terminal").unwrap();
+        }
+    }
+
+    fn no_ready_action() -> Option<Action> {
+        None
+    }
 
     #[test]
     fn idle_scheduler_does_not_request_continuous_frames() {
@@ -314,6 +407,80 @@ mod tests {
     }
 
     #[test]
+    fn continuous_journal_readiness_cannot_delay_quit() {
+        let mut journal_polls = 0;
+
+        for _ in 0..100 {
+            let action = poll_ready_action(
+                || Ok(Some(Action::Quit)),
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                || {
+                    journal_polls += 1;
+                    Some(Action::LogsUpdated(Default::default()))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(action, Some(Action::Quit));
+        }
+        assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
+    fn continuous_journal_readiness_cannot_delay_resize() {
+        let mut journal_polls = 0;
+
+        for _ in 0..100 {
+            let action = poll_ready_action(
+                || Ok(Some(Action::Resize)),
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                no_ready_action,
+                || {
+                    journal_polls += 1;
+                    Some(Action::LogsUpdated(Default::default()))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(action, Some(Action::Resize));
+        }
+        assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
+    fn continuous_journal_readiness_cannot_delay_network_updates() {
+        let mut journal_polls = 0;
+
+        let action = poll_ready_action(
+            || Ok(None),
+            no_ready_action,
+            no_ready_action,
+            no_ready_action,
+            || {
+                Some(Action::NetworkUpdated(
+                    crate::linux::NetworkSnapshot::default(),
+                ))
+            },
+            no_ready_action,
+            || {
+                journal_polls += 1;
+                Some(Action::LogsUpdated(Default::default()))
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(action, Some(Action::NetworkUpdated(_))));
+        assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
     fn should_restore_terminal_for_panic_filters_threads() {
         let main_id = std::thread::current().id();
         assert!(should_restore_terminal_for_panic(main_id, main_id));
@@ -323,6 +490,74 @@ mod tests {
             assert!(!should_restore_terminal_for_panic(main_id, worker_id));
         });
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn normal_and_error_results_restore_terminal_before_workers() {
+        for run_result in [Ok(()), Err(io::Error::other("main loop failed"))] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let terminal = RecordedDrop {
+                name: "terminal",
+                events: Arc::clone(&events),
+            };
+            let worker = RecordedDrop {
+                name: "worker",
+                events: Arc::clone(&events),
+            };
+
+            let expected_ok = run_result.is_ok();
+            let result = finish_application(terminal, worker, run_result);
+
+            assert_eq!(*events.lock().unwrap(), ["terminal", "worker"]);
+            assert_eq!(result.is_ok(), expected_ok);
+        }
+    }
+
+    #[test]
+    fn quit_uses_normal_terminal_first_teardown() {
+        let mut app = App::default();
+        assert!(!app.update(Action::Quit));
+        assert!(app.should_quit());
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let terminal = RecordedDrop {
+            name: "terminal",
+            events: Arc::clone(&events),
+        };
+        let worker = RecordedDrop {
+            name: "worker",
+            events: Arc::clone(&events),
+        };
+
+        finish_application(terminal, worker, Ok(())).unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["terminal", "worker"]);
+    }
+
+    #[test]
+    fn terminal_restoration_precedes_blocked_worker_teardown() {
+        let (events_tx, events_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let terminal = SignalingDrop {
+            event: events_tx.clone(),
+        };
+        let worker = BlockingWorkerDrop {
+            started: events_tx,
+            release: release_rx,
+        };
+
+        let teardown = std::thread::spawn(move || {
+            finish_application(terminal, worker, Ok(())).unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        assert_eq!(events_rx.recv().unwrap(), "terminal");
+        assert_eq!(events_rx.recv().unwrap(), "worker");
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release_tx.send(()).unwrap();
+        teardown.join().unwrap();
+        assert_eq!(done_rx.recv().unwrap(), ());
     }
 
     #[test]

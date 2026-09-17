@@ -4,10 +4,12 @@ use std::{
     fs, io,
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use super::latest_snapshot::{self, LatestReceiver};
 
 const PROC_NET_DEV: &str = "/proc/net/dev";
 const SYS_CLASS_NET: &str = "/sys/class/net";
@@ -83,6 +85,35 @@ struct InterfacePrev {
     timestamp: Instant,
 }
 
+fn calculate_transfer_rates(
+    previous: Option<&InterfacePrev>,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    now: Instant,
+) -> (Option<f64>, Option<f64>) {
+    let Some(previous) = previous else {
+        return (None, None);
+    };
+    let elapsed = now
+        .saturating_duration_since(previous.timestamp)
+        .as_secs_f64();
+    if elapsed < 0.001 {
+        return (None, None);
+    }
+
+    let rate = |previous: u64, current: u64| {
+        Some(
+            current
+                .checked_sub(previous)
+                .map_or(0.0, |delta| delta as f64 / elapsed),
+        )
+    };
+    (
+        rate(previous.rx_bytes, rx_bytes),
+        rate(previous.tx_bytes, tx_bytes),
+    )
+}
+
 #[derive(Default)]
 pub struct NetworkSampler {
     previous: HashMap<String, InterfacePrev>,
@@ -106,6 +137,7 @@ impl NetworkSampler {
         let dev_contents = match fs::read_to_string(proc_net_dev_path) {
             Ok(contents) => contents,
             Err(error) => {
+                self.previous.clear();
                 return NetworkSnapshot {
                     interfaces: Vec::new(),
                     error: Some(format!(
@@ -161,37 +193,21 @@ impl NetworkSampler {
             let ipv4 = ipv4_map.remove(&name).unwrap_or_default();
             let ipv6 = ipv6_map.remove(&name).unwrap_or_default();
 
-            let (rx_rate, tx_rate) = if let Some(prev) = self.previous.get(&name) {
-                let elapsed = now.saturating_duration_since(prev.timestamp).as_secs_f64();
-                if elapsed >= 0.001 {
-                    let rx_rate = if rx_bytes >= prev.rx_bytes {
-                        Some((rx_bytes - prev.rx_bytes) as f64 / elapsed)
-                    } else {
-                        // Counter reset/wrap
-                        Some(0.0)
-                    };
-                    let tx_rate = if tx_bytes >= prev.tx_bytes {
-                        Some((tx_bytes - prev.tx_bytes) as f64 / elapsed)
-                    } else {
-                        Some(0.0)
-                    };
-                    (rx_rate, tx_rate)
-                } else {
-                    (None, None)
-                }
+            let (rx_rate, tx_rate) = if stats.is_some() {
+                let rates =
+                    calculate_transfer_rates(self.previous.get(&name), rx_bytes, tx_bytes, now);
+                next_previous.insert(
+                    name.clone(),
+                    InterfacePrev {
+                        rx_bytes,
+                        tx_bytes,
+                        timestamp: now,
+                    },
+                );
+                rates
             } else {
-                // First sample or newly appeared interface
                 (None, None)
             };
-
-            next_previous.insert(
-                name.clone(),
-                InterfacePrev {
-                    rx_bytes,
-                    tx_bytes,
-                    timestamp: now,
-                },
-            );
 
             interfaces.push(NetworkInterfaceInfo {
                 name,
@@ -223,14 +239,14 @@ impl NetworkSampler {
 }
 
 pub struct NetworkCollector {
-    receiver: Receiver<NetworkSnapshot>,
+    receiver: LatestReceiver<NetworkSnapshot>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl NetworkCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
-        let (snapshot_tx, receiver) = mpsc::channel();
+        let (snapshot_tx, receiver) = latest_snapshot::channel();
         let (stop, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("network-metrics".into())
@@ -238,7 +254,7 @@ impl NetworkCollector {
                 let mut sampler = NetworkSampler::default();
 
                 loop {
-                    if snapshot_tx.send(sampler.collect()).is_err() {
+                    if !snapshot_tx.publish(sampler.collect()) {
                         break;
                     }
 
@@ -257,7 +273,7 @@ impl NetworkCollector {
     }
 
     pub fn latest(&self) -> Option<NetworkSnapshot> {
-        self.receiver.try_iter().last()
+        self.receiver.take_latest()
     }
 }
 
@@ -432,102 +448,260 @@ docker0:   16306     214    0    0    0     0          0         0   593023    1
     }
 
     #[test]
-    fn calculates_transfer_rates_between_samples() {
-        let mut sampler = NetworkSampler::default();
+    fn first_sample_has_no_transfer_rate() {
         let t0 = Instant::now();
 
-        // Simulate first sample: populate previous map
-        sampler.previous.insert(
-            "enp6s0".into(),
-            InterfacePrev {
-                rx_bytes: 1_000_000,
-                tx_bytes: 500_000,
-                timestamp: t0,
-            },
+        assert_eq!(
+            calculate_transfer_rates(None, 1_000_000, 500_000, t0),
+            (None, None)
         );
+    }
+
+    #[test]
+    fn calculates_transfer_rates_from_counter_and_elapsed_deltas() {
+        let t0 = Instant::now();
+        let previous = InterfacePrev {
+            rx_bytes: 1_000_000,
+            tx_bytes: 500_000,
+            timestamp: t0,
+        };
 
         let t1 = t0 + Duration::from_secs(2);
-        // After 2 seconds, 2 MiB received (+2_097_152 bytes) and 1 MiB sent (+1_048_576 bytes)
         let rx_now = 1_000_000 + 2_097_152;
         let tx_now = 500_000 + 1_048_576;
+        let (rx_rate, tx_rate) = calculate_transfer_rates(Some(&previous), rx_now, tx_now, t1);
 
-        let elapsed = t1.saturating_duration_since(t0).as_secs_f64();
-        let rx_rate = (rx_now - 1_000_000) as f64 / elapsed;
-        let tx_rate = (tx_now - 500_000) as f64 / elapsed;
-
-        assert!((rx_rate - 1_048_576.0).abs() < 1.0);
-        assert!((tx_rate - 524_288.0).abs() < 1.0);
+        assert_eq!(rx_rate, Some(1_048_576.0));
+        assert_eq!(tx_rate, Some(524_288.0));
     }
 
     #[test]
-    fn handles_first_sample_without_treating_total_as_rate() {
-        let sampler = NetworkSampler::default();
-        assert!(sampler.previous.is_empty());
-        // For a new interface, previous sample is None so rate should be None
-        assert_eq!(sampler.previous.get("eth0").copied().map(|_| ()), None);
-    }
-
-    #[test]
-    fn handles_counter_reset_gracefully() {
-        let mut sampler = NetworkSampler::default();
+    fn suppresses_rates_when_elapsed_time_is_too_short() {
         let t0 = Instant::now();
-
-        sampler.previous.insert(
-            "enp6s0".into(),
-            InterfacePrev {
-                rx_bytes: 10_000_000,
-                tx_bytes: 5_000_000,
-                timestamp: t0,
-            },
-        );
-
-        // Current counter is smaller than previous (reboot, reset, or wrap)
-        let rx_now = 100;
-        let tx_now = 50;
-
-        let prev = sampler.previous.get("enp6s0").unwrap();
-        let rx_rate = if rx_now >= prev.rx_bytes {
-            Some((rx_now - prev.rx_bytes) as f64 / 1.0)
-        } else {
-            Some(0.0)
-        };
-        let tx_rate = if tx_now >= prev.tx_bytes {
-            Some((tx_now - prev.tx_bytes) as f64 / 1.0)
-        } else {
-            Some(0.0)
+        let previous = InterfacePrev {
+            rx_bytes: 100,
+            tx_bytes: 200,
+            timestamp: t0,
         };
 
-        assert_eq!(rx_rate, Some(0.0));
-        assert_eq!(tx_rate, Some(0.0));
+        assert_eq!(
+            calculate_transfer_rates(Some(&previous), 200, 300, t0 + Duration::from_micros(999),),
+            (None, None)
+        );
     }
 
     #[test]
-    fn handles_interface_appearance_and_disappearance() {
+    fn counter_decrease_resets_the_corresponding_rate_to_zero() {
+        let t0 = Instant::now();
+        let previous = InterfacePrev {
+            rx_bytes: 10_000,
+            tx_bytes: 5_000,
+            timestamp: t0,
+        };
+        let rates =
+            calculate_transfer_rates(Some(&previous), 100, 5_500, t0 + Duration::from_secs(1));
+
+        assert_eq!(rates, (Some(0.0), Some(500.0)));
+    }
+
+    #[test]
+    fn sampling_replaces_disappeared_interfaces_and_tracks_new_ones() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxctl-network-lifecycle-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let proc_net_dev = root.join("net-dev");
+        let sys_class_net = root.join("net");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&sys_class_net).unwrap();
+
         let mut sampler = NetworkSampler::default();
         let t0 = Instant::now();
+        fs::write(&proc_net_dev, net_dev_row("tuxgone0", 1_000, 2_000)).unwrap();
+        let first = sampler.collect_at(t0, &proc_net_dev, &sys_class_net);
 
-        sampler.previous.insert(
-            "veth123".into(),
-            InterfacePrev {
-                rx_bytes: 1000,
-                tx_bytes: 1000,
-                timestamp: t0,
-            },
-        );
+        assert_eq!(first.interfaces.len(), 1);
+        assert_eq!(first.interfaces[0].name, "tuxgone0");
+        assert_eq!(first.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(first.interfaces[0].tx_rate_bytes_per_sec, None);
 
-        // Next snapshot only has enp6s0; veth123 disappeared
-        let mut next_previous = HashMap::new();
-        next_previous.insert(
-            "enp6s0".into(),
-            InterfacePrev {
-                rx_bytes: 2000,
-                tx_bytes: 2000,
-                timestamp: t0 + Duration::from_secs(1),
-            },
-        );
-        sampler.previous = next_previous;
+        fs::write(&proc_net_dev, net_dev_row("tuxnew0", 3_000, 4_000)).unwrap();
+        let second = sampler.collect_at(t0 + Duration::from_secs(1), &proc_net_dev, &sys_class_net);
 
-        assert!(!sampler.previous.contains_key("veth123"));
+        assert_eq!(second.interfaces.len(), 1);
+        assert_eq!(second.interfaces[0].name, "tuxnew0");
+        assert_eq!(second.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert!(!sampler.previous.contains_key("tuxgone0"));
+        assert!(sampler.previous.contains_key("tuxnew0"));
+
+        fs::write(&proc_net_dev, net_dev_row("tuxnew0", 3_500, 5_000)).unwrap();
+        let third = sampler.collect_at(t0 + Duration::from_secs(3), &proc_net_dev, &sys_class_net);
+
+        assert_eq!(third.interfaces[0].rx_rate_bytes_per_sec, Some(250.0));
+        assert_eq!(third.interfaces[0].tx_rate_bytes_per_sec, Some(500.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proc_read_failure_invalidates_rate_baselines_before_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxctl-network-read-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let proc_net_dev = root.join("net-dev");
+        let sys_class_net = root.join("net");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&sys_class_net).unwrap();
+
+        let mut sampler = NetworkSampler::default();
+        let t0 = Instant::now();
+        fs::write(&proc_net_dev, net_dev_row("enp6s0", 1_000, 2_000)).unwrap();
+        let baseline = sampler.collect_at(t0, &proc_net_dev, &sys_class_net);
+
+        assert_eq!(baseline.interfaces.len(), 1);
+        assert_eq!(baseline.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(baseline.interfaces[0].tx_rate_bytes_per_sec, None);
         assert!(sampler.previous.contains_key("enp6s0"));
+
+        fs::remove_file(&proc_net_dev).unwrap();
+        let failed = sampler.collect_at(t0 + Duration::from_secs(1), &proc_net_dev, &sys_class_net);
+
+        assert!(failed.interfaces.is_empty());
+        assert!(failed.error.as_deref().is_some_and(
+            |error| error.starts_with(&format!("Failed to read {}:", proc_net_dev.display()))
+        ));
+        assert!(sampler.previous.is_empty());
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("enp6s0", 8 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let recovered =
+            sampler.collect_at(t0 + Duration::from_secs(2), &proc_net_dev, &sys_class_net);
+
+        assert_eq!(recovered.interfaces.len(), 1);
+        assert_eq!(recovered.interfaces[0].name, "enp6s0");
+        assert_eq!(recovered.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(recovered.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(sampler.previous.contains_key("enp6s0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "enp6s0",
+                8 * 1024 * 1024 * 1024 + 4_096,
+                2 * 1024 * 1024 * 1024 + 2_048,
+            ),
+        )
+        .unwrap();
+        let resumed =
+            sampler.collect_at(t0 + Duration::from_secs(3), &proc_net_dev, &sys_class_net);
+
+        assert_eq!(resumed.interfaces[0].rx_rate_bytes_per_sec, Some(4_096.0));
+        assert_eq!(resumed.interfaces[0].tx_rate_bytes_per_sec, Some(2_048.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sysfs_only_discovery_never_becomes_a_counter_baseline() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxctl-network-sysfs-baseline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let proc_net_dev = root.join("net-dev");
+        let sys_class_net = root.join("net");
+        let interface_dir = sys_class_net.join("tuxsys0");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&interface_dir).unwrap();
+
+        let mut sampler = NetworkSampler::default();
+        let t0 = Instant::now();
+        fs::write(&proc_net_dev, "").unwrap();
+        let sysfs_only = sampler.collect_at(t0, &proc_net_dev, &sys_class_net);
+
+        assert_eq!(sysfs_only.interfaces.len(), 1);
+        assert_eq!(sysfs_only.interfaces[0].name, "tuxsys0");
+        assert_eq!(sysfs_only.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(sysfs_only.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(!sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("tuxsys0", 8 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let first_counters =
+            sampler.collect_at(t0 + Duration::from_secs(1), &proc_net_dev, &sys_class_net);
+        assert_eq!(first_counters.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(first_counters.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "tuxsys0",
+                8 * 1024 * 1024 * 1024 + 4_096,
+                2 * 1024 * 1024 * 1024 + 2_048,
+            ),
+        )
+        .unwrap();
+        let next_counters =
+            sampler.collect_at(t0 + Duration::from_secs(2), &proc_net_dev, &sys_class_net);
+        assert_eq!(
+            next_counters.interfaces[0].rx_rate_bytes_per_sec,
+            Some(4_096.0)
+        );
+        assert_eq!(
+            next_counters.interfaces[0].tx_rate_bytes_per_sec,
+            Some(2_048.0)
+        );
+
+        fs::write(&proc_net_dev, "").unwrap();
+        let counters_lost =
+            sampler.collect_at(t0 + Duration::from_secs(3), &proc_net_dev, &sys_class_net);
+        assert_eq!(counters_lost.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert!(!sampler.previous.contains_key("tuxsys0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("tuxsys0", 9 * 1024 * 1024 * 1024, 3 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let counters_return =
+            sampler.collect_at(t0 + Duration::from_secs(4), &proc_net_dev, &sys_class_net);
+        assert_eq!(counters_return.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(counters_return.interfaces[0].tx_rate_bytes_per_sec, None);
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "tuxsys0",
+                9 * 1024 * 1024 * 1024 + 1_024,
+                3 * 1024 * 1024 * 1024 + 512,
+            ),
+        )
+        .unwrap();
+        let counters_resume =
+            sampler.collect_at(t0 + Duration::from_secs(5), &proc_net_dev, &sys_class_net);
+        assert_eq!(
+            counters_resume.interfaces[0].rx_rate_bytes_per_sec,
+            Some(1_024.0)
+        );
+        assert_eq!(
+            counters_resume.interfaces[0].tx_rate_bytes_per_sec,
+            Some(512.0)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn net_dev_row(name: &str, rx_bytes: u64, tx_bytes: u64) -> String {
+        format!("{name}: {rx_bytes} 1 0 0 0 0 0 0 {tx_bytes} 1 0 0 0 0 0 0\n")
     }
 }

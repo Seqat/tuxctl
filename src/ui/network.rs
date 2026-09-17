@@ -77,17 +77,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> NetworkRender {
             Style::default()
         };
 
-        let (state_text, state_style) = match iface.operstate {
-            OperState::Up => (
-                "● up",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            OperState::Down => ("○ down", Style::default().fg(Color::DarkGray)),
-            OperState::Dormant => ("◌ dormant", Style::default().fg(Color::Yellow)),
-            _ => (iface.operstate.as_str(), Style::default().fg(Color::Yellow)),
-        };
+        let (state_text, state_style) = state_display(iface.operstate);
 
         let name_prefix = if is_selected { "> " } else { "  " };
         let name_cell = Cell::from(format!("{name_prefix}{}", iface.name));
@@ -274,6 +264,20 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> NetworkRender {
     }
 }
 
+pub(super) fn state_display(state: OperState) -> (&'static str, Style) {
+    match state {
+        OperState::Up => (
+            "● up",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        OperState::Down => ("○ down", Style::default().fg(Color::DarkGray)),
+        OperState::Dormant => ("◌ dormant", Style::default().fg(Color::Yellow)),
+        _ => (state.as_str(), Style::default().fg(Color::Yellow)),
+    }
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         Span::raw(" "),
@@ -281,7 +285,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if area.width >= 40 {
-        spans.push(Span::raw("   Enter Details"));
+        spans.push(Span::raw("   Enter details"));
     }
 
     if let Some(error) = app.network_error() {

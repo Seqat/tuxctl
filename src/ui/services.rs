@@ -27,8 +27,8 @@ const COLUMN_SPACING: u16 = 1;
 const COLUMN_WIDTHS: [Constraint; 5] = [
     Constraint::Percentage(34),
     Constraint::Length(10),
-    Constraint::Length(12),
     Constraint::Length(14),
+    Constraint::Length(12),
     Constraint::Min(12),
 ];
 
@@ -213,5 +213,17 @@ fn fallback(value: &str) -> &str {
         "N/A"
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_widths_allocate_at_least_14_chars_for_active_state() {
+        // "○ deactivating" is 14 characters long
+        assert_eq!(COLUMN_WIDTHS[2], Constraint::Length(14));
+        assert_eq!(COLUMN_WIDTHS[3], Constraint::Length(12));
     }
 }

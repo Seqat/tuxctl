@@ -6,8 +6,9 @@ use crate::{
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
-        NetworkSnapshot, OverviewMetrics, ProcessIdentity, ProcessInfo, ProcessSignal,
-        ProcessSignalError, ProcessSnapshot, ServiceInfo, ServiceSnapshot,
+        NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
+        ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot,
+        SystemMetrics,
     },
 };
 
@@ -15,6 +16,7 @@ use crate::{
 use crate::linux::verify_and_send_signal_at;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
+const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -25,13 +27,46 @@ pub struct ProcessSignalConfirmation {
 }
 
 #[derive(Debug)]
+pub struct AggregateCpuHistory {
+    samples: VecDeque<f64>,
+}
+
+impl Default for AggregateCpuHistory {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(AGGREGATE_CPU_HISTORY_CAPACITY),
+        }
+    }
+}
+
+impl AggregateCpuHistory {
+    fn push(&mut self, utilization_percent: f64) -> bool {
+        if !utilization_percent.is_finite() {
+            return false;
+        }
+        if self.samples.len() == AGGREGATE_CPU_HISTORY_CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples
+            .push_back(utilization_percent.clamp(0.0, 100.0));
+        true
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = f64> + ExactSizeIterator + '_ {
+        self.samples.iter().copied()
+    }
+}
+
+#[derive(Debug)]
 pub struct App {
     should_quit: bool,
     active_tab: Tab,
     help_visible: bool,
-    overview: OverviewMetrics,
+    system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
+    aggregate_cpu_history: AggregateCpuHistory,
     processes: Vec<ProcessInfo>,
+    process_summary: ProcessSummary,
     filtered_processes: Vec<usize>,
     selected_process: Option<ProcessIdentity>,
     process_scroll: usize,
@@ -52,8 +87,9 @@ pub struct App {
     service_searching: bool,
     service_detail_visible: bool,
     service_error: Option<String>,
-    service_refresh_requested: bool,
-    service_refreshing: bool,
+    service_refresh_generation: ServiceRefreshGeneration,
+    service_refresh_requested: Option<ServiceRefreshGeneration>,
+    pending_service_refresh_generation: Option<ServiceRefreshGeneration>,
     logs: VecDeque<JournalEntry>,
     filtered_logs: Vec<usize>,
     selected_log: Option<u64>,
@@ -81,9 +117,11 @@ impl Default for App {
             should_quit: false,
             active_tab: Tab::Overview,
             help_visible: false,
-            overview: OverviewMetrics::default(),
+            system_metrics: SystemMetrics::default(),
             hardware: None,
+            aggregate_cpu_history: AggregateCpuHistory::default(),
             processes: Vec::new(),
+            process_summary: ProcessSummary::default(),
             filtered_processes: Vec::new(),
             selected_process: None,
             process_scroll: 0,
@@ -104,8 +142,9 @@ impl Default for App {
             service_searching: false,
             service_detail_visible: false,
             service_error: None,
-            service_refresh_requested: false,
-            service_refreshing: false,
+            service_refresh_generation: 0,
+            service_refresh_requested: None,
+            pending_service_refresh_generation: None,
             logs: VecDeque::with_capacity(LOG_BUFFER_CAPACITY),
             filtered_logs: Vec::new(),
             selected_log: None,
@@ -142,8 +181,12 @@ impl App {
         self.help_visible
     }
 
-    pub fn overview(&self) -> &OverviewMetrics {
-        &self.overview
+    pub fn system_metrics(&self) -> &SystemMetrics {
+        &self.system_metrics
+    }
+
+    pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
+        &self.aggregate_cpu_history
     }
 
     pub fn hardware(&self) -> Option<&HardwareInventory> {
@@ -182,6 +225,10 @@ impl App {
 
     pub fn process_count(&self) -> usize {
         self.filtered_processes.len()
+    }
+
+    pub fn process_summary(&self) -> ProcessSummary {
+        self.process_summary
     }
 
     pub fn process_at(&self, index: usize) -> Option<&ProcessInfo> {
@@ -285,11 +332,11 @@ impl App {
     }
 
     pub fn service_refreshing(&self) -> bool {
-        self.service_refreshing
+        self.pending_service_refresh_generation.is_some()
     }
 
-    pub fn take_service_refresh_request(&mut self) -> bool {
-        std::mem::take(&mut self.service_refresh_requested)
+    pub fn take_service_refresh_request(&mut self) -> Option<ServiceRefreshGeneration> {
+        self.service_refresh_requested.take()
     }
 
     pub fn log_count(&self) -> usize {
@@ -352,6 +399,10 @@ impl App {
         self.networks.len()
     }
 
+    pub fn networks(&self) -> &[NetworkInterfaceInfo] {
+        &self.networks
+    }
+
     pub fn network_at(&self, index: usize) -> Option<&NetworkInterfaceInfo> {
         self.networks.get(index)
     }
@@ -384,17 +435,32 @@ impl App {
 
     /// Applies an action and reports whether the rendered UI may have changed.
     pub fn update(&mut self, action: Action) -> bool {
+        // Terminal geometry is global state and must bypass every input/modal guard below.
+        if matches!(&action, Action::Resize) {
+            self.hovered = None;
+            return true;
+        }
+
         match action {
             Action::Quit => {
                 self.should_quit = true;
                 false
             }
-            Action::OverviewUpdated(metrics) => {
-                if self.overview == metrics {
-                    false
-                } else {
-                    self.overview = metrics;
-                    self.active_tab == Tab::Overview
+            Action::SystemMetricsUpdated(metrics) => {
+                let process_metrics_changed = self.system_metrics.cpu_percent
+                    != metrics.cpu_percent
+                    || self.system_metrics.memory != metrics.memory;
+                let history_changed = metrics
+                    .cpu_percent
+                    .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
+                let metrics_changed = self.system_metrics != metrics;
+                if metrics_changed {
+                    self.system_metrics = metrics;
+                }
+                match self.active_tab {
+                    Tab::Overview => metrics_changed || history_changed,
+                    Tab::Processes => process_metrics_changed,
+                    _ => false,
                 }
             }
             Action::HardwareDiscovered(hardware) => {
@@ -447,6 +513,7 @@ impl App {
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
+            Action::Resize => unreachable!("resize actions return before modal suppression"),
             _ if self.help_visible
                 || self.process_signal_confirmation.is_some()
                 || self.process_detail_visible
@@ -528,10 +595,6 @@ impl App {
             Action::NetworkLast => self.select_network_index(self.networks.len().saturating_sub(1)),
             Action::SelectNetwork(name) => self.select_network(&name),
             Action::OpenNetworkDetails => self.open_network_details(),
-            Action::Resize => {
-                self.hovered = None;
-                true
-            }
             Action::Tick => false,
         }
     }
@@ -579,34 +642,47 @@ impl App {
         } else if self.network_detail_visible {
             self.network_detail_visible = false;
             true
-        } else if self.process_searching || !self.process_search_query.is_empty() {
-            self.process_searching = false;
-            self.process_search_query.clear();
-            self.rebuild_process_filter();
-            true
-        } else if self.service_searching || !self.service_search_query.is_empty() {
-            self.service_searching = false;
-            self.service_search_query.clear();
-            self.rebuild_service_filter();
-            true
-        } else if self.log_searching || !self.log_search_query.is_empty() {
-            self.log_searching = false;
-            self.log_search_query.clear();
-            self.rebuild_log_filter();
-            true
         } else {
-            false
+            match self.active_tab {
+                Tab::Processes
+                    if self.process_searching || !self.process_search_query.is_empty() =>
+                {
+                    self.process_searching = false;
+                    self.process_search_query.clear();
+                    self.rebuild_process_filter();
+                    true
+                }
+                Tab::Services
+                    if self.service_searching || !self.service_search_query.is_empty() =>
+                {
+                    self.service_searching = false;
+                    self.service_search_query.clear();
+                    self.rebuild_service_filter();
+                    true
+                }
+                Tab::Logs if self.log_searching || !self.log_search_query.is_empty() => {
+                    self.log_searching = false;
+                    self.log_search_query.clear();
+                    self.rebuild_log_filter();
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
     fn update_processes(&mut self, snapshot: ProcessSnapshot) -> bool {
-        let visible = self.active_tab == Tab::Processes;
+        let processes_visible = self.active_tab == Tab::Processes;
+        let overview_visible = self.active_tab == Tab::Overview;
+        let was_stale = self.process_error.is_some();
+        let summary = snapshot.summary();
+        let overview_summary_changed = overview_visible && self.process_summary != summary;
         if let Some(error) = snapshot.error {
             if self.process_error.as_ref() == Some(&error) {
                 return false;
             }
             self.process_error = Some(error);
-            return visible;
+            return processes_visible || overview_visible;
         }
 
         if self.process_error.is_none() && self.processes == snapshot.processes {
@@ -616,6 +692,7 @@ impl App {
         let previous_index = self.selected_process_index().unwrap_or(0);
         let previous_selection = self.selected_process;
         self.processes = snapshot.processes;
+        self.process_summary = summary;
         self.process_error = None;
         self.rebuild_process_filter();
 
@@ -648,7 +725,7 @@ impl App {
         }
         self.reconcile_hovered_process();
         self.ensure_process_visible();
-        visible
+        processes_visible || overview_summary_changed || (overview_visible && was_stale)
     }
 
     fn begin_process_search(&mut self) -> bool {
@@ -839,13 +916,15 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn confirm_process_signal_at<F>(
+    pub(crate) fn confirm_process_signal_at<H, O, S>(
         &mut self,
         proc_dir: &std::path::Path,
-        kill_fn: F,
+        open_pidfd: O,
+        send_signal: S,
     ) -> bool
     where
-        F: FnOnce(libc::pid_t, libc::c_int) -> std::io::Result<()>,
+        O: FnOnce(libc::pid_t) -> std::io::Result<H>,
+        S: FnOnce(&H, libc::c_int) -> std::io::Result<()>,
     {
         let Some(confirmation) = self.process_signal_confirmation.take() else {
             return false;
@@ -854,7 +933,8 @@ impl App {
             proc_dir,
             confirmation.identity,
             confirmation.signal,
-            kill_fn,
+            open_pidfd,
+            send_signal,
         );
         self.finish_process_signal(confirmation, result)
     }
@@ -889,6 +969,12 @@ impl App {
                 self.process_action_message = Some(format!(
                     "Failed to send {}: permission denied for {} ({})",
                     sig_name, confirmation.name, confirmation.identity.pid
+                ));
+            }
+            Err(ProcessSignalError::Unsupported) => {
+                self.process_action_message = Some(format!(
+                    "Failed to send {}: pidfd signaling is not supported",
+                    sig_name
                 ));
             }
             Err(ProcessSignalError::Failed(err)) => {
@@ -939,18 +1025,24 @@ impl App {
 
     fn update_services(&mut self, snapshot: ServiceSnapshot) -> bool {
         let visible = self.active_tab == Tab::Services;
-        let was_refreshing = self.service_refreshing;
-        self.service_refreshing = false;
+        let was_refreshing = self.service_refreshing();
+        if self
+            .pending_service_refresh_generation
+            .is_some_and(|pending| snapshot.completed_refresh_generation >= pending)
+        {
+            self.pending_service_refresh_generation = None;
+        }
+        let refresh_state_changed = was_refreshing != self.service_refreshing();
         if let Some(error) = snapshot.error {
             if self.service_error.as_ref() == Some(&error) {
-                return was_refreshing && visible;
+                return refresh_state_changed && visible;
             }
             self.service_error = Some(error);
             return visible;
         }
 
         if self.service_error.is_none() && self.services == snapshot.services {
-            return was_refreshing && visible;
+            return refresh_state_changed && visible;
         }
 
         let previous_index = self.selected_service_index().unwrap_or(0);
@@ -1087,9 +1179,11 @@ impl App {
         if self.active_tab != Tab::Services {
             return false;
         }
-        self.service_refresh_requested = true;
-        let changed = !self.service_refreshing;
-        self.service_refreshing = true;
+        self.service_refresh_generation = self.service_refresh_generation.saturating_add(1);
+        let generation = self.service_refresh_generation;
+        self.service_refresh_requested = Some(generation);
+        let changed = !self.service_refreshing();
+        self.pending_service_refresh_generation = Some(generation);
         changed
     }
 
@@ -1318,7 +1412,7 @@ impl App {
     }
 
     fn update_networks(&mut self, snapshot: NetworkSnapshot) -> bool {
-        let visible = self.active_tab == Tab::Network;
+        let visible = matches!(self.active_tab, Tab::Overview | Tab::Network);
         if let Some(error) = snapshot.error {
             if self.network_error.as_ref() == Some(&error) {
                 return false;
@@ -1364,6 +1458,9 @@ impl App {
     }
 
     pub fn select_network(&mut self, name: &str) -> bool {
+        if self.active_tab != Tab::Network {
+            return false;
+        }
         if self.selected_network.as_deref() == Some(name) {
             return false;
         }
@@ -1378,6 +1475,9 @@ impl App {
     }
 
     fn select_network_index(&mut self, index: usize) -> bool {
+        if self.active_tab != Tab::Network {
+            return false;
+        }
         let Some(iface) = self.networks.get(index) else {
             return false;
         };
@@ -1393,9 +1493,10 @@ impl App {
 
     fn open_network_details(&mut self) -> bool {
         if self.active_tab == Tab::Network && self.selected_network.is_some() {
-            self.network_detail_visible = !self.network_detail_visible;
+            let changed = !self.network_detail_visible;
+            self.network_detail_visible = true;
             self.hovered = None;
-            true
+            changed
         } else {
             false
         }
@@ -1481,9 +1582,11 @@ fn log_matches(entry: &JournalEntry, query: &str) -> bool {
     query.is_empty()
         || entry.source.to_lowercase().contains(query)
         || entry.message.to_lowercase().contains(query)
-        || entry
-            .priority
-            .is_some_and(|priority| priority.to_string().contains(query))
+        || entry.priority.is_some_and(|priority| {
+            priority.to_string().contains(query)
+                || entry.priority_label().contains(query)
+                || (priority == 4 && "warning".contains(query))
+        })
 }
 
 pub(crate) fn calculate_scroll(
@@ -1568,6 +1671,7 @@ mod tests {
             command: Some(format!("/usr/bin/{name}")),
             state: "S (sleeping)".into(),
             parent_pid: 1,
+            state_code: 'S',
             start_time: u64::from(pid),
         }
     }
@@ -1597,6 +1701,17 @@ mod tests {
         ServiceSnapshot {
             services: entries,
             error: None,
+            completed_refresh_generation: 0,
+        }
+    }
+
+    fn services_completed(
+        entries: Vec<ServiceInfo>,
+        generation: ServiceRefreshGeneration,
+    ) -> ServiceSnapshot {
+        ServiceSnapshot {
+            completed_refresh_generation: generation,
+            ..services(entries)
         }
     }
 
@@ -1757,8 +1872,38 @@ mod tests {
 
         assert!(app.update(Action::RefreshServices));
         assert!(app.service_refreshing());
-        assert!(app.take_service_refresh_request());
-        assert!(!app.take_service_refresh_request());
+        assert_eq!(app.take_service_refresh_request(), Some(1));
+        assert_eq!(app.take_service_refresh_request(), None);
+
+        app.update(Action::ServicesUpdated(services(vec![service(
+            "alpha.service",
+            "active",
+            "Alpha",
+        )])));
+        assert!(app.service_refreshing());
+
+        assert!(app.update(Action::ServicesUpdated(services_completed(
+            vec![service("alpha.service", "active", "Alpha")],
+            1,
+        ))));
+        assert!(!app.service_refreshing());
+    }
+
+    #[test]
+    fn service_refresh_waits_for_the_latest_coalesced_generation() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+
+        assert!(app.update(Action::RefreshServices));
+        assert!(!app.update(Action::RefreshServices));
+        assert!(!app.update(Action::RefreshServices));
+        assert_eq!(app.take_service_refresh_request(), Some(3));
+
+        app.update(Action::ServicesUpdated(services_completed(Vec::new(), 2)));
+        assert!(app.service_refreshing());
+
+        assert!(app.update(Action::ServicesUpdated(services_completed(Vec::new(), 3,))));
+        assert!(!app.service_refreshing());
     }
 
     #[test]
@@ -1774,6 +1919,7 @@ mod tests {
         app.update(Action::ServicesUpdated(ServiceSnapshot {
             services: Vec::new(),
             error: Some("system bus unavailable".into()),
+            completed_refresh_generation: 0,
         }));
 
         assert_eq!(visible_units(&app), vec!["alpha.service"]);
@@ -2376,8 +2522,8 @@ mod tests {
         // Success case
         app.update(Action::RequestProcessSignal(ProcessSignal::Term));
         let mut signal_received = None;
-        app.confirm_process_signal_at(&temp_dir, |pid, sig| {
-            signal_received = Some((pid, sig));
+        app.confirm_process_signal_at(&temp_dir, Ok, |pidfd, sig| {
+            signal_received = Some((*pidfd, sig));
             Ok(())
         });
 
@@ -2392,15 +2538,19 @@ mod tests {
         std::fs::write(proc_100.join("stat"), stat_reused).unwrap();
 
         app.update(Action::RequestProcessSignal(ProcessSignal::Kill));
-        let mut kill_called = false;
-        app.confirm_process_signal_at(&temp_dir, |_pid, _sig| {
-            kill_called = true;
-            Ok(())
-        });
+        let mut signal_called_stale = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Ok(()),
+            |_, _| {
+                signal_called_stale = true;
+                Ok(())
+            },
+        );
 
         assert!(
-            !kill_called,
-            "Kill must NOT be called when start_time differs"
+            !signal_called_stale,
+            "Signal must NOT be sent when start_time differs"
         );
         assert_eq!(
             app.process_action_message(),
@@ -2411,16 +2561,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         app.update(Action::RequestProcessSignal(ProcessSignal::Term));
-        let mut kill_called_missing = false;
-        app.confirm_process_signal_at(&temp_dir, |_pid, _sig| {
-            kill_called_missing = true;
-            Ok(())
-        });
+        let mut signal_called_missing = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Ok(()),
+            |_, _| {
+                signal_called_missing = true;
+                Ok(())
+            },
+        );
 
-        assert!(!kill_called_missing);
+        assert!(!signal_called_missing);
         assert_eq!(
             app.process_action_message(),
             Some("Failed to send SIGTERM: process bash (100) not found")
+        );
+
+        // Unsupported pidfd syscalls are reported without a signal attempt.
+        app.update(Action::RequestProcessSignal(ProcessSignal::Kill));
+        let mut signal_called_unsupported = false;
+        app.confirm_process_signal_at(
+            &temp_dir,
+            |_| Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+            |_, _| {
+                signal_called_unsupported = true;
+                Ok(())
+            },
+        );
+
+        assert!(!signal_called_unsupported);
+        assert_eq!(
+            app.process_action_message(),
+            Some("Failed to send SIGKILL: pidfd signaling is not supported")
         );
     }
 
@@ -2429,12 +2601,19 @@ mod tests {
         let mut app = App::default();
         assert_eq!(app.active_tab(), Tab::Overview);
 
-        // Processes update while on Overview tab should return false, but update state
+        // Process summary changes affect the active Overview and require a redraw.
         let proc_redraw = app.update(Action::ProcessesUpdated(processes(vec![process(
             1, "test",
         )])));
-        assert!(!proc_redraw);
+        assert!(proc_redraw);
         assert_eq!(app.process_count(), 1);
+
+        // Process details may refresh without changing the summary shown on Overview.
+        let same_summary_redraw = app.update(Action::ProcessesUpdated(processes(vec![process(
+            2,
+            "replacement",
+        )])));
+        assert!(!same_summary_redraw);
 
         // Services update while on Overview tab should return false, but update state
         let srv_redraw = app.update(Action::ServicesUpdated(services(vec![service(
@@ -2445,37 +2624,149 @@ mod tests {
         assert!(!srv_redraw);
         assert_eq!(app.service_count(), 1);
 
-        // Network update while on Overview tab should return false, but update state
+        // Network updates affect the summary shown on the active Overview.
         let net_redraw = app.update(Action::NetworkUpdated(NetworkSnapshot {
             interfaces: vec![dummy_network("eth0")],
             error: None,
         }));
-        assert!(!net_redraw);
+        assert!(net_redraw);
         assert_eq!(app.network_count(), 1);
 
         // Overview update while on Overview tab DOES trigger redraw
-        let metrics = OverviewMetrics {
+        let metrics = SystemMetrics {
             cpu_percent: Some(42.0),
             ..Default::default()
         };
-        let ov_redraw = app.update(Action::OverviewUpdated(metrics.clone()));
+        let ov_redraw = app.update(Action::SystemMetricsUpdated(metrics.clone()));
         assert!(ov_redraw);
 
         // Switching to Processes tab triggers redraw
         assert!(app.update(Action::SelectTab(Tab::Processes)));
 
-        // Overview update while on Processes tab should NOT trigger redraw
-        let metrics2 = OverviewMetrics {
+        // Visible system metrics update the active Processes summary.
+        let metrics2 = SystemMetrics {
             cpu_percent: Some(99.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
             ..Default::default()
         };
-        let ov_redraw_inactive = app.update(Action::OverviewUpdated(metrics2));
-        assert!(!ov_redraw_inactive);
+        let process_metrics_redraw = app.update(Action::SystemMetricsUpdated(metrics2.clone()));
+        assert!(process_metrics_redraw);
+
+        let mut memory_only_metrics = metrics2;
+        memory_only_metrics.memory = Some(crate::linux::ByteUsage { used: 2, total: 4 });
+        assert!(app.update(Action::SystemMetricsUpdated(memory_only_metrics.clone())));
+
+        // Unrelated Overview-only fields do not redraw Processes.
+        let mut overview_only_metrics = memory_only_metrics;
+        overview_only_metrics.uptime = Some(std::time::Duration::from_secs(60));
+        assert!(!app.update(Action::SystemMetricsUpdated(overview_only_metrics)));
+
+        let net_redraw_inactive = app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("wlan0")],
+            error: None,
+        }));
+        assert!(!net_redraw_inactive);
 
         // Process update while on Processes tab DOES trigger redraw
         let proc_redraw_active =
             app.update(Action::ProcessesUpdated(processes(vec![process(2, "new")])));
         assert!(proc_redraw_active);
+
+        // System metrics remain cached without redrawing unrelated active tabs.
+        assert!(app.update(Action::SelectTab(Tab::Services)));
+        assert!(!app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            cpu_percent: Some(12.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
+            ..Default::default()
+        })));
+    }
+
+    #[test]
+    fn overview_collector_health_transitions_redraw_only_while_visible() {
+        let mut app = App::default();
+        let process_snapshot = processes(vec![process(1, "init")]);
+        let network_snapshot = NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0")],
+            error: None,
+        };
+        app.update(Action::ProcessesUpdated(process_snapshot.clone()));
+        app.update(Action::NetworkUpdated(network_snapshot.clone()));
+        let summary = app.process_summary();
+
+        assert!(app.update(Action::ProcessesUpdated(ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        })));
+        assert_eq!(app.process_summary(), summary);
+        assert_eq!(app.process_error(), Some("proc unavailable"));
+        assert!(app.update(Action::ProcessesUpdated(process_snapshot.clone())));
+        assert_eq!(app.process_error(), None);
+
+        assert!(app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("net unavailable".into()),
+        })));
+        assert_eq!(app.network_count(), 1);
+        assert_eq!(app.network_error(), Some("net unavailable"));
+        assert!(app.update(Action::NetworkUpdated(network_snapshot.clone())));
+        assert_eq!(app.network_error(), None);
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert!(!app.update(Action::ProcessesUpdated(ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        })));
+        assert!(!app.update(Action::ProcessesUpdated(process_snapshot)));
+        assert!(!app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("net unavailable".into()),
+        })));
+        assert!(!app.update(Action::NetworkUpdated(network_snapshot)));
+        assert_eq!(app.process_error(), None);
+        assert_eq!(app.network_error(), None);
+    }
+
+    #[test]
+    fn aggregate_cpu_history_is_bounded_and_evicts_oldest_samples() {
+        let mut app = App::default();
+        let sample_count = AGGREGATE_CPU_HISTORY_CAPACITY + 5;
+
+        for sample in 0..sample_count {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                cpu_percent: Some(sample as f64),
+                ..Default::default()
+            }));
+        }
+
+        let history = app.aggregate_cpu_history().iter().collect::<Vec<_>>();
+        assert_eq!(history.len(), AGGREGATE_CPU_HISTORY_CAPACITY);
+        assert_eq!(history.first(), Some(&5.0));
+        assert_eq!(history.last(), Some(&64.0));
+    }
+
+    #[test]
+    fn process_summary_is_cached_from_process_snapshots() {
+        let mut app = App::default();
+        let mut running = process(1, "running");
+        running.state = "R (running)".into();
+        running.state_code = 'R';
+        let mut zombie = process(2, "zombie");
+        zombie.state = "Z (zombie)".into();
+        zombie.state_code = 'Z';
+
+        assert!(app.update(Action::ProcessesUpdated(processes(vec![
+            running,
+            zombie,
+            process(3, "sleeping"),
+        ]))));
+        assert_eq!(
+            app.process_summary(),
+            ProcessSummary {
+                total: 3,
+                running: 1,
+                zombies: 1,
+            }
+        );
     }
 
     #[test]
@@ -2487,5 +2778,173 @@ mod tests {
 
         app.update(Action::BeginProcessSearch);
         assert!(app.process_action_message().is_none());
+    }
+
+    fn assert_resize_preserves_overlay(app: &mut App, overlay_is_open: impl Fn(&App) -> bool) {
+        assert!(overlay_is_open(app));
+        assert!(app.update(Action::HoverMouseTarget(Some(MouseTarget::Tab(
+            Tab::Overview,
+        )))));
+
+        assert!(app.update(Action::Resize));
+
+        assert!(overlay_is_open(app));
+        assert_eq!(app.hovered(), None);
+    }
+
+    #[test]
+    fn resize_is_global_and_preserves_every_overlay() {
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        assert_resize_preserves_overlay(&mut app, App::help_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "proc",
+        )])));
+        app.update(Action::OpenProcessDetails);
+        assert_resize_preserves_overlay(&mut app, App::process_detail_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "proc",
+        )])));
+        app.update(Action::RequestProcessSignal(ProcessSignal::Term));
+        assert_resize_preserves_overlay(&mut app, |app| {
+            app.process_signal_confirmation().is_some()
+        });
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        app.update(Action::ServicesUpdated(services(vec![service(
+            "dbus.service",
+            "active",
+            "D-Bus System Message Bus",
+        )])));
+        app.update(Action::OpenServiceDetails);
+        assert_resize_preserves_overlay(&mut app, App::service_detail_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Logs));
+        app.update(Action::LogsUpdated(log_batch(vec![log_entry(
+            1, "kernel", 6, "ready",
+        )])));
+        app.update(Action::OpenLogDetails);
+        assert_resize_preserves_overlay(&mut app, App::log_detail_visible);
+
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Network));
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0")],
+            error: None,
+        }));
+        app.update(Action::OpenNetworkDetails);
+        assert_resize_preserves_overlay(&mut app, App::network_detail_visible);
+    }
+
+    #[test]
+    fn resize_is_global_in_search_input_modes() {
+        for (tab, begin_search, expected_mode) in [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                InputMode::ProcessSearch,
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                InputMode::ServiceSearch,
+            ),
+            (Tab::Logs, Action::BeginLogSearch, InputMode::LogSearch),
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(tab));
+            app.update(begin_search);
+            app.update(Action::HoverMouseTarget(Some(MouseTarget::Tab(tab))));
+
+            assert!(app.update(Action::Resize));
+            assert_eq!(app.input_mode(), expected_mode);
+            assert_eq!(app.hovered(), None);
+        }
+    }
+
+    #[test]
+    fn escape_clears_search_only_for_active_tab() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('f'));
+        assert_eq!(app.process_search_query(), "f");
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert_eq!(app.process_search_query(), "f");
+        app.update(Action::BeginServiceSearch);
+        app.update(Action::AppendServiceSearch('s'));
+        assert_eq!(app.service_search_query(), "s");
+
+        // Esc on Services tab should clear Services search, not Processes search
+        app.update(Action::Escape);
+        assert_eq!(app.service_search_query(), "");
+        assert!(!app.service_searching());
+        assert_eq!(app.process_search_query(), "f");
+    }
+
+    #[test]
+    fn network_selection_and_details_guarded_by_active_tab() {
+        let mut app = App::default();
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0"), dummy_network("eth1")],
+            error: None,
+        }));
+
+        // On Overview tab, network selection actions should return false
+        assert_eq!(app.active_tab(), Tab::Overview);
+        assert!(!app.update(Action::SelectNetwork("eth1".into())));
+        assert!(!app.update(Action::NetworkFirst));
+        assert!(!app.update(Action::NetworkNext));
+
+        // Switch to Network tab
+        app.update(Action::SelectTab(Tab::Network));
+        assert!(app.update(Action::SelectNetwork("eth1".into())));
+        assert_eq!(
+            app.selected_network().map(|n| n.name.as_str()),
+            Some("eth1")
+        );
+
+        // Open network details should open, not toggle
+        assert!(app.update(Action::OpenNetworkDetails));
+        assert!(app.network_detail_visible());
+        assert!(!app.update(Action::OpenNetworkDetails));
+        assert!(app.network_detail_visible());
+    }
+
+    #[test]
+    fn log_matches_matches_priority_names_and_numbers() {
+        let error_entry = JournalEntry {
+            id: 1,
+            timestamp_micros: None,
+            source: "app".into(),
+            priority: Some(3),
+            message: "something happened".into(),
+        };
+        let warn_entry = JournalEntry {
+            id: 2,
+            timestamp_micros: None,
+            source: "app".into(),
+            priority: Some(4),
+            message: "look out".into(),
+        };
+
+        assert!(log_matches(&error_entry, "error"));
+        assert!(log_matches(&error_entry, "err"));
+        assert!(log_matches(&error_entry, "3"));
+        assert!(!log_matches(&error_entry, "warn"));
+
+        assert!(log_matches(&warn_entry, "warn"));
+        assert!(log_matches(&warn_entry, "warning"));
+        assert!(log_matches(&warn_entry, "4"));
+        assert!(!log_matches(&warn_entry, "crit"));
     }
 }

@@ -7,19 +7,19 @@ use std::{
 };
 
 const CPUINFO: &str = "/proc/cpuinfo";
-const MEMINFO: &str = "/proc/meminfo";
 const EDAC_ROOT: &str = "/sys/devices/system/edac/mc";
 const DRM_ROOT: &str = "/sys/class/drm";
 const NVIDIA_ROOT: &str = "/proc/driver/nvidia/gpus";
 const BLOCK_ROOT: &str = "/sys/block";
+const NETWORK_ROOT: &str = "/sys/class/net";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HardwareInventory {
     pub cpus: Vec<CpuPackage>,
     pub memory_modules: Vec<MemoryModule>,
-    pub total_memory: Option<u64>,
     pub gpus: Vec<GpuDevice>,
     pub storage_devices: Vec<StorageDevice>,
+    pub network_devices: Vec<NetworkDevice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,12 @@ pub struct StorageDevice {
     pub capacity_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkDevice {
+    pub interface_name: String,
+    pub model: Option<String>,
+}
+
 pub struct HardwareCollector {
     receiver: Receiver<HardwareInventory>,
 }
@@ -96,12 +102,52 @@ fn discover() -> HardwareInventory {
             .map(|contents| parse_cpu_packages(&contents))
             .unwrap_or_default(),
         memory_modules: discover_memory_modules(Path::new(EDAC_ROOT)),
-        total_memory: fs::read_to_string(MEMINFO)
-            .ok()
-            .and_then(|contents| parse_total_memory(&contents)),
         gpus: discover_gpus(Path::new(DRM_ROOT), Path::new(NVIDIA_ROOT)),
         storage_devices: discover_storage(Path::new(BLOCK_ROOT)),
+        network_devices: discover_network_devices(Path::new(NETWORK_ROOT)),
     }
+}
+
+fn discover_network_devices(root: &Path) -> Vec<NetworkDevice> {
+    read_sorted_directories(root, |_| true)
+        .into_iter()
+        .filter_map(|interface| {
+            let interface_name = interface.file_name()?.to_str()?.to_owned();
+            let device = fs::canonicalize(interface.join("device")).ok()?;
+            Some(NetworkDevice {
+                interface_name,
+                model: discover_nic_model(&device),
+            })
+        })
+        .collect()
+}
+
+fn discover_nic_model(device: &Path) -> Option<String> {
+    let model = join_nonempty([
+        read_trimmed(device.join("manufacturer")),
+        read_trimmed(device.join("product")),
+    ])
+    .or_else(|| read_trimmed(device.join("product_name")))
+    .or_else(|| read_trimmed(device.join("model")));
+    if model.is_some() {
+        return model;
+    }
+
+    let is_usb_interface = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(':'));
+    is_usb_interface
+        .then(|| device.parent())
+        .flatten()
+        .and_then(|parent| {
+            join_nonempty([
+                read_trimmed(parent.join("manufacturer")),
+                read_trimmed(parent.join("product")),
+            ])
+            .or_else(|| read_trimmed(parent.join("product_name")))
+            .or_else(|| read_trimmed(parent.join("model")))
+        })
 }
 
 #[derive(Default)]
@@ -164,14 +210,6 @@ fn parse_cpu_packages(contents: &str) -> Vec<CpuPackage> {
             model,
         })
         .collect()
-}
-
-fn parse_total_memory(contents: &str) -> Option<u64> {
-    let kib = contents.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key == "MemTotal").then(|| value.split_whitespace().next()?.parse::<u64>().ok())?
-    })?;
-    kib.checked_mul(1024)
 }
 
 fn discover_memory_modules(root: &Path) -> Vec<MemoryModule> {
@@ -464,6 +502,14 @@ fn join_nonempty(values: impl IntoIterator<Item = Option<String>>) -> Option<Str
 mod tests {
     use super::*;
 
+    fn temp_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tuxctl-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
     #[test]
     fn deduplicates_logical_cpus_by_physical_package() {
         let cpuinfo = "processor: 0\nphysical id: 1\nmodel name: Example CPU\n\nprocessor: 1\nphysical id: 1\nmodel name: Example CPU\n\nprocessor: 2\nphysical id: 3\nmodel name: Other CPU\n";
@@ -509,14 +555,40 @@ mod tests {
     }
 
     #[test]
-    fn ram_gracefully_falls_back_to_total_only() {
-        let inventory = HardwareInventory {
-            total_memory: parse_total_memory("MemTotal: 33554432 kB\n"),
-            ..HardwareInventory::default()
-        };
+    fn nic_model_uses_only_available_hardware_identity() {
+        let root = temp_test_dir("nic-model");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("manufacturer"), "Realtek\n").unwrap();
+        fs::write(root.join("product"), "RTL8125 2.5GbE\n").unwrap();
 
-        assert!(inventory.memory_modules.is_empty());
-        assert_eq!(inventory.total_memory, Some(32 * 1024 * 1024 * 1024));
+        assert_eq!(
+            discover_nic_model(&root).as_deref(),
+            Some("Realtek RTL8125 2.5GbE")
+        );
+        fs::remove_file(root.join("manufacturer")).unwrap();
+        fs::remove_file(root.join("product")).unwrap();
+        assert_eq!(discover_nic_model(&root), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_nic_without_model_is_retained() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("physical-nic");
+        let devices = root.join("devices");
+        let interfaces = root.join("net");
+        fs::create_dir_all(&devices).unwrap();
+        fs::create_dir_all(interfaces.join("enp6s0")).unwrap();
+        symlink(&devices, interfaces.join("enp6s0/device")).unwrap();
+
+        let discovered = discover_network_devices(&interfaces);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].interface_name, "enp6s0");
+        assert_eq!(discovered[0].model, None);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

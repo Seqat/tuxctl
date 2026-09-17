@@ -1,24 +1,27 @@
 mod hardware;
+mod hardware_cpu;
+mod hardware_network_summary;
 mod layout;
 mod logs;
 mod network;
+mod overview;
 mod processes;
 mod services;
 
 use std::sync::Arc;
 
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, Gauge, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::{
     action::{InputMode, MouseTarget, ProcessSortField, Tab},
     app::App,
-    linux::{ByteUsage, OverviewMetrics},
+    linux::ByteUsage,
 };
 
 #[derive(Debug, Default)]
@@ -95,6 +98,19 @@ impl UiRegions {
                 .collect(),
             ..Self::default()
         }
+    }
+
+    fn suppress_background_interaction(&mut self) {
+        self.tabs.clear();
+        self.process_rows.clear();
+        self.process_headers.clear();
+        self.process_scroll_area = None;
+        self.service_rows.clear();
+        self.service_scroll_area = None;
+        self.log_rows.clear();
+        self.log_scroll_area = None;
+        self.network_rows.clear();
+        self.network_scroll_area = None;
     }
 
     pub fn target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
@@ -309,7 +325,12 @@ impl UiRegions {
 
 pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     let area = frame.area();
+    frame.render_widget(Clear, area);
     if area.width == 0 || area.height == 0 {
+        return UiRegions::default();
+    }
+    if !layout::terminal_size_supported(area) {
+        render_terminal_size_warning(frame, area);
         return UiRegions::default();
     }
 
@@ -325,8 +346,7 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         app.active_tab(),
         app.hovered(),
         &tab_areas,
-        screen.tabs.width,
-        screen.tabs.y,
+        screen.tabs,
     );
     let content_render = render_content(frame, app, screen.content);
 
@@ -379,84 +399,30 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
 
     if app.process_detail_visible() {
         processes::render_detail(frame, app.selected_process(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.service_detail_visible() {
         services::render_detail(frame, app.selected_service(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.log_detail_visible() {
         logs::render_detail(frame, app.selected_log(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if app.network_detail_visible() {
         network::render_detail(frame, app.selected_network(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
     }
     if let Some(confirmation) = app.process_signal_confirmation() {
         let (cancel_rect, confirm_rect) =
             processes::render_signal_confirmation(frame, confirmation, app.hovered(), area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
         regions.process_signal_cancel = Some(cancel_rect);
         regions.process_signal_confirm = Some(confirm_rect);
     }
     if app.help_visible() {
         render_help(frame, area);
-        regions.tabs.clear();
-        regions.process_rows.clear();
-        regions.process_headers.clear();
-        regions.process_scroll_area = None;
-        regions.service_rows.clear();
-        regions.service_scroll_area = None;
-        regions.log_rows.clear();
-        regions.log_scroll_area = None;
-        regions.network_rows.clear();
-        regions.network_scroll_area = None;
+        regions.suppress_background_interaction();
         regions.process_signal_cancel = None;
         regions.process_signal_confirm = None;
     }
@@ -464,13 +430,46 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     regions
 }
 
+fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
+    let width = area.width.min(36);
+    let height = area.height.min(9);
+    let warning_area = layout::centered_rect(area, width, height);
+    if warning_area.width == 0 || warning_area.height == 0 {
+        return;
+    }
+
+    let lines = vec![
+        Line::from("tuxctl").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("Terminal too small").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(format!(
+            "Minimum: {}x{}",
+            layout::MIN_TERMINAL_WIDTH,
+            layout::MIN_TERMINAL_HEIGHT
+        )),
+        Line::from(format!("Current: {}x{}", area.width, area.height)),
+        Line::from(""),
+        Line::from("Resize the terminal to continue."),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        warning_area,
+    );
+}
+
 fn render_tabs(
     frame: &mut Frame,
     active_tab: Tab,
     hovered: Option<&MouseTarget>,
     tabs: &[(Tab, Rect)],
-    tabs_width: u16,
-    tabs_y: u16,
+    tabs_area: Rect,
 ) {
     for &(tab, area) in tabs {
         let style = if tab == active_tab {
@@ -484,18 +483,25 @@ fn render_tabs(
             Style::default()
         };
 
-        frame.render_widget(
-            Paragraph::new(format!(" {} ", tab.label())).style(style),
-            area,
-        );
+        let label = if usize::from(area.width) >= tab.label().chars().count().saturating_add(2) {
+            format!(" {} ", tab.label())
+        } else {
+            tab.label().to_owned()
+        };
+        frame.render_widget(Paragraph::new(label).style(style), area);
     }
 
-    if tabs_width >= 75 {
+    if tabs_area.width >= 75 {
         let hint_text = "1-5 Tabs   ? Help ";
         let hint_width = hint_text.len() as u16;
-        let hint_x = tabs_width.saturating_sub(hint_width);
+        let hint_x = tabs_area.width.saturating_sub(hint_width);
         if hint_x >= 48 {
-            let hint_rect = Rect::new(hint_x, tabs_y, hint_width, 1);
+            let hint_rect = Rect::new(
+                tabs_area.x.saturating_add(hint_x),
+                tabs_area.y,
+                hint_width,
+                1,
+            );
             frame.render_widget(
                 Paragraph::new(hint_text)
                     .style(Style::default().fg(Color::DarkGray))
@@ -508,33 +514,25 @@ fn render_tabs(
 
 fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     let active_tab = app.active_tab();
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(format!(" {} ", active_tab.label()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     if active_tab == Tab::Overview {
-        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-        render_overview_status(frame, app, sections[0]);
-        render_overview(frame, app, sections[1]);
+        overview::render(frame, app, area);
         return ContentRender::None;
     }
 
     if active_tab == Tab::Processes {
-        return ContentRender::Processes(processes::render(frame, app, inner));
+        return ContentRender::Processes(processes::render(frame, app, area));
     }
 
     if active_tab == Tab::Services {
-        return ContentRender::Services(services::render(frame, app, inner));
+        return ContentRender::Services(services::render(frame, app, area));
     }
 
     if active_tab == Tab::Logs {
-        return ContentRender::Logs(logs::render(frame, app, inner));
+        return ContentRender::Logs(logs::render(frame, app, area));
     }
 
     if active_tab == Tab::Network {
-        return ContentRender::Network(network::render(frame, app, inner));
+        return ContentRender::Network(network::render(frame, app, area));
     }
 
     let content = Paragraph::new(vec![
@@ -543,172 +541,11 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
         Line::from("Press ? for help"),
     ])
     .alignment(Alignment::Center);
-    frame.render_widget(content, layout::centered_rows(inner, 3));
+    frame.render_widget(content, layout::centered_rows(area, 3));
     ContentRender::None
 }
 
-fn render_overview_status(frame: &mut Frame, app: &App, area: Rect) {
-    let uptime = app
-        .overview()
-        .uptime
-        .map(format_uptime)
-        .unwrap_or_else(|| "N/A".into());
-    let load = app
-        .overview()
-        .load_average
-        .map(|l| format!("{:.2}  {:.2}  {:.2}", l.one, l.five, l.fifteen))
-        .unwrap_or_else(|| "N/A".into());
-    let text = if area.width >= 80 {
-        format!(" Live System Metrics   Load: {load}   Uptime: {uptime}   ? help")
-    } else if area.width >= 50 {
-        format!(" System Overview   Uptime: {uptime}   ? help")
-    } else {
-        format!(" Overview   Up: {uptime}")
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
-        area,
-    );
-}
-
-fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let (live_area, hardware_area) = if area.width >= 85 {
-        let live_width = 42.min(area.width.saturating_sub(35));
-        let columns =
-            Layout::horizontal([Constraint::Length(live_width), Constraint::Min(35)]).split(area);
-        (columns[0], columns[1])
-    } else if area.height >= 20 {
-        let rows = Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).split(area);
-        (rows[0], rows[1])
-    } else if area.height >= 12 {
-        let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).split(area);
-        (rows[0], rows[1])
-    } else {
-        (area, Rect::default())
-    };
-
-    render_live_metrics(frame, app.overview(), live_area);
-    if hardware_area.width > 0 && hardware_area.height > 0 {
-        let fallback_memory = app.overview().memory.map(|memory| memory.total);
-        hardware::render(frame, app.hardware(), fallback_memory, hardware_area);
-    }
-}
-
-fn render_live_metrics(frame: &mut Frame, metrics: &OverviewMetrics, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Live Metrics ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let load = metrics
-        .load_average
-        .map(|load| format!("{:.2}  {:.2}  {:.2}", load.one, load.five, load.fifteen))
-        .unwrap_or_else(|| "N/A".into());
-    let uptime = metrics
-        .uptime
-        .map(format_uptime)
-        .unwrap_or_else(|| "N/A".into());
-    let filesystem = metrics
-        .root_filesystem
-        .map(format_usage)
-        .unwrap_or_else(|| "N/A".into());
-
-    if inner.height >= 12 {
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
-        render_gauge(
-            frame,
-            rows[1],
-            " Memory ",
-            metrics.memory.map(ByteUsage::percent),
-            metrics.memory.map(format_usage),
-        );
-        render_gauge(
-            frame,
-            rows[2],
-            " Root FS ",
-            metrics.root_filesystem.map(ByteUsage::percent),
-            metrics.root_filesystem.map(format_usage),
-        );
-
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!("Load:    {load}")),
-                Line::from(format!("Uptime:  {uptime}")),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" System ")),
-            rows[3],
-        );
-    } else if inner.height >= 7 {
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-        render_gauge(frame, rows[0], " CPU ", metrics.cpu_percent, None);
-        render_gauge(
-            frame,
-            rows[1],
-            " Memory ",
-            metrics.memory.map(ByteUsage::percent),
-            metrics.memory.map(format_usage),
-        );
-
-        if rows[2].height > 0 {
-            frame.render_widget(
-                Paragraph::new(format!("Load: {load}  Root: {filesystem}"))
-                    .style(Style::default().fg(Color::DarkGray)),
-                rows[2],
-            );
-        }
-    } else {
-        render_gauge(frame, inner, " CPU ", metrics.cpu_percent, None);
-    }
-}
-
-fn render_gauge(
-    frame: &mut Frame,
-    area: Rect,
-    title: &'static str,
-    percent: Option<f64>,
-    detail: Option<String>,
-) {
-    let ratio = percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
-    let label = match (percent, detail) {
-        (Some(percent), Some(detail)) => format!("{detail}  ({percent:.0}%)"),
-        (Some(percent), None) => format!("{percent:.0}%"),
-        (None, _) => "N/A".into(),
-    };
-
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(ratio)
-            .label(label),
-        area,
-    );
-}
-
-fn format_usage(usage: ByteUsage) -> String {
+pub(super) fn format_usage(usage: ByteUsage) -> String {
     format!(
         "{} / {}",
         format_bytes(usage.used),
@@ -716,7 +553,7 @@ fn format_usage(usage: ByteUsage) -> String {
     )
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
     let mut value = bytes as f64;
@@ -733,7 +570,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_uptime(uptime: std::time::Duration) -> String {
+pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
     let total_minutes = uptime.as_secs() / 60;
     let days = total_minutes / (24 * 60);
     let hours = (total_minutes / 60) % 24;
@@ -812,7 +649,52 @@ mod tests {
 
     use super::*;
     use crate::action::Action;
-    use crate::linux::ProcessIdentity;
+    use crate::linux::{
+        ByteUsage, LogicalCpuId, LogicalCpuMetrics, ProcessIdentity, SystemMetrics,
+    };
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn process_confirmation_app() -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: vec![crate::linux::ProcessInfo {
+                pid: 1234,
+                name: "testproc".into(),
+                cpu_percent: Some(5.0),
+                memory_bytes: 4096,
+                command: Some("/bin/testproc".into()),
+                state: "R (running)".into(),
+                parent_pid: 1,
+                state_code: 'R',
+                start_time: 100,
+            }],
+            error: None,
+        }));
+        app.update(Action::RequestProcessSignal(
+            crate::linux::ProcessSignal::Term,
+        ));
+        app
+    }
+
+    fn rendered_regions(terminal: &mut Terminal<TestBackend>, app: &App) -> UiRegions {
+        let mut regions = UiRegions::default();
+        terminal
+            .draw(|frame| {
+                regions = render(frame, app);
+            })
+            .unwrap();
+        regions
+    }
 
     #[test]
     fn hit_testing_includes_top_left_and_excludes_bottom_right() {
@@ -944,7 +826,84 @@ mod tests {
     }
 
     #[test]
-    fn implemented_screens_render_in_tiny_terminals() {
+    fn modal_suppression_clears_background_targets_but_preserves_viewports() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_time: 9001,
+        };
+        let target_area = Rect::new(2, 6, 20, 1);
+        let mut regions = UiRegions {
+            tabs: vec![TabRegion {
+                tab: Tab::Overview,
+                area: target_area,
+            }],
+            process_rows: vec![ProcessRowRegion {
+                identity,
+                area: target_area,
+            }],
+            process_headers: vec![ProcessHeaderRegion {
+                field: ProcessSortField::Cpu,
+                area: target_area,
+            }],
+            process_scroll_area: Some(target_area),
+            process_viewport: Some((3, 7)),
+            service_rows: vec![ServiceRowRegion {
+                unit: Arc::from("dbus.service"),
+                area: target_area,
+            }],
+            service_scroll_area: Some(target_area),
+            service_viewport: Some((4, 8)),
+            log_rows: vec![LogRowRegion {
+                id: 77,
+                area: target_area,
+            }],
+            log_scroll_area: Some(target_area),
+            log_viewport: Some((5, 9)),
+            network_rows: vec![NetworkRowRegion {
+                name: Arc::from("enp6s0"),
+                area: target_area,
+            }],
+            network_scroll_area: Some(target_area),
+            network_viewport: Some((6, 10)),
+            process_signal_cancel: None,
+            process_signal_confirm: None,
+            input_mode: InputMode::ProcessSignalConfirm,
+        };
+
+        regions.suppress_background_interaction();
+
+        assert!(regions.tabs.is_empty());
+        assert!(regions.process_rows.is_empty());
+        assert!(regions.process_headers.is_empty());
+        assert!(regions.process_scroll_area.is_none());
+        assert!(regions.service_rows.is_empty());
+        assert!(regions.service_scroll_area.is_none());
+        assert!(regions.log_rows.is_empty());
+        assert!(regions.log_scroll_area.is_none());
+        assert!(regions.network_rows.is_empty());
+        assert!(regions.network_scroll_area.is_none());
+        assert_eq!(regions.process_viewport(), Some((3, 7)));
+        assert_eq!(regions.service_viewport(), Some((4, 8)));
+        assert_eq!(regions.log_viewport(), Some((5, 9)));
+        assert_eq!(regions.network_viewport(), Some((6, 10)));
+        assert_eq!(regions.target_at(2, 6), None);
+
+        let cancel = Rect::new(10, 12, 12, 1);
+        let confirm = Rect::new(26, 12, 15, 1);
+        regions.process_signal_cancel = Some(cancel);
+        regions.process_signal_confirm = Some(confirm);
+        assert_eq!(
+            regions.target_at(cancel.x, cancel.y),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(
+            regions.target_at(confirm.x, confirm.y),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+    }
+
+    #[test]
+    fn implemented_screens_use_the_warning_path_in_tiny_terminals() {
         for tab in [
             Tab::Overview,
             Tab::Processes,
@@ -958,13 +917,283 @@ mod tests {
             for (width, height) in [(1, 1), (2, 2), (10, 3)] {
                 let backend = TestBackend::new(width, height);
                 let mut terminal = Terminal::new(backend).unwrap();
-                terminal
-                    .draw(|frame| {
-                        render(frame, &app);
-                    })
-                    .unwrap();
+                assert!(rendered_regions_are_empty(&mut terminal, &app));
             }
         }
+    }
+
+    fn rendered_regions_are_empty(terminal: &mut Terminal<TestBackend>, app: &App) -> bool {
+        let mut empty = false;
+        terminal
+            .draw(|frame| {
+                empty = render(frame, app).tabs.is_empty();
+            })
+            .unwrap();
+        empty
+    }
+
+    #[test]
+    fn minimum_terminal_size_render_boundary_is_global() {
+        let app = App::default();
+        for (width, height) in [(39, 15), (40, 14), (39, 14)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            assert!(rendered_regions_are_empty(&mut terminal, &app));
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Terminal too small"));
+            assert!(text.contains(&format!("Current: {width}x{height}")));
+        }
+
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        assert!(!buffer_text(&terminal).contains("Terminal too small"));
+    }
+
+    #[test]
+    fn minimum_terminal_warning_is_safe_at_pathological_sizes() {
+        let app = App::default();
+        for (width, height) in [(1, 1), (1, 40), (40, 1), (2, 2)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            assert!(rendered_regions_are_empty(&mut terminal, &app));
+        }
+    }
+
+    #[test]
+    fn resize_transitions_clear_warning_and_normal_content() {
+        let app = App::default();
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        assert!(buffer_text(&terminal).contains("Processes"));
+
+        terminal.backend_mut().resize(39, 40);
+        terminal.autoresize().unwrap();
+        assert!(rendered_regions_are_empty(&mut terminal, &app));
+        let warning = buffer_text(&terminal);
+        assert!(warning.contains("Terminal too small"));
+        assert!(!warning.contains("Processes"));
+
+        terminal.backend_mut().resize(80, 40);
+        terminal.autoresize().unwrap();
+        assert!(!rendered_regions_are_empty(&mut terminal, &app));
+        let normal = buffer_text(&terminal);
+        assert!(normal.contains("Processes"));
+        assert!(!normal.contains("Terminal too small"));
+    }
+
+    #[test]
+    fn process_confirmation_regions_are_rebuilt_after_resize() {
+        let app = process_confirmation_app();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let old_regions = rendered_regions(&mut terminal, &app);
+        let old_confirm = old_regions.process_signal_confirm.unwrap();
+        let old_viewport = old_regions.process_viewport();
+
+        terminal.backend_mut().resize(50, 16);
+        terminal.autoresize().unwrap();
+        let new_regions = rendered_regions(&mut terminal, &app);
+        let new_cancel = new_regions.process_signal_cancel.unwrap();
+        let new_confirm = new_regions.process_signal_confirm.unwrap();
+
+        assert_ne!(new_confirm, old_confirm);
+        assert_ne!(new_regions.process_viewport(), old_viewport);
+        assert_eq!(
+            new_regions.target_at(new_cancel.x, new_cancel.y),
+            Some(MouseTarget::ProcessSignalCancel)
+        );
+        assert_eq!(
+            new_regions.target_at(new_confirm.x, new_confirm.y),
+            Some(MouseTarget::ProcessSignalConfirm)
+        );
+        assert_eq!(
+            new_regions.target_at(old_confirm.x, old_confirm.y),
+            None,
+            "the prior confirmation coordinates must not remain active"
+        );
+        assert!(new_regions.tabs.is_empty());
+        assert!(new_regions.process_rows.is_empty());
+        assert!(new_regions.process_headers.is_empty());
+        assert!(new_regions.process_scroll_area.is_none());
+    }
+
+    #[test]
+    fn modal_resize_crosses_each_minimum_terminal_boundary() {
+        let mut app = process_confirmation_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        for (width, height) in [
+            (layout::MIN_TERMINAL_WIDTH - 1, layout::MIN_TERMINAL_HEIGHT),
+            (layout::MIN_TERMINAL_WIDTH, layout::MIN_TERMINAL_HEIGHT - 1),
+            (
+                layout::MIN_TERMINAL_WIDTH - 1,
+                layout::MIN_TERMINAL_HEIGHT - 1,
+            ),
+        ] {
+            let valid_regions = rendered_regions(&mut terminal, &app);
+            assert!(valid_regions.process_signal_confirm.is_some());
+            assert!(buffer_text(&terminal).contains("Terminate Process"));
+
+            terminal.backend_mut().resize(width, height);
+            terminal.autoresize().unwrap();
+            assert!(app.update(Action::Resize));
+            assert!(app.process_signal_confirmation().is_some());
+            let small_regions = rendered_regions(&mut terminal, &app);
+            assert!(small_regions.process_signal_confirm.is_none());
+            assert!(small_regions.tabs.is_empty());
+            assert!(buffer_text(&terminal).contains("Terminal too small"));
+
+            terminal.backend_mut().resize(80, 24);
+            terminal.autoresize().unwrap();
+            assert!(app.update(Action::Resize));
+            assert!(app.process_signal_confirmation().is_some());
+            let restored_regions = rendered_regions(&mut terminal, &app);
+            assert!(restored_regions.process_signal_confirm.is_some());
+            assert!(restored_regions.tabs.is_empty());
+            let restored = buffer_text(&terminal);
+            assert!(restored.contains("Terminate Process"));
+            assert!(!restored.contains("Terminal too small"));
+        }
+    }
+
+    #[test]
+    fn overview_dashboard_renders_cached_data_across_responsive_sizes() {
+        let mut app = App::default();
+        let logical_cpus = (0..64)
+            .map(|index| LogicalCpuMetrics {
+                id: LogicalCpuId::for_test(index),
+                utilization_percent: Some(f64::from(index % 101)),
+            })
+            .collect::<Vec<_>>();
+
+        for sample in 0..65 {
+            let mut metrics = SystemMetrics {
+                cpu_percent: Some(f64::from(sample)),
+                logical_cpus: logical_cpus.clone(),
+                memory: Some(ByteUsage {
+                    used: 8 * 1024 * 1024 * 1024,
+                    total: 32 * 1024 * 1024 * 1024,
+                }),
+                uptime: Some(std::time::Duration::from_secs(90_000)),
+                root_filesystem: Some(ByteUsage {
+                    used: 120 * 1024 * 1024 * 1024,
+                    total: 500 * 1024 * 1024 * 1024,
+                }),
+                ..SystemMetrics::default()
+            };
+            metrics.system_identity.hostname = Some("build-host".into());
+            metrics.system_identity.kernel_release = Some("6.12.0-tuxctl".into());
+            app.update(Action::SystemMetricsUpdated(metrics));
+        }
+
+        for (width, height) in [
+            (180, 50),
+            (120, 40),
+            (90, 40),
+            (80, 40),
+            (46, 50),
+            (46, 60),
+            (40, 40),
+            (40, 15),
+        ] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render(frame, &app);
+                })
+                .unwrap();
+
+            let buffer = buffer_text(&terminal);
+            assert!(!buffer.contains("Dashboard"));
+
+            let rows = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>();
+
+            // Row 0 is outer border, Row 1 is tab bar, Row 2 begins System content directly below tabs.
+            assert!(rows[1].contains("Overview"));
+            assert!(rows[2].contains("System"));
+            assert!(!rows[2].contains("Overview"));
+            assert!(!rows[2].trim().is_empty());
+            assert!(!rows[3].trim().is_empty());
+
+            let content_width = width.saturating_sub(2);
+            if content_width >= 90 {
+                assert!(rows[2].contains("Hardware"));
+            } else {
+                assert!(rows.iter().skip(3).any(|row| row.contains("Hardware")));
+            }
+        }
+    }
+
+    #[test]
+    fn data_screens_start_with_meaningful_content_below_tabs_at_responsive_sizes() {
+        for (tab, marker) in [
+            (Tab::Processes, "0 processes"),
+            (Tab::Services, "0 services"),
+            (Tab::Logs, "0 entries"),
+            (Tab::Network, "0 interfaces"),
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(tab));
+
+            for (width, height) in [(40, 15), (46, 20), (80, 24), (120, 40), (180, 50)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let regions = rendered_regions(&mut terminal, &app);
+                let rows = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(usize::from(width))
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>();
+
+                assert!(rows[1].contains(tab.label()));
+                assert!(
+                    rows[2].contains(marker),
+                    "{tab:?} at {width}x{height} did not start with {marker:?}"
+                );
+                assert!(!rows[2].contains("Terminal too small"));
+
+                let viewport = match tab {
+                    Tab::Processes => regions.process_viewport(),
+                    Tab::Services => regions.service_viewport(),
+                    Tab::Logs => regions.log_viewport(),
+                    Tab::Network => regions.network_viewport(),
+                    Tab::Overview => unreachable!(),
+                };
+                assert!(viewport.is_some_and(|(_, height)| height > 0));
+            }
+        }
+    }
+
+    #[test]
+    fn removing_redundant_screen_titles_reclaims_a_table_row() {
+        let mut processes = App::default();
+        processes.update(Action::SelectTab(Tab::Processes));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let regions = rendered_regions(&mut terminal, &processes);
+
+        assert_eq!(regions.process_viewport(), Some((0, 18)));
+        assert_eq!(regions.process_scroll_area.unwrap().y, 5);
+
+        let mut services = App::default();
+        services.update(Action::SelectTab(Tab::Services));
+        let regions = rendered_regions(&mut terminal, &services);
+
+        assert_eq!(regions.service_viewport(), Some((0, 19)));
+        assert_eq!(regions.service_scroll_area.unwrap().y, 4);
     }
 
     #[test]
@@ -1014,6 +1243,7 @@ mod tests {
                     command: Some("/bin/testproc".into()),
                     state: "R (running)".into(),
                     parent_pid: 1,
+                    state_code: 'R',
                     start_time: 100,
                 }],
                 error: None,
@@ -1030,5 +1260,22 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn tabs_hint_includes_horizontal_offset() {
+        let app = App::default();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line_chars = (81..99)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert_eq!(line_chars, "1-5 Tabs   ? Help ");
     }
 }
