@@ -137,6 +137,7 @@ impl NetworkSampler {
         let dev_contents = match fs::read_to_string(proc_net_dev_path) {
             Ok(contents) => contents,
             Err(error) => {
+                self.previous.clear();
                 return NetworkSnapshot {
                     interfaces: Vec::new(),
                     error: Some(format!(
@@ -539,6 +540,69 @@ docker0:   16306     214    0    0    0     0          0         0   593023    1
 
         assert_eq!(third.interfaces[0].rx_rate_bytes_per_sec, Some(250.0));
         assert_eq!(third.interfaces[0].tx_rate_bytes_per_sec, Some(500.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proc_read_failure_invalidates_rate_baselines_before_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "tuxctl-network-read-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let proc_net_dev = root.join("net-dev");
+        let sys_class_net = root.join("net");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&sys_class_net).unwrap();
+
+        let mut sampler = NetworkSampler::default();
+        let t0 = Instant::now();
+        fs::write(&proc_net_dev, net_dev_row("enp6s0", 1_000, 2_000)).unwrap();
+        let baseline = sampler.collect_at(t0, &proc_net_dev, &sys_class_net);
+
+        assert_eq!(baseline.interfaces.len(), 1);
+        assert_eq!(baseline.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(baseline.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(sampler.previous.contains_key("enp6s0"));
+
+        fs::remove_file(&proc_net_dev).unwrap();
+        let failed = sampler.collect_at(t0 + Duration::from_secs(1), &proc_net_dev, &sys_class_net);
+
+        assert!(failed.interfaces.is_empty());
+        assert!(failed.error.as_deref().is_some_and(
+            |error| error.starts_with(&format!("Failed to read {}:", proc_net_dev.display()))
+        ));
+        assert!(sampler.previous.is_empty());
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row("enp6s0", 8 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let recovered =
+            sampler.collect_at(t0 + Duration::from_secs(2), &proc_net_dev, &sys_class_net);
+
+        assert_eq!(recovered.interfaces.len(), 1);
+        assert_eq!(recovered.interfaces[0].name, "enp6s0");
+        assert_eq!(recovered.interfaces[0].rx_rate_bytes_per_sec, None);
+        assert_eq!(recovered.interfaces[0].tx_rate_bytes_per_sec, None);
+        assert!(sampler.previous.contains_key("enp6s0"));
+
+        fs::write(
+            &proc_net_dev,
+            net_dev_row(
+                "enp6s0",
+                8 * 1024 * 1024 * 1024 + 4_096,
+                2 * 1024 * 1024 * 1024 + 2_048,
+            ),
+        )
+        .unwrap();
+        let resumed =
+            sampler.collect_at(t0 + Duration::from_secs(3), &proc_net_dev, &sys_class_net);
+
+        assert_eq!(resumed.interfaces[0].rx_rate_bytes_per_sec, Some(4_096.0));
+        assert_eq!(resumed.interfaces[0].tx_rate_bytes_per_sec, Some(2_048.0));
 
         let _ = fs::remove_dir_all(root);
     }
