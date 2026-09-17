@@ -2,6 +2,12 @@
 name = "tuxctl"
 version = "0.2.0"
 edition = "2021"
+authors = ["Seqat"]
+license = "MIT"
+repository = "https://github.com/Seqat/tuxctl"
+description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
+readme = "README.md"
+
 
 [dependencies]
 crossterm = "0.28"

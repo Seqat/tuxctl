@@ -1,81 +1,216 @@
 # tuxctl
 
-`tuxctl` is a lightweight, responsive, Linux-native control-center TUI written in Rust with [Ratatui](https://ratatui.rs) and [Crossterm](https://github.com/crossterm-rs/crossterm). It provides real-time system monitoring, process management, systemd service status, journal logs, and network interface statistics in a restrained, terminal-native interface.
+`tuxctl` is a lightweight, responsive, Linux-native control-center TUI written in Rust with [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm).
+
+It provides real-time system monitoring, process management, systemd service inspection, journal logs, hardware information, and network interface statistics in a restrained, terminal-native interface.
+
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="tuxctl Overview dashboard">
+</p>
+
+## Features
+
+### Overview
+
+- Responsive **System** and **Hardware** dashboard.
+- System information:
+  - Hostname and kernel version.
+  - Uptime.
+  - Process, running-process, and zombie counts.
+  - Root filesystem usage.
+- Live CPU monitoring:
+  - Aggregate CPU utilization.
+  - Bounded CPU utilization history.
+  - 1-minute, 5-minute, and 15-minute load averages.
+  - Per-logical-CPU utilization.
+  - Responsive logical-CPU grid for different terminal sizes.
+- Live RAM usage with used/total capacity.
+- Hardware inventory:
+  - CPU model information.
+  - RAM module information via EDAC sysfs when available.
+  - GPU devices using DRM/NVIDIA sysfs metadata.
+  - NVMe and SATA/SCSI storage devices.
+- Compact physical network interface summary with live RX/TX rates.
+- Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
+
+### Processes
+
+- Live process count plus aggregate system CPU and RAM usage.
+- Real-time `/proc` process scanner.
+- PID, process name, CPU percentage, and resident memory display.
+- Sortable columns:
+  - CPU (`c`)
+  - Memory (`m`)
+  - PID (`p`)
+  - Name (`n`)
+- Case-insensitive search (`/`).
+- Detailed process inspection (`Enter`).
+- Safe process signaling:
+  - SIGTERM with `t`.
+  - SIGKILL with `K` / `Shift+K`.
+  - Explicit confirmation before destructive actions.
+  - `Cancel` is the safe default.
+  - Process identity is tracked using `(PID, start_time)`.
+  - Final signal delivery uses Linux pidfds to prevent PID-reuse races.
+  - Signaling fails closed when safe pidfd signaling is unavailable.
+
+### Services
+
+- systemd unit status viewer.
+- Displays:
+  - Unit
+  - Load state
+  - Active state
+  - Sub-state
+  - Description
+- Distinct state indicators:
+  - `● active`
+  - `✖ failed`
+  - `○ inactive`
+  - `◌ activating`
+- Case-insensitive search (`/`).
+- On-demand refresh (`r`).
+- Read-only service inspection (`Enter`).
+
+### Logs
+
+- Streaming systemd journal viewer using `journalctl`.
+- Bounded log storage to prevent unbounded memory growth.
+- Bounded journal ingestion with dropped-entry accounting under sustained load.
+- Follow mode (`f`).
+- Pause/resume (`Space`).
+- Severity-based styling for errors, warnings, informational messages, and debug output.
+- Search/filter mode (`/`).
+- Detailed multiline message viewer (`Enter`).
+- Journal ingestion is scheduled so sustained log traffic does not monopolize terminal input handling.
+
+### Network
+
+- Interface monitoring using `/proc/net/dev` and `/sys/class/net`.
+- Live RX/TX transfer rates based on elapsed sampling intervals.
+- Total RX/TX counters.
+- IPv4 and IPv6 addresses.
+- Operational state indicators:
+  - `● up`
+  - `○ down`
+  - `◌ dormant`
+- Detailed interface inspection (`Enter`) including:
+  - MAC address
+  - MTU
+  - Packet counts
+  - Error counters
+  - Dropped packets
+- Safe rate-baseline recovery across interface changes and temporary `/proc/net/dev` failures.
+
+### Help
+
+- Contextual keybinding reference overlay (`?`).
+
+---
+
+## Screenshots
+
+### Processes
+
+<p align="center">
+  <img src="docs/screenshots/processes.png" alt="tuxctl Processes">
+</p>
+
+### Services
+
+<p align="center">
+  <img src="docs/screenshots/services.png" alt="tuxctl Services">
+</p>
+
+### Logs
+
+<p align="center">
+  <img src="docs/screenshots/logs.png" alt="tuxctl Logs">
+</p>
+
+### Network
+
+<p align="center">
+  <img src="docs/screenshots/network.png" alt="tuxctl Network">
+</p>
+
+
+<details>
+<summary><strong>Detail views and confirmation dialogs</strong></summary>
+
+### Process Details
+
+<p align="center">
+  <img src="docs/screenshots/process_about.png" alt="tuxctl Process Details">
+</p>
+
+### Process Signal Confirmation
+
+<p align="center">
+  <img src="docs/screenshots/process_terminate.png" alt="tuxctl Process Signal Confirmation">
+</p>
+
+### Process Kill Confirmation
+
+<p align="center">
+  <img src="docs/screenshots/process_kill.png" alt="tuxctl Process Kill Confirmation">
+</p>
+
+### Log Details
+
+<p align="center">
+  <img src="docs/screenshots/logs_detail.png" alt="tuxctl Log Details">
+</p>
+
+### Network Interface Details
+
+<p align="center">
+  <img src="docs/screenshots/network_detail.png" alt="tuxctl Network Interface Details">
+</p>
+
+</details>
 
 ---
 
 ## Requirements
 
-- **Operating System**: Linux (`tuxctl` directly inspects Linux interfaces such as `/proc` and `/sys`).
-- **Runtime Utilities**:
-  - `systemctl` (required for the **Services** tab).
-  - `journalctl` (required for the **Logs** tab).
-- **Rust Toolchain**: 1.74+ (Rust 2021 edition).
+- **Operating System:** Linux.
+  - `tuxctl` directly uses Linux interfaces such as `/proc` and `/sys`.
+- **Runtime utilities:**
+  - `systemctl` for the **Services** tab.
+  - `journalctl` for the **Logs** tab.
+- **Rust:** Rust 2021-compatible toolchain for building from source.
+
+> Process signaling uses Linux pidfds for PID-safe signal delivery. If the required pidfd operations are unavailable or denied, `tuxctl` fails closed instead of falling back to unsafe PID-only signaling.
 
 ---
 
-## Implemented Screens & Features
+## Installation
 
-1. **Overview**
-   - Live CPU, Memory, and Root Filesystem usage gauges.
-   - 1-minute, 5-minute, and 15-minute system load averages and system uptime.
-   - Hardware inventory:
-     - CPU models and physical socket/package deduplication.
-     - RAM modules via EDAC sysfs with total memory fallback from `/proc/meminfo`.
-     - GPU devices (DRM and NVIDIA sysfs detection).
-     - Block storage devices (NVMe, SATA/SCSI disk enumeration).
-   - Responsive layout adapting from side-by-side wide displays to compact stacked layouts on narrow terminals.
+### Install from Source
 
-2. **Processes**
-   - Real-time `/proc` scanner reporting PID, process name, command, CPU percentage, and resident memory.
-   - Sortable columns: CPU (`c`), Memory (`m`), PID (`p`), and Name (`n`).
-   - Case-insensitive search filter (`/`).
-   - Detailed process inspection modal (`Enter`).
-   - Safe signal workflow:
-     - Request SIGTERM (`t`) or SIGKILL (`K` / `Shift+K`).
-     - Explicit confirmation modal with `Cancel` as the safe default.
-     - Start-time identity validation immediately prior to signal delivery to prevent PID reuse race conditions.
-
-3. **Services**
-   - Systemd unit status viewer (`Unit`, `LoadState`, `ActiveState`, `SubState`, `Description`).
-   - Distinct state glyphs (`● active`, `✖ failed`, `○ inactive`, `◌ activating`) for accessibility across color and monochrome terminals.
-   - Case-insensitive search filter (`/`).
-   - On-demand service refresh (`r`).
-   - Read-only service inspection popup (`Enter`).
-
-4. **Logs**
-   - Streaming systemd journal reader via `journalctl`.
-   - Bounded ring buffer preventing memory exhaustion under high log volume.
-   - Dynamic follow mode (`f`) and pause/resume (`Space`).
-   - Severity-based color coding (emergency/crit/error, warn, notice/info, debug).
-   - Search/filter mode (`/`) and detailed message viewer (`Enter`).
-   - Dropped entry accounting when logs exceed ingestion capacity.
-
-5. **Network**
-   - Network interface monitor parsing `/proc/net/dev` and `/sys/class/net`.
-   - Dynamic RX/TX transfer rate calculations based on elapsed sampling intervals.
-   - Operational link status glyphs (`● up`, `○ down`, `◌ dormant`).
-   - IPv4 and IPv6 address resolution.
-   - Detailed interface modal (`Enter`) with MAC address, MTU, packet counts, error counters, and drop statistics.
-
-6. **Help**
-   - Contextual keybinding reference overlay (`?`).
-
----
-
-## Building and Running
-
-### Development Mode
-
-Run directly with Cargo:
+Clone the repository:
 
 ```sh
-cargo run
+git clone https://github.com/Seqat/tuxctl.git
+cd tuxctl
+```
+
+Install the optimized binary through Cargo:
+
+```sh
+cargo install --path .
+```
+
+Then run:
+
+```sh
+tuxctl
 ```
 
 ### Release Build
 
-Build an optimized release binary:
+Build an optimized binary without installing it:
 
 ```sh
 cargo build --release
@@ -83,8 +218,20 @@ cargo build --release
 
 The resulting executable is located at:
 
+```text
+./target/release/tuxctl
+```
+
+Run it with:
+
 ```sh
 ./target/release/tuxctl
+```
+
+### Development Mode
+
+```sh
+cargo run
 ```
 
 ---
@@ -95,11 +242,13 @@ The resulting executable is located at:
 
 | Key | Action |
 | --- | --- |
-| `1` - `5` | Switch directly to tab (1: Overview, 2: Processes, 3: Services, 4: Logs, 5: Network) |
-| `Tab` / `Shift+Tab` | Next / previous tab (also `→` / `←`) |
+| `1` - `5` | Switch directly to tab: Overview, Processes, Services, Logs, Network |
+| `Tab` / `Shift+Tab` | Next / previous tab |
+| `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
-| `Esc` | Dismiss open dialog / clear search filter |
-| `q` or `Ctrl+C` | Quit `tuxctl` |
+| `Esc` | Dismiss dialog / clear active search |
+| `q` | Quit |
+| `Ctrl+C` | Quit globally |
 
 ### Navigation & Common Actions
 
@@ -107,56 +256,97 @@ The resulting executable is located at:
 | --- | --- |
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
-| `PageUp` / `PageDown` | Move selection up / down by page |
+| `PageUp` / `PageDown` | Move selection by page |
 | `Home` / `End` | Jump to first / last item |
 | `/` | Begin search / filter |
-| `Enter` | Open detailed inspection modal |
+| `Enter` | Open detailed inspection |
 
-### Processes Screen
+### Processes
 
 | Key | Action |
 | --- | --- |
-| `c` | Sort by CPU % (toggle descending / ascending) |
-| `m` | Sort by Memory (toggle descending / ascending) |
-| `p` | Sort by PID (toggle ascending / descending) |
-| `n` | Sort by Name (toggle ascending / descending) |
+| `c` | Sort by CPU % |
+| `m` | Sort by Memory |
+| `p` | Sort by PID |
+| `n` | Sort by Name |
 | `t` | Request `SIGTERM` for selected process |
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
 
-#### Signal Confirmation Modal
+Repeated sort commands toggle the sort direction.
+
+#### Signal Confirmation
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `←` / `→` / `h` / `l` | Toggle focus between `Cancel` and `Confirm` |
-| `Enter` | Execute focused button |
-| `Esc` | Cancel and dismiss modal |
+| `Tab` / `←` / `→` / `h` / `l` | Move focus between `Cancel` and confirmation |
+| `Enter` | Execute focused action |
+| `Esc` | Cancel and close |
 
-### Services Screen
-
-| Key | Action |
-| --- | --- |
-| `r` | Trigger immediate systemd service refresh |
-
-### Logs Screen
+### Services
 
 | Key | Action |
 | --- | --- |
-| `f` | Toggle follow mode (auto-scroll to newest entries) |
-| `Space` | Toggle pause / resume |
+| `r` | Request an immediate service refresh |
+
+### Logs
+
+| Key | Action |
+| --- | --- |
+| `f` | Toggle follow mode |
+| `Space` | Pause / resume |
 
 ### Mouse Controls
 
-- **Tab Switching**: Click any tab title in the top bar.
-- **Selection**: Click any row in Processes, Services, Logs, or Network to select it.
-- **Scrolling**: Scroll the mouse wheel over list areas to scroll up and down.
-- **Process Sorting**: Click column headers (`PID`, `NAME`, `CPU`, `MEMORY`) to change sort column and toggle direction.
-- **Dialogs**: Click `[ Cancel ]` or `[ Confirm ]` buttons in confirmation popups.
+- **Tabs:** Click a tab title to switch screens.
+- **Selection:** Click rows in Processes, Services, Logs, or Network.
+- **Scrolling:** Use the mouse wheel over list/table areas.
+- **Process sorting:** Click `PID`, `NAME`, `CPU`, or `MEMORY` headers.
+- **Confirmation dialogs:** Click `Cancel` or the confirmation action.
+
+---
+
+## Design & Reliability
+
+`tuxctl` is designed around a small, bounded, event-driven architecture.
+
+- Linux collection happens outside rendering.
+- Render paths consume cached state rather than performing blocking `/proc`, `/sys`, `systemctl`, or `journalctl` work.
+- Periodic system, process, service, and network snapshots use bounded newest-state semantics.
+- CPU history and log storage are bounded.
+- Journal processing is bounded per main-loop turn.
+- Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
+- Inactive screens can update cached state without forcing unnecessary redraws.
+- Terminal restoration remains owned by the main UI lifecycle.
+- Process signals use pidfds and fail closed if safe delivery cannot be guaranteed.
+
+---
+
+## Terminal Support
+
+The normal interface requires a terminal size of at least:
+
+```text
+40 columns × 15 rows
+```
+
+Below either dimension, `tuxctl` displays a terminal-too-small warning instead of attempting to render the normal interface.
+
+Within supported dimensions, layouts adapt to available space. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
 
 ---
 
 ## Known Limitations
 
-- **Systemd Dependency**: The Services and Logs tabs require access to `systemctl` and `journalctl` on the host system.
-- **Hardware Hotplug**: Hardware inventory is discovered at startup; hot-plugged devices (such as USB drives) are not dynamically re-enumerated without restarting.
-- **Process Signals**: Signal operations are subject to standard Linux permissions. Signaling processes owned by root or other users will report `permission denied` unless `tuxctl` is run with sufficient capabilities or privileges.
-- **Terminal Width**: The interface adapts to small terminals, but terminal widths below 40 columns will truncate long command strings and IP addresses rather than offering horizontal scrolling.
+- **Linux only:** `tuxctl` relies directly on Linux `/proc`, `/sys`, systemd utilities, and Linux-specific process signaling.
+- **systemd dependency:** Services and Logs require access to `systemctl` and `journalctl`.
+- **Hardware hotplug:** Hardware inventory is discovered at startup. Newly attached hardware is not dynamically re-enumerated until `tuxctl` is restarted.
+- **Process permissions:** Signaling another user's or privileged processes is subject to normal Linux permissions.
+- **pidfd availability:** Process signaling requires safe pidfd support. `tuxctl` intentionally does not fall back to PID-only signaling if that safety guarantee is unavailable.
+- **Terminal size:** Normal rendering requires at least **40×15**.
+- **No horizontal scrolling:** Long values may be truncated in narrow layouts.
+
+---
+
+## License
+
+See [LICENSE](LICENSE) for license information.
