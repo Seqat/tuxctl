@@ -32,6 +32,11 @@ pub fn tab_areas(area: Rect) -> Vec<(Tab, Rect)> {
     let right = u32::from(area.x) + u32::from(area.width);
     let mut x = u32::from(area.x);
     let mut areas = Vec::with_capacity(Tab::ALL.len());
+    let padded_width = Tab::ALL
+        .iter()
+        .map(|tab| tab.label().chars().count().saturating_add(2))
+        .sum::<usize>();
+    let side_padding = usize::from(padded_width <= usize::from(area.width));
 
     for tab in Tab::ALL {
         let remaining = right.saturating_sub(x);
@@ -39,7 +44,11 @@ pub fn tab_areas(area: Rect) -> Vec<(Tab, Rect)> {
             break;
         }
 
-        let desired_width = tab.label().len().saturating_add(2) as u32;
+        let desired_width = tab
+            .label()
+            .chars()
+            .count()
+            .saturating_add(side_padding.saturating_mul(2)) as u32;
         let width = desired_width.min(remaining).min(u32::from(u16::MAX)) as u16;
         let rect = Rect::new(
             x.min(u32::from(u16::MAX)) as u16,
@@ -105,9 +114,18 @@ mod tests {
         let area = Rect::new(5, 2, 12, 1);
         let tabs = tab_areas(area);
 
-        assert_eq!(tabs[0], (Tab::Overview, Rect::new(5, 2, 10, 1)));
-        assert_eq!(tabs[1], (Tab::Processes, Rect::new(15, 2, 2, 1)));
+        assert_eq!(tabs[0], (Tab::Overview, Rect::new(5, 2, 8, 1)));
+        assert_eq!(tabs[1], (Tab::Processes, Rect::new(13, 2, 4, 1)));
         assert_eq!(tabs.len(), 2);
+    }
+
+    #[test]
+    fn tab_areas_drop_decorative_padding_to_fit_all_labels() {
+        let tabs = tab_areas(Rect::new(1, 1, 38, 1));
+
+        assert_eq!(tabs.len(), Tab::ALL.len());
+        assert_eq!(tabs[0], (Tab::Overview, Rect::new(1, 1, 8, 1)));
+        assert_eq!(tabs[4], (Tab::Network, Rect::new(30, 1, 7, 1)));
     }
 
     #[test]

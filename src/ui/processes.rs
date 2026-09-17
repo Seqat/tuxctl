@@ -13,7 +13,7 @@ use crate::{
     linux::{ProcessIdentity, ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
-use super::{format_bytes, layout};
+use super::{format_bytes, hardware::utilization_bar, layout};
 
 pub struct ProcessRender {
     pub rows: Vec<(ProcessIdentity, Rect)>,
@@ -240,21 +240,8 @@ fn resource_metric(label: &str, percent: Option<f64>, gauge_width: Option<usize>
     let percent_text = system_percent(percent);
     gauge_width.map_or_else(
         || format!("{label} {percent_text}"),
-        |width| {
-            format!(
-                "{label} {percent_text} [{}]",
-                utilization_bar(percent, width)
-            )
-        },
+        |width| format!("{label} {percent_text} {}", utilization_bar(percent, width)),
     )
-}
-
-fn utilization_bar(percent: Option<f64>, width: usize) -> String {
-    let filled = percent
-        .map(|percent| ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize)
-        .unwrap_or(0)
-        .min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 fn system_percent(percent: Option<f64>) -> String {
@@ -515,17 +502,19 @@ mod tests {
         assert!(text.contains("RAM  25%"));
         assert!(text.contains("8.0 GiB / 32.0 GiB"));
         assert_eq!(text.matches(['█', '░']).count(), 20);
+        assert!(!text.contains('['));
+        assert!(!text.contains(']'));
         assert!(text.chars().count() <= 120);
     }
 
     #[test]
-    fn medium_resource_summary_preserves_values_before_gauges() {
+    fn medium_resource_summary_uses_compact_gauges_and_preserves_values() {
         let text = resource_summary_text(393, &metrics(), 70);
 
         assert!(text.contains("CPU  14%"));
         assert!(text.contains("RAM  25%"));
         assert!(text.contains("8.0 GiB / 32.0 GiB"));
-        assert!(!text.contains(['█', '░']));
+        assert_eq!(text.matches(['█', '░']).count(), 12);
         assert!(text.chars().count() <= 70);
     }
 

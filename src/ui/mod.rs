@@ -483,10 +483,12 @@ fn render_tabs(
             Style::default()
         };
 
-        frame.render_widget(
-            Paragraph::new(format!(" {} ", tab.label())).style(style),
-            area,
-        );
+        let label = if usize::from(area.width) >= tab.label().chars().count().saturating_add(2) {
+            format!(" {} ", tab.label())
+        } else {
+            tab.label().to_owned()
+        };
+        frame.render_widget(Paragraph::new(label).style(style), area);
     }
 
     if tabs_area.width >= 75 {
@@ -517,26 +519,20 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
         return ContentRender::None;
     }
 
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(format!(" {} ", active_tab.label()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     if active_tab == Tab::Processes {
-        return ContentRender::Processes(processes::render(frame, app, inner));
+        return ContentRender::Processes(processes::render(frame, app, area));
     }
 
     if active_tab == Tab::Services {
-        return ContentRender::Services(services::render(frame, app, inner));
+        return ContentRender::Services(services::render(frame, app, area));
     }
 
     if active_tab == Tab::Logs {
-        return ContentRender::Logs(logs::render(frame, app, inner));
+        return ContentRender::Logs(logs::render(frame, app, area));
     }
 
     if active_tab == Tab::Network {
-        return ContentRender::Network(network::render(frame, app, inner));
+        return ContentRender::Network(network::render(frame, app, area));
     }
 
     let content = Paragraph::new(vec![
@@ -545,7 +541,7 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
         Line::from("Press ? for help"),
     ])
     .alignment(Alignment::Center);
-    frame.render_widget(content, layout::centered_rows(inner, 3));
+    frame.render_widget(content, layout::centered_rows(area, 3));
     ContentRender::None
 }
 
@@ -1137,25 +1133,67 @@ mod tests {
                 assert!(rows.iter().skip(3).any(|row| row.contains("Hardware")));
             }
         }
+    }
 
-        // Confirm other screens preserve their content header
-        let mut proc_app = App::default();
-        proc_app.update(Action::SelectTab(Tab::Processes));
+    #[test]
+    fn data_screens_start_with_meaningful_content_below_tabs_at_responsive_sizes() {
+        for (tab, marker) in [
+            (Tab::Processes, "0 processes"),
+            (Tab::Services, "0 services"),
+            (Tab::Logs, "0 entries"),
+            (Tab::Network, "0 interfaces"),
+        ] {
+            let mut app = App::default();
+            app.update(Action::SelectTab(tab));
+
+            for (width, height) in [(40, 15), (46, 20), (80, 24), (120, 40), (180, 50)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let regions = rendered_regions(&mut terminal, &app);
+                let rows = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(usize::from(width))
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>();
+
+                assert!(rows[1].contains(tab.label()));
+                assert!(
+                    rows[2].contains(marker),
+                    "{tab:?} at {width}x{height} did not start with {marker:?}"
+                );
+                assert!(!rows[2].contains("Terminal too small"));
+
+                let viewport = match tab {
+                    Tab::Processes => regions.process_viewport(),
+                    Tab::Services => regions.service_viewport(),
+                    Tab::Logs => regions.log_viewport(),
+                    Tab::Network => regions.network_viewport(),
+                    Tab::Overview => unreachable!(),
+                };
+                assert!(viewport.is_some_and(|(_, height)| height > 0));
+            }
+        }
+    }
+
+    #[test]
+    fn removing_redundant_screen_titles_reclaims_a_table_row() {
+        let mut processes = App::default();
+        processes.update(Action::SelectTab(Tab::Processes));
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render(frame, &proc_app);
-            })
-            .unwrap();
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(80)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        assert!(rows[2].contains("Processes"));
+        let regions = rendered_regions(&mut terminal, &processes);
+
+        assert_eq!(regions.process_viewport(), Some((0, 18)));
+        assert_eq!(regions.process_scroll_area.unwrap().y, 5);
+
+        let mut services = App::default();
+        services.update(Action::SelectTab(Tab::Services));
+        let regions = rendered_regions(&mut terminal, &services);
+
+        assert_eq!(regions.service_viewport(), Some((0, 19)));
+        assert_eq!(regions.service_scroll_area.unwrap().y, 4);
     }
 
     #[test]

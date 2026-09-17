@@ -285,7 +285,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if area.width >= 40 {
-        spans.push(Span::raw("   Enter Details"));
+        spans.push(Span::raw("   Enter details"));
     }
 
     if let Some(error) = app.network_error() {
