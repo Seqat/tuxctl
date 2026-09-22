@@ -1559,6 +1559,13 @@ mod tests {
         ] {
             let mut app = App::default();
             app.update(Action::SelectTab(tab));
+            if let Some(generation) = app.take_service_refresh_request() {
+                // Settle the refresh that entering Services requests.
+                app.update(Action::ServicesUpdated(crate::linux::ServiceSnapshot {
+                    completed_refresh_generation: generation,
+                    ..Default::default()
+                }));
+            }
 
             for (width, height) in [(40, 15), (46, 20), (80, 24), (120, 40), (180, 50)] {
                 let backend = TestBackend::new(width, height);

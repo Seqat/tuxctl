@@ -59,9 +59,11 @@ pub struct ServiceCollector {
 }
 
 impl ServiceCollector {
-    pub fn start(refresh_rate: Duration) -> io::Result<Self> {
+    /// Starts the collector, optionally paused so no `systemctl` runs until
+    /// [`ServiceCollector::set_paused`] resumes it.
+    pub fn start(refresh_rate: Duration, paused: bool) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new_paused(paused));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("systemd-services".into())
@@ -88,6 +90,10 @@ impl ServiceCollector {
     pub fn request_refresh(&self, generation: ServiceRefreshGeneration) {
         self.control.request_refresh(generation);
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.control.set_paused(paused);
+    }
 }
 
 impl Drop for ServiceCollector {
@@ -106,7 +112,12 @@ fn run_collector(
     mut publish: impl FnMut(ServiceSnapshot) -> bool,
 ) {
     let mut refresh_progress = ServiceRefreshProgress::default();
-    let mut collection_generation = None;
+    // Returns immediately unless the collector starts paused.
+    let mut collection_generation = match control.wait(Duration::ZERO) {
+        CollectorWake::Refresh(generation) => Some(generation),
+        CollectorWake::Timeout => None,
+        CollectorWake::Stop => return,
+    };
 
     loop {
         let snapshot = refresh_progress.finish_collection(collect(), collection_generation);
@@ -326,6 +337,44 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(snapshot_rx.recv().unwrap().completed_refresh_generation, 7);
 
+        control.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn paused_collector_runs_no_command_until_resumed_with_one_refresh() {
+        let control = Arc::new(CollectorControl::new_paused(true));
+        let worker_control = Arc::clone(&control);
+        let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_collections = Arc::clone(&collections);
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_collector(
+                Duration::from_secs(3600),
+                &worker_control,
+                || {
+                    worker_collections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ServiceSnapshot::default()
+                },
+                |snapshot| snapshot_tx.send(snapshot).is_ok(),
+            );
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(collections.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        control.request_refresh(1);
+        control.set_paused(false);
+        let snapshot = snapshot_rx.recv().unwrap();
+        assert_eq!(snapshot.completed_refresh_generation, 1);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            collections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resume plus refresh must collect exactly once"
+        );
+
+        control.set_paused(true);
         control.stop();
         worker.join().unwrap();
     }

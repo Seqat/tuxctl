@@ -2,7 +2,7 @@
 
 use std::{
     sync::{Condvar, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Monotonic id of a user-requested refresh.
@@ -19,6 +19,7 @@ pub(super) enum CollectorWake {
 struct CollectorControlState {
     pending_refresh_generation: Option<RefreshGeneration>,
     stop: bool,
+    paused: bool,
 }
 
 #[derive(Default)]
@@ -28,6 +29,24 @@ pub(super) struct CollectorControl {
 }
 
 impl CollectorControl {
+    pub(super) fn new_paused(paused: bool) -> Self {
+        let control = Self::default();
+        lock(&control.state).paused = paused;
+        control
+    }
+
+    /// While paused, a waiting worker does not collect; a refresh requested
+    /// meanwhile is kept and served on resume.
+    pub(super) fn set_paused(&self, paused: bool) {
+        let mut state = lock(&self.state);
+        if state.paused == paused {
+            return;
+        }
+        state.paused = paused;
+        drop(state);
+        self.wake.notify_one();
+    }
+
     pub(super) fn request_refresh(&self, generation: RefreshGeneration) {
         let mut state = lock(&self.state);
         if state.stop {
@@ -59,24 +78,35 @@ impl CollectorControl {
         state.stop
     }
 
+    /// Waits until a stop, a refresh request, or `timeout` after the call.
+    /// Time spent paused counts toward `timeout`, so resuming after a long
+    /// pause collects promptly.
     pub(super) fn wait(&self, timeout: Duration) -> CollectorWake {
+        let deadline = Instant::now() + timeout;
         let mut state = lock(&self.state);
-        if state.pending_refresh_generation.is_none() && !state.stop {
-            let (next_state, _) = self
+        loop {
+            if state.stop {
+                return CollectorWake::Stop;
+            }
+            if state.paused {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
+            if let Some(generation) = state.pending_refresh_generation.take() {
+                return CollectorWake::Refresh(generation);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return CollectorWake::Timeout;
+            }
+            state = self
                 .wake
-                .wait_timeout_while(state, timeout, |state| {
-                    state.pending_refresh_generation.is_none() && !state.stop
-                })
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next_state;
-        }
-
-        if state.stop {
-            CollectorWake::Stop
-        } else if let Some(generation) = state.pending_refresh_generation.take() {
-            CollectorWake::Refresh(generation)
-        } else {
-            CollectorWake::Timeout
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
     }
 }
@@ -142,6 +172,52 @@ mod tests {
         let control = Arc::new(CollectorControl::default());
         let worker_control = Arc::clone(&control);
         let worker = thread::spawn(move || worker_control.wait(Duration::from_secs(60)));
+
+        control.stop();
+
+        assert_eq!(worker.join().unwrap(), CollectorWake::Stop);
+    }
+
+    #[test]
+    fn paused_wait_ignores_timeouts_until_resumed() {
+        let control = Arc::new(CollectorControl::new_paused(true));
+        let worker_control = Arc::clone(&control);
+        let worker = thread::spawn(move || worker_control.wait(Duration::from_millis(10)));
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(!worker.is_finished(), "a paused worker must not time out");
+        control.set_paused(false);
+
+        assert_eq!(worker.join().unwrap(), CollectorWake::Timeout);
+    }
+
+    #[test]
+    fn refresh_requested_while_paused_is_served_once_on_resume() {
+        let control = Arc::new(CollectorControl::new_paused(true));
+        let worker_control = Arc::clone(&control);
+        let worker = thread::spawn(move || {
+            (
+                worker_control.wait(Duration::from_secs(3600)),
+                worker_control.wait(Duration::ZERO),
+            )
+        });
+
+        control.request_refresh(3);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!worker.is_finished());
+        control.set_paused(false);
+
+        assert_eq!(
+            worker.join().unwrap(),
+            (CollectorWake::Refresh(3), CollectorWake::Timeout)
+        );
+    }
+
+    #[test]
+    fn stop_wakes_a_paused_worker() {
+        let control = Arc::new(CollectorControl::new_paused(true));
+        let worker_control = Arc::clone(&control);
+        let worker = thread::spawn(move || worker_control.wait(Duration::from_secs(3600)));
 
         control.stop();
 
