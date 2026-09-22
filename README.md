@@ -230,6 +230,18 @@ Run it with:
 ./target/release/tuxctl
 ```
 
+### Command-Line Options
+
+```text
+tuxctl [--interval <DURATION>]
+```
+
+| Option | Description |
+| --- | --- |
+| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. |
+| `-h`, `--help` | Print help. |
+| `-V`, `--version` | Print the version. |
+
 ### Development Mode
 
 ```sh

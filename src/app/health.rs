@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// How often each background collector samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectorPeriods {
+    pub metrics: Duration,
+    pub processes: Duration,
+    pub network: Duration,
+    pub services: Duration,
+}
+
+impl CollectorPeriods {
+    /// Full process scans stay at most once per second and `systemctl` listings
+    /// at most once every 5 s, whatever the sampling interval.
+    const MIN_PROCESS_PERIOD: Duration = Duration::from_secs(1);
+    const MIN_SERVICE_PERIOD: Duration = Duration::from_secs(5);
+
+    pub fn for_sampling_interval(interval: Duration) -> Self {
+        Self {
+            metrics: interval,
+            processes: interval.max(Self::MIN_PROCESS_PERIOD),
+            network: interval,
+            services: interval.max(Self::MIN_SERVICE_PERIOD),
+        }
+    }
+}
+
 /// Background collectors whose last update time is tracked for the stale marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Collector {
@@ -55,15 +80,23 @@ pub(super) struct CollectorHealth {
 impl App {
     /// Enables stale markers: a collector is stale after three missed periods.
     /// Services also allow for a full `systemctl` timeout before being flagged.
-    pub fn with_collector_periods(mut self, sampling: Duration, services: Duration) -> Self {
+    pub fn with_collector_periods(mut self, periods: CollectorPeriods) -> Self {
         for collector in Collector::ALL {
             let threshold = match collector {
-                Collector::Services => services.saturating_mul(2) + SYSTEMCTL_TIMEOUT,
-                _ => sampling.saturating_mul(3),
+                Collector::Metrics => periods.metrics.saturating_mul(3),
+                Collector::Processes => periods.processes.saturating_mul(3),
+                Collector::Network => periods.network.saturating_mul(3),
+                Collector::Services => periods.services.saturating_mul(2) + SYSTEMCTL_TIMEOUT,
             };
             self.collector_health[collector.index()].stale_after = Some(threshold);
         }
+        self.cpu_history_interval = periods.metrics;
         self
+    }
+
+    /// Time between aggregate CPU history samples.
+    pub fn cpu_history_interval(&self) -> Duration {
+        self.cpu_history_interval
     }
 
     /// Stale collectors whose data is shown on the active tab.
@@ -129,6 +162,36 @@ mod tests {
     }
 
     #[test]
+    fn sampling_interval_is_clamped_for_process_and_service_collectors() {
+        let fast = CollectorPeriods::for_sampling_interval(Duration::from_millis(250));
+        assert_eq!(fast.metrics, Duration::from_millis(250));
+        assert_eq!(fast.network, Duration::from_millis(250));
+        assert_eq!(fast.processes, Duration::from_secs(1));
+        assert_eq!(fast.services, Duration::from_secs(5));
+
+        let slow = CollectorPeriods::for_sampling_interval(Duration::from_secs(30));
+        assert_eq!(slow.processes, Duration::from_secs(30));
+        assert_eq!(slow.services, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn each_collector_uses_its_own_period_for_staleness() {
+        let mut app = App::default().with_collector_periods(
+            CollectorPeriods::for_sampling_interval(Duration::from_millis(250)),
+        );
+        app.update(Action::SelectTab(Tab::Processes));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        // 1 s later: metrics (250 ms period) are stale, the 1 s process scan is not.
+        app.update(Action::Tick(start + Duration::from_secs(1)));
+        assert_eq!(stale_names(&app), ["metrics"]);
+
+        app.update(Action::Tick(start + Duration::from_millis(3_001)));
+        assert_eq!(stale_names(&app), ["metrics", "processes"]);
+    }
+
+    #[test]
     fn staleness_is_disabled_without_configured_periods() {
         let mut app = App::default();
         let start = Instant::now();
@@ -140,7 +203,8 @@ mod tests {
 
     #[test]
     fn collector_becomes_stale_only_after_three_missed_periods() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         let start = Instant::now();
         fresh_tick(&mut app, start);
 
@@ -158,7 +222,8 @@ mod tests {
 
     #[test]
     fn stale_transitions_redraw_once_and_recovery_clears_the_marker() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         let start = Instant::now();
         fresh_tick(&mut app, start);
 
@@ -179,7 +244,8 @@ mod tests {
 
     #[test]
     fn hidden_collector_transitions_do_not_redraw() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         app.update(Action::SelectTab(Tab::Logs));
         let start = Instant::now();
         fresh_tick(&mut app, start);
@@ -193,7 +259,8 @@ mod tests {
 
     #[test]
     fn paused_services_are_not_stale_when_their_tab_returns() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         app.update(Action::SelectTab(Tab::Services));
         let start = Instant::now();
         fresh_tick(&mut app, start);
@@ -215,7 +282,8 @@ mod tests {
 
     #[test]
     fn services_threshold_exceeds_the_systemctl_timeout() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         app.update(Action::SelectTab(Tab::Services));
         let start = Instant::now();
         fresh_tick(&mut app, start);
@@ -231,7 +299,8 @@ mod tests {
 
     #[test]
     fn collector_that_never_publishes_becomes_stale_from_the_first_tick() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         let start = Instant::now();
 
         assert!(!app.update(Action::Tick(start)));
@@ -245,7 +314,8 @@ mod tests {
 
     #[test]
     fn staleness_is_checked_while_a_modal_is_open() {
-        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
         let start = Instant::now();
         fresh_tick(&mut app, start);
         app.update(Action::ShowHelp);

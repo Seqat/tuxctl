@@ -121,10 +121,11 @@ pub(super) fn render(
     if lines.len() < height {
         let percent = format_percent(metrics.cpu_percent);
         let prefix = format!("Util  {percent:>4}  ");
-        let history_width = width.saturating_sub(prefix.chars().count());
-        let history = history_sparkline(app.aggregate_cpu_history().iter(), history_width);
         lines.push(Line::from(layout::truncate(
-            &format!("{prefix}{history}"),
+            &format!(
+                "{prefix}{}",
+                utilization_history(app, width.saturating_sub(prefix.chars().count()))
+            ),
             width,
         )));
     }
@@ -281,6 +282,45 @@ fn dense_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize
     )
 }
 
+/// The CPU sparkline followed by the time span it covers, e.g. `▂▃▅  60s`.
+/// The span counts only the samples that fit, so it shrinks on narrow panels.
+fn utilization_history(app: &App, width: usize) -> String {
+    const LABEL_GAP: &str = "  ";
+    const MIN_SPARKLINE_WIDTH: usize = 4;
+    let history = app.aggregate_cpu_history();
+    let interval = app.cpu_history_interval();
+    let widest_label = format_window(interval.saturating_mul(history.capacity() as u32));
+    let sparkline_width = width
+        .saturating_sub(LABEL_GAP.len() + widest_label.chars().count())
+        .min(history.capacity());
+    if sparkline_width < MIN_SPARKLINE_WIDTH {
+        return history_sparkline(history.iter(), width);
+    }
+    let sparkline = history_sparkline(history.iter(), sparkline_width);
+    let window = format_window(interval.saturating_mul(sparkline_width as u32));
+    format!(
+        "{}{LABEL_GAP}{window}",
+        pad_cell(&sparkline, sparkline_width)
+    )
+}
+
+/// Compact span: `15s`, `90s`, `2m`, `2m30s`, `1h`; sub-second parts as `4.8s`.
+fn format_window(window: std::time::Duration) -> String {
+    let millis = window.as_millis();
+    let seconds = window.as_secs();
+    if !millis.is_multiple_of(1000) {
+        format!("{:.1}s", window.as_secs_f64())
+    } else if seconds < 120 {
+        format!("{seconds}s")
+    } else if seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
 fn history_sparkline(samples: impl ExactSizeIterator<Item = f64>, width: usize) -> String {
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     if width == 0 {
@@ -376,6 +416,61 @@ mod tests {
 
         assert_eq!(cpu_grid_layout(32, 31, 0, 10).visible, 0);
         assert_eq!(cpu_grid_layout(32, 31, 10, 0).visible, 0);
+    }
+
+    #[test]
+    fn history_windows_are_compact() {
+        use std::time::Duration;
+        for (window, text) in [
+            (Duration::from_millis(15_000), "15s"),
+            (Duration::from_secs(60), "60s"),
+            (Duration::from_secs(90), "90s"),
+            (Duration::from_secs(120), "2m"),
+            (Duration::from_secs(150), "2m30s"),
+            (Duration::from_secs(300), "5m"),
+            (Duration::from_secs(3600), "1h"),
+            (Duration::from_millis(4750), "4.8s"),
+        ] {
+            assert_eq!(format_window(window), text);
+        }
+    }
+
+    fn util_line(interval_secs: u64, width: u16) -> String {
+        let app = App::default().with_collector_periods(
+            crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(
+                interval_secs,
+            )),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, None, app.system_metrics(), frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .find(|row| row.starts_with("Util"))
+            .expect("utilization line")
+    }
+
+    #[test]
+    fn history_label_states_the_window_it_covers() {
+        assert!(util_line(1, 100).trim_end().ends_with("  60s"));
+        assert!(util_line(5, 100).trim_end().ends_with("  5m"));
+        // Only 23 samples fit next to the label at 40 columns.
+        assert!(
+            util_line(1, 40).trim_end().ends_with("  23s"),
+            "{}",
+            util_line(1, 40)
+        );
+    }
+
+    #[test]
+    fn history_label_is_dropped_when_there_is_no_room() {
+        let line = util_line(1, 16);
+        assert!(!line.contains('s'), "{line}");
     }
 
     #[test]

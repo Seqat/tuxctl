@@ -977,8 +977,7 @@ mod tests {
     #[test]
     fn stale_marker_is_shown_in_the_frame_without_hiding_search_state() {
         let mut app = App::default().with_collector_periods(
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(5),
+            crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(1)),
         );
         app.update(Action::SelectTab(Tab::Processes));
         app.update(Action::BeginProcessSearch);

@@ -30,8 +30,8 @@ mod services;
 #[cfg(test)]
 mod test_support;
 
-pub use health::Collector;
 use health::CollectorHealth;
+pub use health::{Collector, CollectorPeriods};
 use processes::ProcessKeys;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
@@ -69,6 +69,11 @@ impl AggregateCpuHistory {
         self.samples
             .push_back(utilization_percent.clamp(0.0, 100.0));
         true
+    }
+
+    /// Number of samples kept; the history covers `capacity × sampling interval`.
+    pub fn capacity(&self) -> usize {
+        AGGREGATE_CPU_HISTORY_CAPACITY
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = f64> + ExactSizeIterator + '_ {
@@ -143,6 +148,7 @@ pub struct App {
     network_error: Option<String>,
     hovered: Option<MouseTarget>,
     collector_health: [CollectorHealth; 4],
+    cpu_history_interval: Duration,
     logs_visited: bool,
 }
 
@@ -197,6 +203,7 @@ impl Default for App {
             network_error: None,
             hovered: None,
             collector_health: [CollectorHealth::default(); 4],
+            cpu_history_interval: Duration::from_secs(1),
             logs_visited: false,
         }
     }
