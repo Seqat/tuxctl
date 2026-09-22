@@ -3,12 +3,15 @@ use std::{
     ffi::CString,
     fs, io,
     mem::MaybeUninit,
-    sync::mpsc::{self, Sender},
+    sync::Arc,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use super::latest_snapshot::{self, LatestReceiver};
+use super::{
+    control::{run_periodic, CollectorControl},
+    latest_snapshot::{self, LatestReceiver},
+};
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
@@ -79,35 +82,32 @@ pub struct LoadAverage {
 
 pub struct SystemMetricsCollector {
     receiver: LatestReceiver<SystemMetrics>,
-    stop: Sender<()>,
+    control: Arc<CollectorControl>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl SystemMetricsCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (metrics_tx, receiver) = latest_snapshot::channel();
-        let (stop, stop_rx) = mpsc::channel();
+        let control = Arc::new(CollectorControl::default());
+        let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("system-metrics".into())
             .spawn(move || {
                 let identity = collect_system_identity();
                 let mut sampler = SystemMetricsSampler::new(identity);
 
-                loop {
-                    if !metrics_tx.publish(sampler.collect()) {
-                        break;
-                    }
-
-                    match stop_rx.recv_timeout(refresh_rate) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
+                run_periodic(
+                    refresh_rate,
+                    &worker_control,
+                    || sampler.collect(),
+                    |snapshot| metrics_tx.publish(snapshot),
+                );
             })?;
 
         Ok(Self {
             receiver,
-            stop,
+            control,
             worker: Some(worker),
         })
     }
@@ -119,7 +119,7 @@ impl SystemMetricsCollector {
 
 impl Drop for SystemMetricsCollector {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        self.control.stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

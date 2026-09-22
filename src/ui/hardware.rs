@@ -14,6 +14,9 @@ use crate::{
 use super::{format_bytes, hardware_cpu, hardware_network_summary, layout};
 
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
+const MAX_STORAGE_ROWS: u16 = 4;
+/// A section heading plus one value row; anything less is not drawn.
+const LOWER_SECTION_MIN_HEIGHT: u16 = 2;
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
@@ -29,11 +32,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let inventory = app.hardware();
     let metrics = app.system_metrics();
-    let grid_row_budget = usize::from(inner.height.saturating_sub(10).max(1));
-    let cpu_grid = hardware_cpu::grid_layout(metrics, usize::from(inner.width), grid_row_budget);
-
-    let desired = [
-        hardware_cpu::desired_height(metrics, cpu_grid),
+    let width = usize::from(inner.width);
+    let lower_desired = [
         2_u16.saturating_add(
             inventory
                 .map(|inventory| inventory.memory_modules.len().min(2) as u16)
@@ -47,42 +47,89 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         1_u16.saturating_add(
             inventory
                 .map(|inventory| {
-                    u16::try_from(inventory.storage_devices.len().max(1)).unwrap_or(u16::MAX)
+                    inventory
+                        .storage_devices
+                        .len()
+                        .clamp(1, MAX_STORAGE_ROWS.into()) as u16
                 })
                 .unwrap_or(1),
         ),
         hardware_network_summary::desired_height(app, inventory),
     ];
-    let (heights, spacing) = allocate_section_heights(inner.height, desired);
+    let (heights, spacing) = allocate_section_heights(
+        inner.height,
+        hardware_cpu::priority_height(metrics, width),
+        hardware_cpu::comfortable_height(metrics, width),
+        lower_desired,
+        |height| hardware_cpu::fitted_height(metrics, width, height),
+    );
     let areas = vertical_areas(inner, heights, spacing);
 
-    hardware_cpu::render(frame, app, inventory, metrics, cpu_grid, areas[0]);
+    hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
     render_ram(frame, inventory, metrics, areas[1]);
     render_gpu(frame, inventory, areas[2]);
     render_storage(frame, inventory, areas[3]);
     hardware_network_summary::render(frame, app, inventory, areas[4]);
 }
 
-fn allocate_section_heights(total: u16, desired: [u16; 5]) -> ([u16; 5], u16) {
+/// Splits the panel between CPU and the lower sections (RAM, GPU, storage,
+/// network), returning heights and the gap between sections.
+///
+/// 1. CPU gets its priority height (summary plus a few grid rows).
+/// 2. Lower sections, in order, get a heading plus one value row; the first
+///    that does not fit and every later one are omitted instead of being
+///    drawn as an orphan heading.
+/// 3. Lower sections grow toward their desired height.
+/// 4. Only once every lower section is complete does CPU grow toward its
+///    comfortable height, trimmed by `cpu_fitted` to the rows its grid
+///    actually draws; leftover rows then become gaps between sections.
+///
+/// CPU only gains rows in step 1 and step 4, and neither can shrink as the
+/// panel grows, so a taller panel never shows fewer CPUs.
+fn allocate_section_heights(
+    total: u16,
+    cpu_priority: u16,
+    cpu_comfortable: u16,
+    lower_desired: [u16; 4],
+    cpu_fitted: impl Fn(u16) -> u16,
+) -> ([u16; 5], u16) {
     let mut heights = [0; 5];
-    let spacing = u16::from(total >= 21);
-    let mut remaining = total.saturating_sub(spacing.saturating_mul(4));
+    heights[0] = cpu_priority.min(total);
+    let mut remaining = total - heights[0];
 
-    for height in &mut heights {
-        if remaining == 0 {
-            return (heights, 0);
+    let mut all_lower_shown = true;
+    for height in &mut heights[1..] {
+        if remaining < LOWER_SECTION_MIN_HEIGHT {
+            all_lower_shown = false;
+            break;
         }
-        *height = 1;
-        remaining -= 1;
+        *height = LOWER_SECTION_MIN_HEIGHT;
+        remaining -= LOWER_SECTION_MIN_HEIGHT;
     }
 
-    for section in 0..heights.len() {
-        let addition = desired[section]
-            .saturating_sub(heights[section])
-            .min(remaining);
-        heights[section] += addition;
-        remaining -= addition;
+    let mut lower_complete = all_lower_shown;
+    if all_lower_shown {
+        for (height, desired) in heights[1..].iter_mut().zip(lower_desired) {
+            let addition = desired.saturating_sub(*height).min(remaining);
+            *height += addition;
+            remaining -= addition;
+            lower_complete &= *height >= desired;
+        }
     }
+
+    if lower_complete {
+        let addition = cpu_comfortable.saturating_sub(heights[0]).min(remaining);
+        let fitted = cpu_fitted(heights[0] + addition).max(heights[0]);
+        remaining -= fitted - heights[0];
+        heights[0] = fitted;
+    }
+
+    let gaps = heights
+        .iter()
+        .filter(|height| **height > 0)
+        .count()
+        .saturating_sub(1) as u16;
+    let spacing = u16::from(gaps > 0 && remaining >= gaps);
     (heights, spacing)
 }
 
@@ -417,13 +464,60 @@ mod tests {
 
     #[test]
     fn section_height_allocation_never_exceeds_the_available_area() {
-        for height in 0..40 {
-            let (allocated, spacing) = allocate_section_heights(height, [20, 4, 4, 8, 5]);
-            let used = allocated.into_iter().sum::<u16>() + spacing * 4;
-            assert!(used <= height);
-            if height >= 21 {
-                assert_eq!(spacing, 1);
-            }
+        for height in 0..60 {
+            let (allocated, spacing) = allocate_section_heights(height, 9, 20, [4, 4, 5, 5], |h| h);
+            let gaps = allocated
+                .iter()
+                .filter(|height| **height > 0)
+                .count()
+                .saturating_sub(1);
+            let used = allocated.into_iter().sum::<u16>() + spacing * gaps as u16;
+            assert!(used <= height, "height {height}: {allocated:?} + {spacing}");
         }
+    }
+
+    #[test]
+    fn lower_sections_get_a_value_row_or_are_omitted() {
+        for height in 0..60 {
+            let (allocated, _) = allocate_section_heights(height, 9, 20, [4, 4, 5, 5], |h| h);
+            let lower = &allocated[1..];
+            assert!(lower.iter().all(|height| *height == 0 || *height >= 2));
+            let shown = lower.iter().take_while(|height| **height > 0).count();
+            assert!(
+                lower[shown..].iter().all(|height| *height == 0),
+                "{allocated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_cpu_rows_become_section_gaps() {
+        let (allocated, spacing) = allocate_section_heights(40, 9, 25, [4, 4, 5, 5], |h| h.min(18));
+        assert_eq!(allocated, [18, 4, 4, 5, 5]);
+        assert_eq!(spacing, 1);
+    }
+
+    #[test]
+    fn cpu_priority_comes_first_and_extra_rows_wait_for_lower_sections() {
+        assert_eq!(
+            allocate_section_heights(6, 9, 20, [4, 4, 5, 5], |h| h).0,
+            [6, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            allocate_section_heights(17, 9, 20, [4, 4, 5, 5], |h| h).0,
+            [9, 2, 2, 2, 2]
+        );
+        assert_eq!(
+            allocate_section_heights(27, 9, 20, [4, 4, 5, 5], |h| h).0,
+            [9, 4, 4, 5, 5]
+        );
+        assert_eq!(
+            allocate_section_heights(30, 9, 20, [4, 4, 5, 5], |h| h),
+            ([12, 4, 4, 5, 5], 0)
+        );
+        assert_eq!(
+            allocate_section_heights(44, 9, 20, [4, 4, 5, 5], |h| h),
+            ([20, 4, 4, 5, 5], 1)
+        );
     }
 }

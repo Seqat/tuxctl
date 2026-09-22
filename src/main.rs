@@ -51,11 +51,14 @@ fn main() -> io::Result<()> {
         Ok(processes) => processes,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
-    let services = match linux::ServiceCollector::start(SERVICES_REFRESH_RATE) {
+    // Services only collect while their tab is visible; journalctl starts on
+    // the first visit to Logs.
+    let mut services_paused = !app.services_visible();
+    let services = match linux::ServiceCollector::start(SERVICES_REFRESH_RATE, services_paused) {
         Ok(services) => services,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
-    let journal = linux::JournalCollector::start();
+    let mut journal: Option<linux::JournalCollector> = None;
     let network = match linux::NetworkCollector::start(METRICS_REFRESH_RATE) {
         Ok(network) => network,
         Err(error) => return finish_application(terminal, (), Err(error)),
@@ -79,7 +82,12 @@ fn main() -> io::Result<()> {
                     || services.latest().map(action::Action::ServicesUpdated),
                     || network.latest().map(action::Action::NetworkUpdated),
                     || hardware.latest().map(action::Action::HardwareDiscovered),
-                    || journal.latest().map(action::Action::LogsUpdated),
+                    || {
+                        journal
+                            .as_ref()
+                            .and_then(linux::JournalCollector::latest)
+                            .map(action::Action::LogsUpdated)
+                    },
                 )
             };
             let first = match ready(&mut events, app.hovered())? {
@@ -90,8 +98,17 @@ fn main() -> io::Result<()> {
                 ready(&mut events, app.hovered())
             })?;
 
+            // Queue the tab-entry refresh before resuming so the worker wakes
+            // to exactly one collection.
             if let Some(generation) = app.take_service_refresh_request() {
                 services.request_refresh(generation);
+            }
+            if services_paused == app.services_visible() {
+                services_paused = !services_paused;
+                services.set_paused(services_paused);
+            }
+            if journal.is_none() && app.logs_visited() {
+                journal = Some(linux::JournalCollector::start());
             }
 
             if app.should_quit() {

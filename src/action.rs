@@ -187,6 +187,17 @@ impl Tab {
         }
     }
 
+    /// Compact label used when the full labels cannot fit with separation.
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Overview => "Ovr",
+            Self::Processes => "Proc",
+            Self::Services => "Svc",
+            Self::Logs => "Logs",
+            Self::Network => "Net",
+        }
+    }
+
     pub const fn next(self) -> Self {
         match self {
             Self::Overview => Self::Processes,

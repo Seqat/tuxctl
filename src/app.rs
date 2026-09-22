@@ -170,6 +170,7 @@ pub struct App {
     network_error: Option<String>,
     hovered: Option<MouseTarget>,
     collector_health: [CollectorHealth; 4],
+    logs_visited: bool,
 }
 
 impl Default for App {
@@ -228,6 +229,7 @@ impl Default for App {
             network_error: None,
             hovered: None,
             collector_health: [CollectorHealth::default(); 4],
+            logs_visited: false,
         }
     }
 }
@@ -253,6 +255,16 @@ impl App {
         })
     }
 
+    /// Services are only collected while their tab is visible.
+    pub fn services_visible(&self) -> bool {
+        self.active_tab == Tab::Services
+    }
+
+    /// Whether the journal stream is needed yet; it starts on the first Logs visit.
+    pub fn logs_visited(&self) -> bool {
+        self.logs_visited
+    }
+
     fn record_collector_update(&mut self, collector: Collector) {
         self.collector_health[collector.index()].updated_since_tick = true;
     }
@@ -266,6 +278,14 @@ impl App {
             let Some(stale_after) = health.stale_after else {
                 continue;
             };
+            if collector == Collector::Services && !collector.shown_on(self.active_tab) {
+                // Paused while hidden: keep the clock fresh so re-entering the
+                // tab does not count the pause as missed updates.
+                health.last_update = Some(now);
+                health.updated_since_tick = false;
+                health.stale = false;
+                continue;
+            }
             if std::mem::take(&mut health.updated_since_tick) {
                 health.last_update = Some(now);
             }
@@ -721,6 +741,7 @@ impl App {
     }
 
     fn select_tab(&mut self, tab: Tab) -> bool {
+        let entering_services = tab == Tab::Services && self.active_tab != Tab::Services;
         let changed = self.active_tab != tab
             || self.process_signal_confirmation.is_some()
             || self.process_searching
@@ -744,6 +765,13 @@ impl App {
         self.hovered = None;
         if tab == Tab::Processes && self.deferred_process_rebuild.is_some() {
             self.rebuild_process_filter();
+        }
+        if tab == Tab::Logs {
+            self.logs_visited = true;
+        }
+        if entering_services {
+            // The collector was paused while hidden; fetch current state now.
+            self.request_service_refresh();
         }
         changed
     }
@@ -2046,12 +2074,11 @@ mod tests {
 
     #[test]
     fn service_refresh_is_an_explicit_background_request() {
-        let mut app = App::default();
-        app.update(Action::SelectTab(Tab::Services));
+        let mut app = services_tab_after_entry_refresh();
 
         assert!(app.update(Action::RefreshServices));
         assert!(app.service_refreshing());
-        assert_eq!(app.take_service_refresh_request(), Some(1));
+        assert_eq!(app.take_service_refresh_request(), Some(2));
         assert_eq!(app.take_service_refresh_request(), None);
 
         app.update(Action::ServicesUpdated(services(vec![service(
@@ -2063,26 +2090,78 @@ mod tests {
 
         assert!(app.update(Action::ServicesUpdated(services_completed(
             vec![service("alpha.service", "active", "Alpha")],
-            1,
+            2,
         ))));
         assert!(!app.service_refreshing());
     }
 
     #[test]
     fn service_refresh_waits_for_the_latest_coalesced_generation() {
-        let mut app = App::default();
-        app.update(Action::SelectTab(Tab::Services));
+        let mut app = services_tab_after_entry_refresh();
 
         assert!(app.update(Action::RefreshServices));
         assert!(!app.update(Action::RefreshServices));
         assert!(!app.update(Action::RefreshServices));
-        assert_eq!(app.take_service_refresh_request(), Some(3));
+        assert_eq!(app.take_service_refresh_request(), Some(4));
 
-        app.update(Action::ServicesUpdated(services_completed(Vec::new(), 2)));
+        app.update(Action::ServicesUpdated(services_completed(Vec::new(), 3)));
         assert!(app.service_refreshing());
 
-        assert!(app.update(Action::ServicesUpdated(services_completed(Vec::new(), 3,))));
+        assert!(app.update(Action::ServicesUpdated(services_completed(Vec::new(), 4,))));
         assert!(!app.service_refreshing());
+    }
+
+    /// Selects Services and completes the refresh that entering the tab requests.
+    fn services_tab_after_entry_refresh() -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        assert_eq!(app.take_service_refresh_request(), Some(1));
+        app.update(Action::ServicesUpdated(services_completed(Vec::new(), 1)));
+        assert!(!app.service_refreshing());
+        app
+    }
+
+    #[test]
+    fn entering_services_requests_exactly_one_refresh_per_entry() {
+        let mut app = App::default();
+        assert!(!app.services_visible());
+        assert_eq!(app.take_service_refresh_request(), None);
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert!(app.services_visible());
+        assert!(app.service_refreshing());
+        assert_eq!(app.take_service_refresh_request(), Some(1));
+
+        app.update(Action::SelectTab(Tab::Services));
+        app.update(Action::NextTab);
+        app.update(Action::PreviousTab);
+        assert_eq!(
+            app.take_service_refresh_request(),
+            Some(2),
+            "leaving and re-entering requests one new refresh"
+        );
+        assert_eq!(app.take_service_refresh_request(), None);
+
+        app.update(Action::SelectTab(Tab::Logs));
+        assert!(!app.services_visible());
+        assert_eq!(app.take_service_refresh_request(), None);
+    }
+
+    #[test]
+    fn journal_is_needed_only_after_logs_is_visited() {
+        let mut app = App::default();
+        for tab in [Tab::Processes, Tab::Services, Tab::Network, Tab::Overview] {
+            app.update(Action::SelectTab(tab));
+            assert!(!app.logs_visited(), "{tab:?}");
+        }
+
+        app.update(Action::SelectTab(Tab::Logs));
+        app.update(Action::SelectTab(Tab::Overview));
+
+        assert!(
+            app.logs_visited(),
+            "the journal keeps streaming once started"
+        );
     }
 
     #[test]
@@ -2991,7 +3070,29 @@ mod tests {
         assert!(!app.update(Action::Tick(start + Duration::from_secs(60))));
         assert!(stale_names(&app).is_empty());
 
+        app.update(Action::SelectTab(Tab::Processes));
+        assert_eq!(stale_names(&app), ["metrics", "processes"]);
+    }
+
+    #[test]
+    fn paused_services_are_not_stale_when_their_tab_returns() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
         app.update(Action::SelectTab(Tab::Services));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+        app.update(Action::SelectTab(Tab::Overview));
+
+        let back = start + Duration::from_secs(600);
+        app.update(Action::Tick(back));
+        app.update(Action::SelectTab(Tab::Services));
+
+        assert!(!app.update(Action::Tick(back + Duration::from_millis(250))));
+        assert!(
+            stale_names(&app).is_empty(),
+            "the pause is not a missed update"
+        );
+        let threshold = SERVICES_PERIOD * 2 + SYSTEMCTL_TIMEOUT;
+        assert!(app.update(Action::Tick(back + threshold + Duration::from_secs(1))));
         assert_eq!(stale_names(&app), ["services"]);
     }
 

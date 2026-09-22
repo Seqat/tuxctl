@@ -1,12 +1,15 @@
 use std::{
     io::{self, Read},
     process::{Child, Command, Output, Stdio},
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use super::latest_snapshot::{self, LatestReceiver};
+use super::{
+    control::{CollectorControl, CollectorWake},
+    latest_snapshot::{self, LatestReceiver},
+};
 
 pub type ServiceRefreshGeneration = u64;
 
@@ -28,79 +31,6 @@ pub struct ServiceSnapshot {
     pub services: Vec<ServiceInfo>,
     pub error: Option<String>,
     pub completed_refresh_generation: ServiceRefreshGeneration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CollectorWake {
-    Refresh(ServiceRefreshGeneration),
-    Stop,
-    Timeout,
-}
-
-#[derive(Default)]
-struct CollectorControlState {
-    pending_refresh_generation: Option<ServiceRefreshGeneration>,
-    stop: bool,
-}
-
-#[derive(Default)]
-struct CollectorControl {
-    state: Mutex<CollectorControlState>,
-    wake: Condvar,
-}
-
-impl CollectorControl {
-    fn request_refresh(&self, generation: ServiceRefreshGeneration) {
-        let mut state = lock(&self.state);
-        if state.stop {
-            return;
-        }
-        state.pending_refresh_generation = Some(
-            state
-                .pending_refresh_generation
-                .map_or(generation, |pending| pending.max(generation)),
-        );
-        drop(state);
-        self.wake.notify_one();
-    }
-
-    fn stop(&self) {
-        let mut state = lock(&self.state);
-        state.stop = true;
-        drop(state);
-        self.wake.notify_one();
-    }
-
-    /// Sleeps for up to `timeout`, returning early with `true` once a stop is requested.
-    fn stopped_within(&self, timeout: Duration) -> bool {
-        let state = lock(&self.state);
-        let (state, _) = self
-            .wake
-            .wait_timeout_while(state, timeout, |state| !state.stop)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.stop
-    }
-
-    fn wait(&self, timeout: Duration) -> CollectorWake {
-        let mut state = lock(&self.state);
-        if state.pending_refresh_generation.is_none() && !state.stop {
-            let (next_state, _) = self
-                .wake
-                .wait_timeout_while(state, timeout, |state| {
-                    state.pending_refresh_generation.is_none() && !state.stop
-                })
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next_state;
-        }
-
-        if state.stop {
-            CollectorWake::Stop
-        } else if let Some(generation) = state.pending_refresh_generation.take() {
-            CollectorWake::Refresh(generation)
-        } else {
-            CollectorWake::Timeout
-        }
-    }
 }
 
 #[derive(Default)]
@@ -129,9 +59,11 @@ pub struct ServiceCollector {
 }
 
 impl ServiceCollector {
-    pub fn start(refresh_rate: Duration) -> io::Result<Self> {
+    /// Starts the collector, optionally paused so no `systemctl` runs until
+    /// [`ServiceCollector::set_paused`] resumes it.
+    pub fn start(refresh_rate: Duration, paused: bool) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new_paused(paused));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("systemd-services".into())
@@ -158,6 +90,10 @@ impl ServiceCollector {
     pub fn request_refresh(&self, generation: ServiceRefreshGeneration) {
         self.control.request_refresh(generation);
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.control.set_paused(paused);
+    }
 }
 
 impl Drop for ServiceCollector {
@@ -169,12 +105,6 @@ impl Drop for ServiceCollector {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn run_collector(
     refresh_rate: Duration,
     control: &CollectorControl,
@@ -182,7 +112,12 @@ fn run_collector(
     mut publish: impl FnMut(ServiceSnapshot) -> bool,
 ) {
     let mut refresh_progress = ServiceRefreshProgress::default();
-    let mut collection_generation = None;
+    // Returns immediately unless the collector starts paused.
+    let mut collection_generation = match control.wait(Duration::ZERO) {
+        CollectorWake::Refresh(generation) => Some(generation),
+        CollectorWake::Timeout => None,
+        CollectorWake::Stop => return,
+    };
 
     loop {
         let snapshot = refresh_progress.finish_collection(collect(), collection_generation);
@@ -372,39 +307,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeated_refresh_requests_coalesce_to_one_pending_wake() {
-        let control = CollectorControl::default();
-
-        for generation in 1..=10_000 {
-            control.request_refresh(generation);
-        }
-
-        assert_eq!(control.wait(Duration::ZERO), CollectorWake::Refresh(10_000));
-        assert_eq!(control.wait(Duration::ZERO), CollectorWake::Timeout);
-    }
-
-    #[test]
-    fn stop_takes_priority_over_a_pending_refresh() {
-        let control = CollectorControl::default();
-        control.request_refresh(1);
-
-        control.stop();
-
-        assert_eq!(control.wait(Duration::ZERO), CollectorWake::Stop);
-    }
-
-    #[test]
-    fn stop_wakes_and_joins_a_waiting_worker() {
-        let control = Arc::new(CollectorControl::default());
-        let worker_control = Arc::clone(&control);
-        let worker = thread::spawn(move || worker_control.wait(Duration::from_secs(60)));
-
-        control.stop();
-
-        assert_eq!(worker.join().unwrap(), CollectorWake::Stop);
-    }
-
-    #[test]
     fn refresh_requested_during_collection_requires_the_follow_up_collection() {
         let control = Arc::new(CollectorControl::default());
         let worker_control = Arc::clone(&control);
@@ -435,6 +337,44 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(snapshot_rx.recv().unwrap().completed_refresh_generation, 7);
 
+        control.stop();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn paused_collector_runs_no_command_until_resumed_with_one_refresh() {
+        let control = Arc::new(CollectorControl::new_paused(true));
+        let worker_control = Arc::clone(&control);
+        let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_collections = Arc::clone(&collections);
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_collector(
+                Duration::from_secs(3600),
+                &worker_control,
+                || {
+                    worker_collections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ServiceSnapshot::default()
+                },
+                |snapshot| snapshot_tx.send(snapshot).is_ok(),
+            );
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(collections.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        control.request_refresh(1);
+        control.set_paused(false);
+        let snapshot = snapshot_rx.recv().unwrap();
+        assert_eq!(snapshot.completed_refresh_generation, 1);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            collections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resume plus refresh must collect exactly once"
+        );
+
+        control.set_paused(true);
         control.stop();
         worker.join().unwrap();
     }
