@@ -1,3 +1,4 @@
+mod control;
 mod hardware;
 mod journal;
 mod latest_snapshot;

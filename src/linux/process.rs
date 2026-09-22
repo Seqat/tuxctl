@@ -3,12 +3,15 @@ use std::{
     fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
-    sync::mpsc::{self, Sender},
+    sync::Arc,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use super::latest_snapshot::{self, LatestReceiver};
+use super::{
+    control::{run_periodic, CollectorControl},
+    latest_snapshot::{self, LatestReceiver},
+};
 
 const PROC: &str = "/proc";
 
@@ -235,34 +238,31 @@ impl ProcessSnapshot {
 
 pub struct ProcessCollector {
     receiver: LatestReceiver<ProcessSnapshot>,
-    stop: Sender<()>,
+    control: Arc<CollectorControl>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ProcessCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let (stop, stop_rx) = mpsc::channel();
+        let control = Arc::new(CollectorControl::default());
+        let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("process-metrics".into())
             .spawn(move || {
                 let mut sampler = ProcessSampler::default();
 
-                loop {
-                    if !snapshot_tx.publish(sampler.collect()) {
-                        break;
-                    }
-
-                    match stop_rx.recv_timeout(refresh_rate) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
+                run_periodic(
+                    refresh_rate,
+                    &worker_control,
+                    || sampler.collect(),
+                    |snapshot| snapshot_tx.publish(snapshot),
+                );
             })?;
 
         Ok(Self {
             receiver,
-            stop,
+            control,
             worker: Some(worker),
         })
     }
@@ -274,7 +274,7 @@ impl ProcessCollector {
 
 impl Drop for ProcessCollector {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        self.control.stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
