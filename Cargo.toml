@@ -8,6 +8,8 @@ license = "MIT"
 repository = "https://github.com/Seqat/tuxctl"
 description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
 readme = "README.md"
+# Screenshots and development tooling are not needed to build from the crate.
+exclude = ["docs/screenshots/", "scripts/", ".github/"]
 
 
 [features]
