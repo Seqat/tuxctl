@@ -236,6 +236,8 @@ Run it with:
 cargo run
 ```
 
+Performance and smoke-test helpers for development live in [`scripts/`](scripts/README.md).
+
 ---
 
 ## Controls & Keybindings

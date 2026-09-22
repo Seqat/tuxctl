@@ -279,6 +279,8 @@ impl RedrawScheduler {
 
 fn draw_app(terminal: &mut TerminalSession, app: &mut App) -> io::Result<UiRegions> {
     let regions = terminal.draw(app)?;
+    #[cfg(feature = "redraw-counter")]
+    redraw_counter::record();
     if let Some((start, height)) = regions.process_viewport() {
         app.update(action::Action::ProcessViewportChanged { start, height });
     }
@@ -292,6 +294,31 @@ fn draw_app(terminal: &mut TerminalSession, app: &mut App) -> io::Result<UiRegio
         app.update(action::Action::NetworkViewportChanged { start, height });
     }
     Ok(regions)
+}
+
+/// Development-only render counter for `scripts/measure.py`.
+#[cfg(feature = "redraw-counter")]
+mod redraw_counter {
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            OnceLock,
+        },
+    };
+
+    static RENDERS: AtomicU64 = AtomicU64::new(0);
+    static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    /// Counts one render and rewrites the running total to `$TUXCTL_REDRAW_LOG`.
+    pub(super) fn record() {
+        let renders = RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
+        let path =
+            LOG_PATH.get_or_init(|| std::env::var_os("TUXCTL_REDRAW_LOG").map(PathBuf::from));
+        if let Some(path) = path {
+            let _ = std::fs::write(path, renders.to_string());
+        }
+    }
 }
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
