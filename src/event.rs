@@ -38,7 +38,7 @@ impl EventHandler {
             }
             if now >= self.next_tick {
                 self.next_tick = now + self.tick_rate;
-                return Ok(Some(Action::Tick));
+                return Ok(Some(Action::Tick(now)));
             }
 
             let deadline = redraw_deadline

@@ -40,7 +40,8 @@ fn main() -> io::Result<()> {
     }));
 
     let mut terminal = TerminalSession::new()?;
-    let mut app = App::default();
+    let mut app =
+        App::default().with_collector_periods(METRICS_REFRESH_RATE, SERVICES_REFRESH_RATE);
     let mut events = EventHandler::new(TICK_RATE);
     let metrics = match linux::SystemMetricsCollector::start(METRICS_REFRESH_RATE) {
         Ok(metrics) => metrics,

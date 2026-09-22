@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use crate::{
     action::{
@@ -8,7 +12,7 @@ use crate::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
         NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
         ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot,
-        SystemMetrics,
+        SystemMetrics, SYSTEMCTL_TIMEOUT,
     },
 };
 
@@ -17,6 +21,56 @@ use crate::linux::verify_and_send_signal_at;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
+
+/// Background collectors whose last update time is tracked for the stale marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collector {
+    Metrics,
+    Processes,
+    Network,
+    Services,
+}
+
+impl Collector {
+    const ALL: [Self; 4] = [
+        Self::Metrics,
+        Self::Processes,
+        Self::Network,
+        Self::Services,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Processes => "processes",
+            Self::Network => "network",
+            Self::Services => "services",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    fn shown_on(self, tab: Tab) -> bool {
+        match self {
+            Self::Metrics | Self::Processes => matches!(tab, Tab::Overview | Tab::Processes),
+            Self::Network => matches!(tab, Tab::Overview | Tab::Network),
+            Self::Services => tab == Tab::Services,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CollectorHealth {
+    /// Disabled until [`App::with_collector_periods`] configures a threshold.
+    stale_after: Option<Duration>,
+    /// Tick time at which data last arrived; the first tick is the baseline so a
+    /// collector that never publishes still becomes stale.
+    last_update: Option<Instant>,
+    updated_since_tick: bool,
+    stale: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -115,6 +169,7 @@ pub struct App {
     network_detail_visible: bool,
     network_error: Option<String>,
     hovered: Option<MouseTarget>,
+    collector_health: [CollectorHealth; 4],
 }
 
 impl Default for App {
@@ -172,11 +227,58 @@ impl Default for App {
             network_detail_visible: false,
             network_error: None,
             hovered: None,
+            collector_health: [CollectorHealth::default(); 4],
         }
     }
 }
 
 impl App {
+    /// Enables stale markers: a collector is stale after three missed periods.
+    /// Services also allow for a full `systemctl` timeout before being flagged.
+    pub fn with_collector_periods(mut self, sampling: Duration, services: Duration) -> Self {
+        for collector in Collector::ALL {
+            let threshold = match collector {
+                Collector::Services => services.saturating_mul(2) + SYSTEMCTL_TIMEOUT,
+                _ => sampling.saturating_mul(3),
+            };
+            self.collector_health[collector.index()].stale_after = Some(threshold);
+        }
+        self
+    }
+
+    /// Stale collectors whose data is shown on the active tab.
+    pub fn stale_collectors(&self) -> impl Iterator<Item = Collector> + '_ {
+        Collector::ALL.into_iter().filter(|collector| {
+            self.collector_health[collector.index()].stale && collector.shown_on(self.active_tab)
+        })
+    }
+
+    fn record_collector_update(&mut self, collector: Collector) {
+        self.collector_health[collector.index()].updated_since_tick = true;
+    }
+
+    /// Returns `true` only when a collector shown on the active tab changes
+    /// between fresh and stale.
+    fn check_collector_staleness(&mut self, now: Instant) -> bool {
+        let mut redraw = false;
+        for collector in Collector::ALL {
+            let health = &mut self.collector_health[collector.index()];
+            let Some(stale_after) = health.stale_after else {
+                continue;
+            };
+            if std::mem::take(&mut health.updated_since_tick) {
+                health.last_update = Some(now);
+            }
+            let last_update = *health.last_update.get_or_insert(now);
+            let stale = now.saturating_duration_since(last_update) > stale_after;
+            if stale != health.stale {
+                health.stale = stale;
+                redraw |= collector.shown_on(self.active_tab);
+            }
+        }
+        redraw
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -455,6 +557,7 @@ impl App {
                 false
             }
             Action::SystemMetricsUpdated(metrics) => {
+                self.record_collector_update(Collector::Metrics);
                 let process_metrics_changed = self.system_metrics.cpu_percent
                     != metrics.cpu_percent
                     || self.system_metrics.memory != metrics.memory;
@@ -479,10 +582,19 @@ impl App {
                     self.active_tab == Tab::Overview
                 }
             }
-            Action::ProcessesUpdated(snapshot) => self.update_processes(snapshot),
-            Action::ServicesUpdated(snapshot) => self.update_services(snapshot),
+            Action::ProcessesUpdated(snapshot) => {
+                self.record_collector_update(Collector::Processes);
+                self.update_processes(snapshot)
+            }
+            Action::ServicesUpdated(snapshot) => {
+                self.record_collector_update(Collector::Services);
+                self.update_services(snapshot)
+            }
             Action::LogsUpdated(batch) => self.update_logs(batch),
-            Action::NetworkUpdated(snapshot) => self.update_networks(snapshot),
+            Action::NetworkUpdated(snapshot) => {
+                self.record_collector_update(Collector::Network);
+                self.update_networks(snapshot)
+            }
             Action::ProcessViewportChanged { start, height } => {
                 self.process_view_height = height;
                 self.process_scroll = start;
@@ -515,6 +627,8 @@ impl App {
                     true
                 }
             }
+            // Staleness is global state, so it is checked even while a modal is open.
+            Action::Tick(now) => self.check_collector_staleness(now),
             Action::Escape => self.escape(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
@@ -603,7 +717,6 @@ impl App {
             Action::NetworkLast => self.select_network_index(self.networks.len().saturating_sub(1)),
             Action::SelectNetwork(name) => self.select_network(&name),
             Action::OpenNetworkDetails => self.open_network_details(),
-            Action::Tick => false,
         }
     }
 
@@ -2802,6 +2915,125 @@ mod tests {
         }
 
         assert_eq!(visible_pids(&app), vec![2, 4, 1, 3]);
+    }
+
+    const SAMPLING: Duration = Duration::from_secs(1);
+    const SERVICES_PERIOD: Duration = Duration::from_secs(5);
+
+    fn stale_names(app: &App) -> Vec<&'static str> {
+        app.stale_collectors().map(Collector::label).collect()
+    }
+
+    fn fresh_tick(app: &mut App, now: Instant) -> bool {
+        app.update(Action::SystemMetricsUpdated(SystemMetrics::default()));
+        app.update(Action::ProcessesUpdated(ProcessSnapshot::default()));
+        app.update(Action::NetworkUpdated(NetworkSnapshot::default()));
+        app.update(Action::ServicesUpdated(ServiceSnapshot::default()));
+        app.update(Action::Tick(now))
+    }
+
+    #[test]
+    fn staleness_is_disabled_without_configured_periods() {
+        let mut app = App::default();
+        let start = Instant::now();
+
+        app.update(Action::Tick(start));
+        assert!(!app.update(Action::Tick(start + Duration::from_secs(3600))));
+        assert!(stale_names(&app).is_empty());
+    }
+
+    #[test]
+    fn collector_becomes_stale_only_after_three_missed_periods() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(!app.update(Action::Tick(start + SAMPLING * 3)));
+        assert!(
+            stale_names(&app).is_empty(),
+            "exactly at the threshold is fresh"
+        );
+
+        assert!(app.update(Action::Tick(
+            start + SAMPLING * 3 + Duration::from_millis(1)
+        )));
+        assert_eq!(stale_names(&app), ["metrics", "processes", "network"]);
+    }
+
+    #[test]
+    fn stale_transitions_redraw_once_and_recovery_clears_the_marker() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        for seconds in 5..10 {
+            assert!(
+                !app.update(Action::Tick(start + Duration::from_secs(seconds))),
+                "no redraw while staying stale"
+            );
+        }
+
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "back",
+        )])));
+        assert!(app.update(Action::Tick(start + Duration::from_secs(10))));
+        assert_eq!(stale_names(&app), ["metrics", "network"]);
+    }
+
+    #[test]
+    fn hidden_collector_transitions_do_not_redraw() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        app.update(Action::SelectTab(Tab::Logs));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(!app.update(Action::Tick(start + Duration::from_secs(60))));
+        assert!(stale_names(&app).is_empty());
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert_eq!(stale_names(&app), ["services"]);
+    }
+
+    #[test]
+    fn services_threshold_exceeds_the_systemctl_timeout() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        app.update(Action::SelectTab(Tab::Services));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+        let slowest_healthy_gap = SERVICES_PERIOD + SYSTEMCTL_TIMEOUT;
+
+        assert!(!app.update(Action::Tick(start + slowest_healthy_gap)));
+        assert!(stale_names(&app).is_empty());
+        assert!(app.update(Action::Tick(
+            start + SERVICES_PERIOD * 2 + SYSTEMCTL_TIMEOUT + Duration::from_millis(1)
+        )));
+        assert_eq!(stale_names(&app), ["services"]);
+    }
+
+    #[test]
+    fn collector_that_never_publishes_becomes_stale_from_the_first_tick() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+
+        assert!(!app.update(Action::Tick(start)));
+        assert!(
+            stale_names(&app).is_empty(),
+            "starting collectors are not stale"
+        );
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        assert_eq!(stale_names(&app), ["metrics", "processes", "network"]);
+    }
+
+    #[test]
+    fn staleness_is_checked_while_a_modal_is_open() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+        app.update(Action::ShowHelp);
+
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        assert!(!stale_names(&app).is_empty());
     }
 
     #[test]

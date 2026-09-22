@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::{
     action::{InputMode, MouseTarget, ProcessSortField, Tab},
-    app::App,
+    app::{App, Collector},
     linux::ByteUsage,
 };
 
@@ -334,7 +334,14 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         return UiRegions::default();
     }
 
-    let outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    let mut outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    if let Some(marker) = stale_marker(app, area.width) {
+        outer = outer.title_top(
+            Line::from(marker)
+                .right_aligned()
+                .style(Style::default().fg(Color::Yellow)),
+        );
+    }
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -428,6 +435,22 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     }
 
     regions
+}
+
+/// Names the collectors behind this screen whose data stopped updating, falling
+/// back to a bare marker when the names would crowd the title.
+fn stale_marker(app: &App, width: u16) -> Option<String> {
+    let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let detailed = format!(" stale: {} ", names.join(", "));
+    let room = usize::from(width).saturating_sub(" tuxctl ".len() + 4);
+    Some(if detailed.chars().count() <= room {
+        detailed
+    } else {
+        " stale ".to_owned()
+    })
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -949,6 +972,36 @@ mod tests {
         }));
         app.update(Action::SelectTab(tab));
         app
+    }
+
+    #[test]
+    fn stale_marker_is_shown_in_the_frame_without_hiding_search_state() {
+        let mut app = App::default().with_collector_periods(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        );
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('x'));
+        let start = std::time::Instant::now();
+        app.update(Action::Tick(start));
+        app.update(Action::Tick(start + std::time::Duration::from_secs(10)));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" stale: metrics, processes "));
+        assert!(text.contains("Search: x_"));
+
+        app.update(Action::SelectTab(Tab::Overview));
+        let mut narrow = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        rendered_regions(&mut narrow, &app);
+        let text = buffer_text(&narrow);
+        assert!(
+            text.contains(" stale "),
+            "three names fall back to a bare marker"
+        );
+        assert!(text.contains(" tuxctl "));
     }
 
     #[test]
