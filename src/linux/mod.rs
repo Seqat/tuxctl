@@ -4,6 +4,7 @@ mod journal;
 mod latest_snapshot;
 mod network;
 mod process;
+mod rate;
 mod service;
 mod system;
 
