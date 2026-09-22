@@ -536,7 +536,7 @@ mod tests {
 
         assert!(!render_now);
         assert_eq!(pulled, 3, "all ready snapshots are drained in one turn");
-        assert_eq!(app.process_count(), 2);
+        assert_eq!(app.process_summary().total, 2);
         assert!(
             scheduler.take_due(now),
             "idle background data renders promptly"
