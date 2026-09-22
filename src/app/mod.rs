@@ -557,6 +557,16 @@ mod tests {
         OverlayKind::NetworkDetail,
     ];
 
+    /// The input mode of a tab with no overlay and no search in progress.
+    fn base_input_mode(tab: Tab) -> InputMode {
+        match tab {
+            Tab::Services => InputMode::Services,
+            Tab::Logs => InputMode::Logs,
+            Tab::Network => InputMode::Network,
+            Tab::Overview | Tab::Processes => InputMode::Normal,
+        }
+    }
+
     /// An app with data on every screen and `kind` open over its screen.
     fn app_with_overlay(kind: OverlayKind) -> App {
         let mut app = App::default();
@@ -620,6 +630,65 @@ mod tests {
             }
             assert_eq!(app.active_tab(), tab, "{kind:?}");
             assert_eq!(app.input_mode(), mode, "{kind:?}");
+        }
+    }
+
+    /// Current Esc order: close the overlay, else clear the tab's search or
+    /// filter, else do nothing. v0.3.0 opens the main menu in that last case.
+    #[test]
+    fn escape_with_nothing_to_close_does_nothing_on_every_tab() {
+        for tab in Tab::ALL {
+            let mut app = app_with_overlay(OverlayKind::Help);
+            app.update(Action::Escape);
+            app.update(Action::SelectTab(tab));
+
+            assert!(!app.update(Action::Escape), "{tab:?}");
+            assert_eq!(app.active_tab(), tab);
+            assert!(app.overlay.is_none());
+        }
+    }
+
+    #[test]
+    fn escape_clears_search_input_then_filter_on_searchable_tabs() {
+        let searches = [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                Action::AppendProcessSearch('i'),
+                Action::OpenProcessDetails,
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                Action::AppendServiceSearch('s'),
+                Action::OpenServiceDetails,
+            ),
+            (
+                Tab::Logs,
+                Action::BeginLogSearch,
+                Action::AppendLogSearch('b'),
+                Action::OpenLogDetails,
+            ),
+        ];
+        for (tab, begin, append, open_details) in searches {
+            let mut app = app_with_overlay(OverlayKind::Help);
+            app.update(Action::Escape);
+            app.update(Action::SelectTab(tab));
+
+            // Typing a query: Esc cancels input and clears the query.
+            app.update(begin.clone());
+            app.update(append.clone());
+            assert!(app.update(Action::Escape), "{tab:?} search input");
+            assert_eq!(app.input_mode(), base_input_mode(tab), "{tab:?}");
+
+            // A committed filter (detail opened, then closed): Esc clears it next.
+            app.update(begin);
+            app.update(append);
+            assert!(app.update(open_details), "{tab:?} details");
+            assert!(app.update(Action::Escape), "{tab:?} closes details first");
+            assert!(app.overlay.is_none());
+            assert!(app.update(Action::Escape), "{tab:?} clears the filter");
+            assert!(!app.update(Action::Escape), "{tab:?} has nothing left");
         }
     }
 

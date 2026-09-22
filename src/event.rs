@@ -220,92 +220,17 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         };
     }
 
-    if input_mode == InputMode::Services {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('1') => Some(Action::SelectTab(Tab::Overview)),
-            KeyCode::Char('2') => Some(Action::SelectTab(Tab::Processes)),
-            KeyCode::Char('3') => Some(Action::SelectTab(Tab::Services)),
-            KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
-            KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
-            KeyCode::Char('?') => Some(Action::ShowHelp),
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Up | KeyCode::Char('k') => Some(Action::ServicePrevious),
-            KeyCode::Down | KeyCode::Char('j') => Some(Action::ServiceNext),
-            KeyCode::PageUp => Some(Action::ServicePreviousPage),
-            KeyCode::PageDown => Some(Action::ServiceNextPage),
-            KeyCode::Home => Some(Action::ServiceFirst),
-            KeyCode::End => Some(Action::ServiceLast),
-            KeyCode::Char('/') => Some(Action::BeginServiceSearch),
-            KeyCode::Enter => Some(Action::OpenServiceDetails),
-            KeyCode::Char('r') => Some(Action::RefreshServices),
-            KeyCode::BackTab => Some(Action::PreviousTab),
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Some(Action::PreviousTab)
-            }
-            KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
-            KeyCode::Left => Some(Action::PreviousTab),
-            _ => None,
-        };
-    }
+    // Tab screens share the global keys; screen keys never shadow them (tested).
+    global_tab_key(key).or_else(|| match input_mode {
+        InputMode::Services => service_key(key),
+        InputMode::Logs => log_key(key),
+        InputMode::Network => network_key(key),
+        _ => process_key(key),
+    })
+}
 
-    if input_mode == InputMode::Logs {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('1') => Some(Action::SelectTab(Tab::Overview)),
-            KeyCode::Char('2') => Some(Action::SelectTab(Tab::Processes)),
-            KeyCode::Char('3') => Some(Action::SelectTab(Tab::Services)),
-            KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
-            KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
-            KeyCode::Char('?') => Some(Action::ShowHelp),
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Up | KeyCode::Char('k') => Some(Action::LogPrevious),
-            KeyCode::Down | KeyCode::Char('j') => Some(Action::LogNext),
-            KeyCode::PageUp => Some(Action::LogPreviousPage),
-            KeyCode::PageDown => Some(Action::LogNextPage),
-            KeyCode::Home => Some(Action::LogFirst),
-            KeyCode::End => Some(Action::LogLast),
-            KeyCode::Char('/') => Some(Action::BeginLogSearch),
-            KeyCode::Enter => Some(Action::OpenLogDetails),
-            KeyCode::Char('f') => Some(Action::ToggleLogFollow),
-            KeyCode::Char(' ') => Some(Action::ToggleLogPause),
-            KeyCode::BackTab => Some(Action::PreviousTab),
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Some(Action::PreviousTab)
-            }
-            KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
-            KeyCode::Left => Some(Action::PreviousTab),
-            _ => None,
-        };
-    }
-
-    if input_mode == InputMode::Network {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('1') => Some(Action::SelectTab(Tab::Overview)),
-            KeyCode::Char('2') => Some(Action::SelectTab(Tab::Processes)),
-            KeyCode::Char('3') => Some(Action::SelectTab(Tab::Services)),
-            KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
-            KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
-            KeyCode::Char('?') => Some(Action::ShowHelp),
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Up | KeyCode::Char('k') => Some(Action::NetworkPrevious),
-            KeyCode::Down | KeyCode::Char('j') => Some(Action::NetworkNext),
-            KeyCode::PageUp => Some(Action::NetworkPreviousPage),
-            KeyCode::PageDown => Some(Action::NetworkNextPage),
-            KeyCode::Home => Some(Action::NetworkFirst),
-            KeyCode::End => Some(Action::NetworkLast),
-            KeyCode::Enter => Some(Action::OpenNetworkDetails),
-            KeyCode::BackTab => Some(Action::PreviousTab),
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Some(Action::PreviousTab)
-            }
-            KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
-            KeyCode::Left => Some(Action::PreviousTab),
-            _ => None,
-        };
-    }
-
+/// Keys that behave the same on every tab screen.
+fn global_tab_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('1') => Some(Action::SelectTab(Tab::Overview)),
@@ -315,6 +240,17 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
         KeyCode::Char('?') => Some(Action::ShowHelp),
         KeyCode::Esc => Some(Action::Escape),
+        KeyCode::BackTab => Some(Action::PreviousTab),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::PreviousTab),
+        KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
+        KeyCode::Left => Some(Action::PreviousTab),
+        _ => None,
+    }
+}
+
+/// Overview and Processes (InputMode::Normal).
+fn process_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
         KeyCode::Char('t') => Some(Action::RequestProcessSignal(
             crate::linux::ProcessSignal::Term,
         )),
@@ -336,10 +272,50 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         KeyCode::Char('m') => Some(Action::SortProcesses(ProcessSortField::Memory)),
         KeyCode::Char('p') => Some(Action::SortProcesses(ProcessSortField::Pid)),
         KeyCode::Char('n') => Some(Action::SortProcesses(ProcessSortField::Name)),
-        KeyCode::BackTab => Some(Action::PreviousTab),
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::PreviousTab),
-        KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
-        KeyCode::Left => Some(Action::PreviousTab),
+        _ => None,
+    }
+}
+
+fn service_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ServicePrevious),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ServiceNext),
+        KeyCode::PageUp => Some(Action::ServicePreviousPage),
+        KeyCode::PageDown => Some(Action::ServiceNextPage),
+        KeyCode::Home => Some(Action::ServiceFirst),
+        KeyCode::End => Some(Action::ServiceLast),
+        KeyCode::Char('/') => Some(Action::BeginServiceSearch),
+        KeyCode::Enter => Some(Action::OpenServiceDetails),
+        KeyCode::Char('r') => Some(Action::RefreshServices),
+        _ => None,
+    }
+}
+
+fn log_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::LogPrevious),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::LogNext),
+        KeyCode::PageUp => Some(Action::LogPreviousPage),
+        KeyCode::PageDown => Some(Action::LogNextPage),
+        KeyCode::Home => Some(Action::LogFirst),
+        KeyCode::End => Some(Action::LogLast),
+        KeyCode::Char('/') => Some(Action::BeginLogSearch),
+        KeyCode::Enter => Some(Action::OpenLogDetails),
+        KeyCode::Char('f') => Some(Action::ToggleLogFollow),
+        KeyCode::Char(' ') => Some(Action::ToggleLogPause),
+        _ => None,
+    }
+}
+
+fn network_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::NetworkPrevious),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::NetworkNext),
+        KeyCode::PageUp => Some(Action::NetworkPreviousPage),
+        KeyCode::PageDown => Some(Action::NetworkNextPage),
+        KeyCode::Home => Some(Action::NetworkFirst),
+        KeyCode::End => Some(Action::NetworkLast),
+        KeyCode::Enter => Some(Action::OpenNetworkDetails),
         _ => None,
     }
 }
@@ -356,6 +332,157 @@ mod tests {
 
     fn no_regions() -> UiRegions {
         UiRegions::default()
+    }
+
+    const TAB_MODES: [InputMode; 4] = [
+        InputMode::Normal,
+        InputMode::Services,
+        InputMode::Logs,
+        InputMode::Network,
+    ];
+
+    /// Every printable ASCII key (plain and shifted) plus the special keys.
+    fn candidate_keys() -> Vec<KeyEvent> {
+        let mut keys: Vec<KeyEvent> = (0x20_u8..0x7f)
+            .flat_map(|byte| {
+                let code = KeyCode::Char(char::from(byte));
+                [
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    KeyEvent::new(code, KeyModifiers::SHIFT),
+                ]
+            })
+            .collect();
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+        ] {
+            keys.push(KeyEvent::new(code, KeyModifiers::NONE));
+            keys.push(KeyEvent::new(code, KeyModifiers::SHIFT));
+        }
+        keys
+    }
+
+    #[test]
+    fn screen_keys_never_shadow_global_tab_keys() {
+        let screens: [(&str, fn(KeyEvent) -> Option<Action>); 4] = [
+            ("processes", process_key),
+            ("services", service_key),
+            ("logs", log_key),
+            ("network", network_key),
+        ];
+        for key in candidate_keys() {
+            if global_tab_key(key).is_none() {
+                continue;
+            }
+            for (screen, screen_key) in screens {
+                assert_eq!(
+                    screen_key(key),
+                    None,
+                    "{screen} binds {key:?}, which is already a global key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_keys_behave_the_same_in_every_tab_mode() {
+        for key in candidate_keys() {
+            let Some(global) = global_tab_key(key) else {
+                continue;
+            };
+            for mode in TAB_MODES {
+                assert_eq!(
+                    translate_key_event(key, mode),
+                    Some(global.clone()),
+                    "{key:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// Maps a key as written in the README tables to a key event.
+    fn readme_key(token: &str) -> KeyEvent {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        match token {
+            "Tab" => plain(KeyCode::Tab),
+            "Shift+Tab" => plain(KeyCode::BackTab),
+            "→" => plain(KeyCode::Right),
+            "←" => plain(KeyCode::Left),
+            "↑" => plain(KeyCode::Up),
+            "↓" => plain(KeyCode::Down),
+            "PageUp" => plain(KeyCode::PageUp),
+            "PageDown" => plain(KeyCode::PageDown),
+            "Home" => plain(KeyCode::Home),
+            "End" => plain(KeyCode::End),
+            "Enter" => plain(KeyCode::Enter),
+            "Esc" => plain(KeyCode::Esc),
+            "Space" => plain(KeyCode::Char(' ')),
+            "Ctrl+C" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            "Shift+K" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT),
+            single if single.chars().count() == 1 => {
+                plain(KeyCode::Char(single.chars().next().unwrap()))
+            }
+            other => panic!("README key {other:?} has no mapping in readme_key()"),
+        }
+    }
+
+    #[test]
+    fn every_key_in_the_readme_tables_is_handled() {
+        let readme = include_str!("../README.md");
+        let controls = readme
+            .split("## Controls & Keybindings")
+            .nth(1)
+            .and_then(|rest| rest.split("### Mouse Controls").next())
+            .expect("README controls section");
+        let mut modes: &[InputMode] = &[];
+        let mut checked = 0;
+        for line in controls.lines() {
+            if let Some(heading) = line.trim_start_matches('#').strip_prefix(' ') {
+                if line.starts_with('#') {
+                    modes = match heading {
+                        "Global Controls" | "Navigation & Common Actions" => &TAB_MODES,
+                        "Processes" => &[InputMode::Normal],
+                        "Signal Confirmation" => &[InputMode::ProcessSignalConfirm],
+                        "Services" => &[InputMode::Services],
+                        "Logs" => &[InputMode::Logs],
+                        other => panic!("unknown README controls section {other:?}"),
+                    };
+                    continue;
+                }
+            }
+            let Some(keys) = line.strip_prefix("| `") else {
+                continue;
+            };
+            let first_column = keys.split(" | ").next().unwrap_or_default();
+            for token in format!("`{first_column}").split('`').skip(1).step_by(2) {
+                let key = readme_key(token);
+                for &mode in modes {
+                    // The Network screen has no search; the README lists `/` as common.
+                    if token == "/" && mode == InputMode::Network {
+                        continue;
+                    }
+                    assert!(
+                        translate_key_event(key, mode).is_some(),
+                        "README documents `{token}` but {mode:?} ignores it"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "only {checked} README keys were checked");
     }
 
     #[test]
