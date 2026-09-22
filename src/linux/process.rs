@@ -705,6 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn exited_processes_are_evicted_from_cpu_tick_baselines() {
+        let proc_dir = temp_proc_dir("ticks_evict");
+        let _cleanup = TempDir(proc_dir.clone());
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(proc_dir.join("stat"), "cpu  10 20 30 40\ncpu0 1 2\n").unwrap();
+        write_process_stat(&proc_dir, 10, "short", 500);
+        write_process_stat(&proc_dir, 11, "long", 600);
+        let mut sampler = ProcessSampler::default();
+        sampler.collect_at(&proc_dir);
+        assert_eq!(sampler.previous_process_ticks.len(), 2);
+
+        fs::remove_dir_all(proc_dir.join("10")).unwrap();
+        sampler.collect_at(&proc_dir);
+
+        assert_eq!(
+            sampler.previous_process_ticks.keys().collect::<Vec<_>>(),
+            [&ProcessIdentity {
+                pid: 11,
+                start_time: 600
+            }]
+        );
+    }
+
+    #[test]
     fn kernel_threads_without_a_command_are_not_retried() {
         let proc_dir = temp_proc_dir("cmdline_kthread");
         let _cleanup = TempDir(proc_dir.clone());
