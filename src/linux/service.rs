@@ -1,14 +1,18 @@
 use std::{
-    io,
-    process::Command,
+    io::{self, Read},
+    process::{Child, Command, Output, Stdio},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::latest_snapshot::{self, LatestReceiver};
 
 pub type ServiceRefreshGeneration = u64;
+
+/// Upper bound for one `systemctl` listing; a hung D-Bus call must not wedge the collector.
+pub const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceInfo {
@@ -65,6 +69,16 @@ impl CollectorControl {
         state.stop = true;
         drop(state);
         self.wake.notify_one();
+    }
+
+    /// Sleeps for up to `timeout`, returning early with `true` once a stop is requested.
+    fn stopped_within(&self, timeout: Duration) -> bool {
+        let state = lock(&self.state);
+        let (state, _) = self
+            .wake
+            .wait_timeout_while(state, timeout, |state| !state.stop)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stop
     }
 
     fn wait(&self, timeout: Duration) -> CollectorWake {
@@ -125,7 +139,7 @@ impl ServiceCollector {
                 run_collector(
                     refresh_rate,
                     &worker_control,
-                    collect_services,
+                    || collect_services(&worker_control),
                     |snapshot| snapshot_tx.publish(snapshot),
                 );
             })?;
@@ -184,8 +198,9 @@ fn run_collector(
     }
 }
 
-fn collect_services() -> ServiceSnapshot {
-    let output = match Command::new("systemctl")
+fn collect_services(control: &CollectorControl) -> ServiceSnapshot {
+    let mut command = Command::new("systemctl");
+    command
         .args([
             "--system",
             "--no-pager",
@@ -197,11 +212,19 @@ fn collect_services() -> ServiceSnapshot {
             "*.service",
         ])
         .env("SYSTEMD_COLORS", "0")
-        .env("LC_ALL", "C")
-        .output()
-    {
+        .env("LC_ALL", "C");
+
+    let output = match run_with_deadline(command, SYSTEMCTL_TIMEOUT, control) {
         Ok(output) => output,
-        Err(error) => return ServiceSnapshot::error(format!("cannot run systemctl: {error}")),
+        Err(CommandError::Spawn(error)) => {
+            return ServiceSnapshot::error(format!("cannot run systemctl: {error}"))
+        }
+        Err(CommandError::TimedOut) => {
+            return ServiceSnapshot::error("systemctl timed out".to_owned())
+        }
+        Err(CommandError::Stopped) => {
+            return ServiceSnapshot::error("systemctl collection stopped".to_owned())
+        }
     };
 
     if !output.status.success() {
@@ -220,6 +243,89 @@ fn collect_services() -> ServiceSnapshot {
         error: None,
         completed_refresh_generation: 0,
     }
+}
+
+#[derive(Debug)]
+enum CommandError {
+    Spawn(io::Error),
+    TimedOut,
+    Stopped,
+}
+
+/// Runs `command` to completion, killing it on timeout or collector stop.
+///
+/// Both pipes are drained on helper threads so a large listing cannot fill a pipe
+/// buffer and deadlock the child while this thread waits for it to exit.
+fn run_with_deadline(
+    mut command: Command,
+    timeout: Duration,
+    control: &CollectorControl,
+) -> Result<Output, CommandError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(CommandError::Spawn)?;
+    let stdout = drain_pipe(child.stdout.take(), "systemctl-stdout");
+    let stderr = drain_pipe(child.stderr.take(), "systemctl-stderr");
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            kill_and_reap(&mut child);
+            let error = [stdout.err(), stderr.err()].into_iter().flatten().next();
+            return Err(CommandError::Spawn(error.unwrap_or_else(|| {
+                io::Error::other("cannot read systemctl output")
+            })));
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(CommandError::Spawn(error)),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(CommandError::TimedOut);
+        }
+        if control.stopped_within(remaining.min(COMMAND_POLL_INTERVAL)) {
+            break Err(CommandError::Stopped);
+        }
+    };
+
+    if outcome.is_err() {
+        kill_and_reap(&mut child);
+    }
+    // The child has exited or been reaped, so both pipe writers are closed and the
+    // readers finish promptly.
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    outcome.map(|status| Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn drain_pipe(
+    pipe: Option<impl Read + Send + 'static>,
+    name: &str,
+) -> io::Result<JoinHandle<Vec<u8>>> {
+    thread::Builder::new().name(name.into()).spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    })
+}
+
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl ServiceSnapshot {
@@ -358,6 +464,112 @@ mod tests {
 
         assert_eq!(first.completed_refresh_generation, 0);
         assert_eq!(second.completed_refresh_generation, 0);
+    }
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn hung_command_times_out_and_is_killed() {
+        let control = CollectorControl::default();
+        let started = Instant::now();
+
+        let result = run_with_deadline(shell("sleep 30"), Duration::from_millis(200), &control);
+
+        assert!(matches!(result, Err(CommandError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stop_during_collection_aborts_the_command_promptly() {
+        let control = Arc::new(CollectorControl::default());
+        let worker_control = Arc::clone(&control);
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            run_with_deadline(shell("sleep 30"), Duration::from_secs(60), &worker_control)
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        control.stop();
+
+        assert!(matches!(worker.join().unwrap(), Err(CommandError::Stopped)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
+        let control = CollectorControl::default();
+
+        let output = run_with_deadline(
+            shell(
+                "i=0; while [ $i -lt 20000 ]; do echo line-$i; echo err-$i >&2; i=$((i+1)); done",
+            ),
+            Duration::from_secs(30),
+            &control,
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 128 * 1024);
+        assert!(output.stderr.len() > 64 * 1024);
+        assert!(String::from_utf8_lossy(&output.stdout).ends_with("line-19999\n"));
+    }
+
+    #[test]
+    fn failing_command_reports_status_and_stderr() {
+        let control = CollectorControl::default();
+
+        let output = run_with_deadline(
+            shell("echo boom >&2; exit 3"),
+            Duration::from_secs(10),
+            &control,
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr, b"boom\n");
+    }
+
+    #[test]
+    fn missing_program_is_a_spawn_error() {
+        let control = CollectorControl::default();
+
+        let result = run_with_deadline(
+            Command::new("/nonexistent/tuxctl-systemctl"),
+            Duration::from_secs(1),
+            &control,
+        );
+
+        assert!(matches!(result, Err(CommandError::Spawn(_))));
+    }
+
+    #[test]
+    fn collector_stop_during_a_hung_collection_joins_promptly() {
+        let control = Arc::new(CollectorControl::default());
+        let worker_control = Arc::clone(&control);
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_collector(
+                Duration::from_secs(60),
+                &worker_control,
+                || match run_with_deadline(shell("sleep 30"), SYSTEMCTL_TIMEOUT, &worker_control) {
+                    Ok(_) => ServiceSnapshot::default(),
+                    Err(_) => ServiceSnapshot::error("stopped".into()),
+                },
+                |snapshot| snapshot_tx.send(snapshot).is_ok(),
+            );
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        control.stop();
+        worker.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(snapshot_rx.recv().unwrap().error.is_some());
     }
 
     #[test]
