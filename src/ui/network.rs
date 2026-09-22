@@ -274,6 +274,8 @@ pub(super) fn state_display(state: OperState) -> (&'static str, Style) {
         ),
         OperState::Down => ("○ down", Style::default().fg(Color::DarkGray)),
         OperState::Dormant => ("◌ dormant", Style::default().fg(Color::Yellow)),
+        // Loopback and many virtual links legitimately report "unknown"; it is not a warning.
+        OperState::Unknown => ("◌ unknown", Style::default()),
         _ => (state.as_str(), Style::default().fg(Color::Yellow)),
     }
 }

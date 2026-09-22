@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -103,16 +103,12 @@ fn render_system(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     if let Some(usage) = metrics.root_filesystem.filter(|_| has_gauge) {
-        let percent = usage.percent();
-        let label = layout::truncate(
-            &format!("/  {filesystem}  {percent:.0}%"),
-            usize::from(inner.width),
-        );
         frame.render_widget(
-            Gauge::default()
-                .gauge_style(Style::default().fg(Color::Cyan))
-                .ratio((percent / 100.0).clamp(0.0, 1.0))
-                .label(label),
+            Paragraph::new(hardware::usage_bar_line(
+                "/  ",
+                usage,
+                usize::from(inner.width),
+            )),
             Rect::new(inner.x, inner.y.saturating_add(text_height), inner.width, 1),
         );
     }
