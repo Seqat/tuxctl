@@ -14,6 +14,8 @@ use super::{
 };
 
 const PROC: &str = "/proc";
+/// `PF_KTHREAD` in the `flags` field of /proc/<pid>/stat.
+const PF_KTHREAD: u64 = 0x0020_0000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessInfo {
@@ -26,6 +28,8 @@ pub struct ProcessInfo {
     pub parent_pid: u32,
     pub(crate) state_code: char,
     pub(crate) start_time: u64,
+    /// A kernel thread (no user-space program); false when unknown.
+    pub kernel_thread: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -380,6 +384,7 @@ impl ProcessSampler {
                 parent_pid: process.parent_pid,
                 state_code: process.state,
                 start_time: process.start_time,
+                kernel_thread: process.kernel_thread,
             });
         }
 
@@ -405,6 +410,7 @@ struct RawProcess {
     start_time: u64,
     memory_bytes: u64,
     command: Option<String>,
+    kernel_thread: bool,
 }
 
 fn read_process(path: &Path, expected_pid: u32, page_size: u64) -> Option<RawProcess> {
@@ -457,6 +463,10 @@ fn parse_process_stat(contents: &str, page_size: u64) -> Option<RawProcess> {
 
     let state = fields[0].chars().next()?;
     let parent_pid = fields[1].parse::<u32>().ok()?;
+    // Unparsable flags only lose the kernel-thread hint; the process is kept.
+    let kernel_thread = fields[6]
+        .parse::<u64>()
+        .is_ok_and(|flags| flags & PF_KTHREAD != 0);
     let user_ticks = fields[11].parse::<u64>().ok()?;
     let system_ticks = fields[12].parse::<u64>().ok()?;
     let start_time = fields[19].parse::<u64>().ok()?;
@@ -474,6 +484,7 @@ fn parse_process_stat(contents: &str, page_size: u64) -> Option<RawProcess> {
         start_time,
         memory_bytes,
         command: None,
+        kernel_thread,
     })
 }
 
@@ -711,6 +722,32 @@ mod tests {
         );
     }
 
+    /// A stat line for pid 42 with the given `flags` field (the 9th field).
+    fn stat_line_with_flags(flags: &str) -> String {
+        format!("42 (worker) S 7 0 0 0 0 {flags} 0 0 0 0 120 30 0 0 0 0 0 0 900 0 25")
+    }
+
+    #[test]
+    fn kernel_threads_are_detected_from_stat_flags() {
+        // kthreadd's typical flags: PF_KTHREAD | PF_NOFREEZE | PF_FORKNOEXEC.
+        let kernel = parse_process_stat(&stat_line_with_flags("2129984"), 4096).unwrap();
+        assert!(kernel.kernel_thread);
+
+        // A typical user process (PF_RANDOMIZE only), as read from /proc/self/stat.
+        let user = parse_process_stat(&stat_line_with_flags("4194304"), 4096).unwrap();
+        assert!(!user.kernel_thread);
+    }
+
+    #[test]
+    fn malformed_stat_flags_keep_the_process_as_a_user_process() {
+        let process = parse_process_stat(&stat_line_with_flags("not-a-number"), 4096)
+            .expect("unparsable flags must not drop the process");
+
+        assert!(!process.kernel_thread);
+        assert_eq!(process.pid, 42);
+        assert_eq!(process.start_time, 900);
+    }
+
     #[test]
     fn parses_process_stat_with_spaces_and_parentheses_in_name() {
         let process = parse_process_stat(&stat_line("worker (pool)"), 4096).unwrap();
@@ -743,6 +780,7 @@ mod tests {
             parent_pid: 1,
             state_code,
             start_time: u64::from(pid),
+            kernel_thread: false,
         };
         let snapshot = ProcessSnapshot {
             processes: vec![

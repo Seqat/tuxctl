@@ -1,5 +1,7 @@
+mod about;
 mod action;
 mod app;
+mod cli;
 mod event;
 mod linux;
 mod ui;
@@ -17,19 +19,35 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
+use app::{App, CollectorPeriods};
 use event::EventHandler;
 use ui::UiRegions;
 
 const TICK_RATE: Duration = Duration::from_millis(250);
-const METRICS_REFRESH_RATE: Duration = Duration::from_secs(1);
-const SERVICES_REFRESH_RATE: Duration = Duration::from_secs(5);
 const HOVER_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const BACKGROUND_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 /// Upper bound on actions applied before the loop renders or blocks again.
 const MAX_ACTIONS_PER_TURN: usize = 16;
 
 fn main() -> io::Result<()> {
+    // Arguments are handled before the terminal is touched.
+    let interval = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::Run { interval }) => interval,
+        Ok(cli::Command::Help) => {
+            print!("{}", cli::help_text());
+            return Ok(());
+        }
+        Ok(cli::Command::Version) => {
+            println!("{}", cli::version_text());
+            return Ok(());
+        }
+        Err(message) => {
+            eprintln!("tuxctl: {message}\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    let periods = CollectorPeriods::for_sampling_interval(interval);
+
     let main_thread = std::thread::current().id();
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -40,26 +58,25 @@ fn main() -> io::Result<()> {
     }));
 
     let mut terminal = TerminalSession::new()?;
-    let mut app =
-        App::default().with_collector_periods(METRICS_REFRESH_RATE, SERVICES_REFRESH_RATE);
+    let mut app = App::default().with_collector_periods(periods);
     let mut events = EventHandler::new(TICK_RATE);
-    let metrics = match linux::SystemMetricsCollector::start(METRICS_REFRESH_RATE) {
+    let metrics = match linux::SystemMetricsCollector::start(periods.metrics) {
         Ok(metrics) => metrics,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
-    let processes = match linux::ProcessCollector::start(METRICS_REFRESH_RATE) {
+    let processes = match linux::ProcessCollector::start(periods.processes) {
         Ok(processes) => processes,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
     // Services only collect while their tab is visible; journalctl starts on
     // the first visit to Logs.
     let mut services_paused = !app.services_visible();
-    let services = match linux::ServiceCollector::start(SERVICES_REFRESH_RATE, services_paused) {
+    let services = match linux::ServiceCollector::start(periods.services, services_paused) {
         Ok(services) => services,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
     let mut journal: Option<linux::JournalCollector> = None;
-    let network = match linux::NetworkCollector::start(METRICS_REFRESH_RATE) {
+    let network = match linux::NetworkCollector::start(periods.network) {
         Ok(network) => network,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
@@ -279,6 +296,8 @@ impl RedrawScheduler {
 
 fn draw_app(terminal: &mut TerminalSession, app: &mut App) -> io::Result<UiRegions> {
     let regions = terminal.draw(app)?;
+    #[cfg(feature = "redraw-counter")]
+    redraw_counter::record();
     if let Some((start, height)) = regions.process_viewport() {
         app.update(action::Action::ProcessViewportChanged { start, height });
     }
@@ -292,6 +311,31 @@ fn draw_app(terminal: &mut TerminalSession, app: &mut App) -> io::Result<UiRegio
         app.update(action::Action::NetworkViewportChanged { start, height });
     }
     Ok(regions)
+}
+
+/// Development-only render counter for `scripts/measure.py`.
+#[cfg(feature = "redraw-counter")]
+mod redraw_counter {
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            OnceLock,
+        },
+    };
+
+    static RENDERS: AtomicU64 = AtomicU64::new(0);
+    static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    /// Counts one render and rewrites the running total to `$TUXCTL_REDRAW_LOG`.
+    pub(super) fn record() {
+        let renders = RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
+        let path =
+            LOG_PATH.get_or_init(|| std::env::var_os("TUXCTL_REDRAW_LOG").map(PathBuf::from));
+        if let Some(path) = path {
+            let _ = std::fs::write(path, renders.to_string());
+        }
+    }
 }
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -508,6 +552,7 @@ mod tests {
                     parent_pid: 1,
                     state_code: 'S',
                     start_time: u64::from(pid),
+                    kernel_thread: false,
                 })
                 .collect(),
             error: None,
@@ -519,6 +564,7 @@ mod tests {
             entries: vec![crate::linux::JournalEntry {
                 id,
                 timestamp_micros: None,
+                local_time: None,
                 source: "test".into(),
                 priority: Some(6),
                 message: format!("entry {id}"),

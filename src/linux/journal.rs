@@ -12,6 +12,8 @@ use std::{
 
 use serde_json::Value;
 
+use super::localtime::LocalTime;
+
 const CHANNEL_CAPACITY: usize = 512;
 const JOURNAL_MAX_BATCH: usize = 64;
 
@@ -19,6 +21,8 @@ const JOURNAL_MAX_BATCH: usize = 64;
 pub struct JournalEntry {
     pub id: u64,
     pub timestamp_micros: Option<u64>,
+    /// Precomputed on the journal thread so rendering never calls into libc.
+    pub local_time: Option<LocalTime>,
     pub source: String,
     pub priority: Option<u8>,
     pub message: String,
@@ -259,8 +263,11 @@ fn read_journal<R, E>(
 
 fn parse_journal_json(line: &str, id: u64) -> Option<JournalEntry> {
     let object = serde_json::from_str::<Value>(line).ok()?;
-    let timestamp_micros =
+    let timestamp_micros: Option<u64> =
         field(&object, "__REALTIME_TIMESTAMP").and_then(|value| value.parse().ok());
+    let local_time = timestamp_micros
+        .and_then(|micros| i64::try_from(micros / 1_000_000).ok())
+        .and_then(LocalTime::from_unix_seconds);
     let source = [
         "_SYSTEMD_UNIT",
         "_SYSTEMD_USER_UNIT",
@@ -276,6 +283,7 @@ fn parse_journal_json(line: &str, id: u64) -> Option<JournalEntry> {
     Some(JournalEntry {
         id,
         timestamp_micros,
+        local_time,
         source,
         priority,
         message,
@@ -294,6 +302,7 @@ mod tests {
         JournalEntry {
             id,
             timestamp_micros: Some(id),
+            local_time: None,
             source: "test".into(),
             priority: Some(6),
             message: format!("entry {id}"),

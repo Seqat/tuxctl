@@ -12,6 +12,7 @@ use std::{
 use super::{
     control::{run_periodic, CollectorControl},
     latest_snapshot::{self, LatestReceiver},
+    rate::CounterSample,
 };
 
 const PROC_NET_DEV: &str = "/proc/net/dev";
@@ -81,41 +82,8 @@ pub struct NetworkSnapshot {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct InterfacePrev {
-    rx_bytes: u64,
-    tx_bytes: u64,
-    timestamp: Instant,
-}
-
-fn calculate_transfer_rates(
-    previous: Option<&InterfacePrev>,
-    rx_bytes: u64,
-    tx_bytes: u64,
-    now: Instant,
-) -> (Option<f64>, Option<f64>) {
-    let Some(previous) = previous else {
-        return (None, None);
-    };
-    let elapsed = now
-        .saturating_duration_since(previous.timestamp)
-        .as_secs_f64();
-    if elapsed < 0.001 {
-        return (None, None);
-    }
-
-    let rate = |previous: u64, current: u64| {
-        Some(
-            current
-                .checked_sub(previous)
-                .map_or(0.0, |delta| delta as f64 / elapsed),
-        )
-    };
-    (
-        rate(previous.rx_bytes, rx_bytes),
-        rate(previous.tx_bytes, tx_bytes),
-    )
-}
+/// RX/TX byte counters of one interface at one sample.
+type InterfacePrev = CounterSample<2>;
 
 #[derive(Default)]
 pub struct NetworkSampler {
@@ -197,17 +165,10 @@ impl NetworkSampler {
             let ipv6 = ipv6_map.remove(&name).unwrap_or_default();
 
             let (rx_rate, tx_rate) = if stats.is_some() {
-                let rates =
-                    calculate_transfer_rates(self.previous.get(&name), rx_bytes, tx_bytes, now);
-                next_previous.insert(
-                    name.clone(),
-                    InterfacePrev {
-                        rx_bytes,
-                        tx_bytes,
-                        timestamp: now,
-                    },
-                );
-                rates
+                let sample = InterfacePrev::new([rx_bytes, tx_bytes], now);
+                let [rx_rate, tx_rate] = sample.rates_since(self.previous.get(&name));
+                next_previous.insert(name.clone(), sample);
+                (rx_rate, tx_rate)
             } else {
                 (None, None)
             };
@@ -445,63 +406,6 @@ docker0:   16306     214    0    0    0     0          0         0   593023    1
         assert_eq!(OperState::from_sys("notpresent"), OperState::NotPresent);
         assert_eq!(OperState::from_sys("unknown"), OperState::Unknown);
         assert_eq!(OperState::from_sys("custom"), OperState::Unknown);
-    }
-
-    #[test]
-    fn first_sample_has_no_transfer_rate() {
-        let t0 = Instant::now();
-
-        assert_eq!(
-            calculate_transfer_rates(None, 1_000_000, 500_000, t0),
-            (None, None)
-        );
-    }
-
-    #[test]
-    fn calculates_transfer_rates_from_counter_and_elapsed_deltas() {
-        let t0 = Instant::now();
-        let previous = InterfacePrev {
-            rx_bytes: 1_000_000,
-            tx_bytes: 500_000,
-            timestamp: t0,
-        };
-
-        let t1 = t0 + Duration::from_secs(2);
-        let rx_now = 1_000_000 + 2_097_152;
-        let tx_now = 500_000 + 1_048_576;
-        let (rx_rate, tx_rate) = calculate_transfer_rates(Some(&previous), rx_now, tx_now, t1);
-
-        assert_eq!(rx_rate, Some(1_048_576.0));
-        assert_eq!(tx_rate, Some(524_288.0));
-    }
-
-    #[test]
-    fn suppresses_rates_when_elapsed_time_is_too_short() {
-        let t0 = Instant::now();
-        let previous = InterfacePrev {
-            rx_bytes: 100,
-            tx_bytes: 200,
-            timestamp: t0,
-        };
-
-        assert_eq!(
-            calculate_transfer_rates(Some(&previous), 200, 300, t0 + Duration::from_micros(999),),
-            (None, None)
-        );
-    }
-
-    #[test]
-    fn counter_decrease_resets_the_corresponding_rate_to_zero() {
-        let t0 = Instant::now();
-        let previous = InterfacePrev {
-            rx_bytes: 10_000,
-            tx_bytes: 5_000,
-            timestamp: t0,
-        };
-        let rates =
-            calculate_transfer_rates(Some(&previous), 100, 5_500, t0 + Duration::from_secs(1));
-
-        assert_eq!(rates, (Some(0.0), Some(500.0)));
     }
 
     #[test]

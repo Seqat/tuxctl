@@ -14,3 +14,10 @@ docs/ROADMAP.md
 # Editor / OS files
 .DS_Store
 Thumbs.db
+
+# Cache Folders
+__pycache__
+.venv
+node_modules
+# Python bytecode from scripts/
+__pycache__/

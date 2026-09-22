@@ -76,6 +76,7 @@ It provides real-time system monitoring, process management, systemd service ins
 ### Logs
 
 - Streaming systemd journal viewer using `journalctl`, started the first time the Logs tab is opened.
+- Timestamps in local time (`HH:MM:SS` in the table; full date and UTC offset in the detail view).
 - Bounded log storage to prevent unbounded memory growth.
 - Bounded journal ingestion with dropped-entry accounting under sustained load.
 - Follow mode (`f`).
@@ -230,11 +231,25 @@ Run it with:
 ./target/release/tuxctl
 ```
 
+### Command-Line Options
+
+```text
+tuxctl [--interval <DURATION>]
+```
+
+| Option | Description |
+| --- | --- |
+| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. |
+| `-h`, `--help` | Print help. |
+| `-V`, `--version` | Print the version. |
+
 ### Development Mode
 
 ```sh
 cargo run
 ```
+
+Performance and smoke-test helpers for development live in [`scripts/`](scripts/README.md).
 
 ---
 
@@ -319,6 +334,7 @@ Repeated sort commands toggle the sort direction.
 - Background snapshots that arrive together are applied before a single redraw, and background redraws are limited to one every 50 ms; keyboard, mouse, and resize still redraw immediately.
 - `systemctl` listings are bounded by a 10 second timeout, so a hung call cannot stall the Services tab or exit.
 - `systemctl` and `journalctl` are not run until the Services or Logs tab is opened; Services collection pauses again while its tab is hidden.
+- Status lines keep an active search or filter visible; messages and errors are shown after it, never instead of it.
 - If a collector stops delivering data, the frame title shows a `stale` marker for the affected screen instead of presenting frozen data as live.
 - Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
 - Inactive screens can update cached state without forcing unnecessary redraws.

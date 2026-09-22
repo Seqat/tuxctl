@@ -1,6 +1,6 @@
 [package]
 name = "tuxctl"
-version = "0.2.2"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Seqat"]
@@ -9,6 +9,11 @@ repository = "https://github.com/Seqat/tuxctl"
 description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
 readme = "README.md"
 
+
+[features]
+# Development only: count renders and write the total to $TUXCTL_REDRAW_LOG
+# (used by scripts/measure.py). Off by default and compiled out when disabled.
+redraw-counter = []
 
 [dependencies]
 crossterm = "0.28"
