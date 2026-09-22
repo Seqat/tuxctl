@@ -377,7 +377,8 @@ mod tests {
 
     #[test]
     fn screen_keys_never_shadow_global_tab_keys() {
-        let screens: [(&str, fn(KeyEvent) -> Option<Action>); 4] = [
+        type ScreenKeys = fn(KeyEvent) -> Option<Action>;
+        let screens: [(&str, ScreenKeys); 4] = [
             ("processes", process_key),
             ("services", service_key),
             ("logs", log_key),
