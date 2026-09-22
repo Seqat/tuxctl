@@ -2,6 +2,7 @@
 name = "tuxctl"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Seqat"]
 license = "MIT"
 repository = "https://github.com/Seqat/tuxctl"

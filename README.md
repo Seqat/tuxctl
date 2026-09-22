@@ -179,7 +179,7 @@ It provides real-time system monitoring, process management, systemd service ins
 - **Runtime utilities:**
   - `systemctl` for the **Services** tab.
   - `journalctl` for the **Logs** tab.
-- **Rust:** Rust 2021-compatible toolchain for building from source.
+- **Rust:** Rust 1.88 or newer for building from source.
 
 > Process signaling uses Linux pidfds for PID-safe signal delivery. If the required pidfd operations are unavailable or denied, `tuxctl` fails closed instead of falling back to unsafe PID-only signaling.
 
