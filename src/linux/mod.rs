@@ -7,7 +7,7 @@ mod service;
 mod system;
 
 #[cfg(test)]
-pub(crate) use hardware::NetworkDevice;
+pub(crate) use hardware::{CpuPackage, GpuDevice, NetworkDevice};
 pub use hardware::{
     GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
 };

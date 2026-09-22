@@ -506,12 +506,10 @@ fn render_tabs(
             Style::default()
         };
 
-        let label = if usize::from(area.width) >= tab.label().chars().count().saturating_add(2) {
-            format!(" {} ", tab.label())
-        } else {
-            tab.label().to_owned()
-        };
-        frame.render_widget(Paragraph::new(label).style(style), area);
+        frame.render_widget(
+            Paragraph::new(layout::tab_text(tab, area.width)).style(style),
+            area,
+        );
     }
 
     if tabs_area.width >= 75 {
@@ -1004,6 +1002,248 @@ mod tests {
         assert!(text.contains(" tuxctl "));
     }
 
+    fn overview_sweep_app(cpu_count: u32) -> App {
+        let mut app = App::default();
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            cpu_percent: Some(21.0),
+            logical_cpus: (0..cpu_count)
+                .map(|index| LogicalCpuMetrics {
+                    id: LogicalCpuId::for_test(index),
+                    utilization_percent: Some(f64::from(index % 100)),
+                })
+                .collect(),
+            memory: Some(ByteUsage {
+                used: 4 << 30,
+                total: 16 << 30,
+            }),
+            root_filesystem: Some(ByteUsage {
+                used: 50 << 30,
+                total: 100 << 30,
+            }),
+            ..SystemMetrics::default()
+        }));
+        let module = crate::linux::MemoryModule {
+            locator: None,
+            capacity_bytes: 8 << 30,
+            memory_type: Some("DDR5".into()),
+            speed_mts: Some(5600),
+            manufacturer: None,
+            part_number: None,
+        };
+        app.update(Action::HardwareDiscovered(
+            crate::linux::HardwareInventory {
+                cpus: vec![crate::linux::CpuPackage {
+                    physical_id: Some(0),
+                    model: "Test Processor".into(),
+                }],
+                memory_modules: vec![module.clone(), module],
+                gpus: vec![crate::linux::GpuDevice {
+                    model: "Test Graphics".into(),
+                    kind: None,
+                    vram_bytes: None,
+                }],
+                storage_devices: vec![crate::linux::StorageDevice {
+                    system_name: "nvme0n1".into(),
+                    kind: crate::linux::StorageKind::Nvme,
+                    model: Some("Test Disk".into()),
+                    capacity_bytes: Some(1_000_000_000_000),
+                }],
+                network_devices: vec![crate::linux::NetworkDevice {
+                    interface_name: "eth0".into(),
+                    model: None,
+                }],
+            },
+        ));
+        app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+            interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                name: "eth0".into(),
+                operstate: crate::linux::OperState::Up,
+                mac_address: None,
+                mtu: None,
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: 0,
+                tx_packets: 0,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                rx_rate_bytes_per_sec: None,
+                tx_rate_bytes_per_sec: None,
+            }],
+            error: None,
+        }));
+        app
+    }
+
+    /// Content rows inside the Hardware panel, located by its title.
+    fn hardware_panel_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let rows: Vec<Vec<&str>> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let Some((top, left)) = rows.iter().enumerate().find_map(|(y, row)| {
+            let line: String = row.concat();
+            let title = line.find(" Hardware ")?;
+            let title_column = line[..title].chars().count();
+            let left = (0..title_column).rev().find(|&x| row[x] == "┌")?;
+            Some((y, left))
+        }) else {
+            return Vec::new();
+        };
+        let right = (left + 1..width).find(|&x| rows[top][x] == "┐").unwrap();
+        rows[top + 1..]
+            .iter()
+            .take_while(|row| row[left] != "└")
+            .map(|row| row[left + 1..right].concat())
+            .collect()
+    }
+
+    fn shown_cpu_labels(rows: &[String]) -> Vec<u32> {
+        let mut labels = Vec::new();
+        for row in rows {
+            let mut rest = row.as_str();
+            while let Some(position) = rest.find("CPU") {
+                rest = &rest[position + 3..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(index) = digits.parse() {
+                    labels.push(index);
+                }
+            }
+        }
+        labels
+    }
+
+    fn more_cpus(rows: &[String]) -> usize {
+        rows.iter()
+            .find_map(|row| {
+                row.trim()
+                    .strip_prefix("… ")?
+                    .strip_suffix(" more logical CPUs")?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn overview_resize_sweep_keeps_cpu_counts_and_sections_consistent() {
+        for cpu_count in [12, 64] {
+            let app = overview_sweep_app(cpu_count);
+            for width in [40, 50, 60, 89, 90, 120, 160] {
+                let mut previous_shown = 0;
+                for height in layout::MIN_TERMINAL_HEIGHT..=60 {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    rendered_regions(&mut terminal, &app);
+                    let rows = hardware_panel_rows(&terminal);
+                    let context =
+                        format!("{cpu_count} CPUs at {width}x{height}:\n{}", rows.join("\n"));
+                    if rows.is_empty() {
+                        continue;
+                    }
+
+                    let shown = shown_cpu_labels(&rows);
+                    let mut distinct = shown.clone();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    assert_eq!(distinct.len(), shown.len(), "{context}");
+                    assert_eq!(
+                        shown.len() + more_cpus(&rows),
+                        cpu_count as usize,
+                        "shown + overflow must equal the CPU count; {context}"
+                    );
+                    assert!(
+                        shown.len() >= previous_shown,
+                        "visible CPUs decreased as height grew; {context}"
+                    );
+                    previous_shown = shown.len();
+
+                    for (index, row) in rows.iter().enumerate() {
+                        if ["RAM", "GPU", "STORAGE", "NETWORK", "CPU"].contains(&row.trim()) {
+                            let next = rows.get(index + 1).map_or("", |next| next.trim());
+                            assert!(
+                                !next.is_empty(),
+                                "section heading without content; {context}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_cpu_cells_keep_a_separator_after_the_label() {
+        let app = overview_sweep_app(64);
+        for height in layout::MIN_TERMINAL_HEIGHT..=60 {
+            let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+            for row in hardware_panel_rows(&terminal) {
+                let mut rest = row.as_str();
+                while let Some(position) = rest.find("CPU") {
+                    rest = &rest[position + 3..];
+                    let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+                    if after_digits.len() != rest.len() {
+                        assert!(
+                            after_digits.starts_with(' ') || after_digits.is_empty(),
+                            "CPU label runs into its value at 40x{height}: {row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_labels_never_touch_and_hit_regions_match_labels() {
+        let app = App::default();
+        for width in 40..=130 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let regions = rendered_regions(&mut terminal, &app);
+            let tab_row: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .nth(1)
+                .unwrap()
+                .iter()
+                .map(|cell| cell.symbol().to_owned())
+                .collect();
+
+            assert_eq!(regions.tabs.len(), Tab::ALL.len(), "at width {width}");
+            for pair in regions.tabs.windows(2) {
+                let (left, right) = (pair[0].area, pair[1].area);
+                let left_label = tab_row[usize::from(left.x)..usize::from(left.right())].concat();
+                let right_label =
+                    tab_row[usize::from(right.x)..usize::from(right.right())].concat();
+                assert!(
+                    left_label.ends_with(' ')
+                        || right_label.starts_with(' ')
+                        || right.x > left.right(),
+                    "tab labels touch at width {width}: {left_label:?} {right_label:?}"
+                );
+            }
+            for region in &regions.tabs {
+                let label =
+                    tab_row[usize::from(region.area.x)..usize::from(region.area.right())].concat();
+                assert!(
+                    !label.trim().is_empty(),
+                    "empty tab hit region at width {width}"
+                );
+                assert_eq!(
+                    regions.target_at(region.area.x, region.area.y),
+                    Some(MouseTarget::Tab(region.tab))
+                );
+            }
+        }
+    }
+
     #[test]
     fn logs_header_shows_the_full_priority_label() {
         let app = populated_app(Tab::Logs);
@@ -1294,7 +1534,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             // Row 0 is outer border, Row 1 is tab bar, Row 2 begins System content directly below tabs.
-            assert!(rows[1].contains("Overview"));
+            assert!(rows[1].contains("Overview") || rows[1].contains(" Ovr "));
             assert!(rows[2].contains("System"));
             assert!(!rows[2].contains("Overview"));
             assert!(!rows[2].trim().is_empty());
@@ -1332,7 +1572,7 @@ mod tests {
                     .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
                     .collect::<Vec<_>>();
 
-                assert!(rows[1].contains(tab.label()));
+                assert!(rows[1].contains(tab.label()) || rows[1].contains(tab.short_label()));
                 assert!(
                     rows[2].contains(marker),
                     "{tab:?} at {width}x{height} did not start with {marker:?}"

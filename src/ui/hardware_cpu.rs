@@ -15,6 +15,12 @@ const MIN_DETAILED_CPU_CELL_WIDTH: usize = 16;
 const MAX_DETAILED_CPU_COLUMNS: usize = 4;
 const MIN_USEFUL_CPU_GAUGE_WIDTH: usize = 6;
 const CPU_CELL_GAP: usize = 2;
+/// Dense cells already separate label and value, so one space between cells suffices.
+const DENSE_CPU_CELL_GAP: usize = 1;
+/// Heading, model, utilization history and load average.
+const SUMMARY_LINES: usize = 4;
+/// Grid rows the CPU section claims before lower sections get their minimum.
+const PRIORITY_GRID_ROWS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CpuGridLayout {
@@ -24,7 +30,7 @@ pub(super) struct CpuGridLayout {
     dense: bool,
 }
 
-pub(super) fn grid_layout(metrics: &SystemMetrics, width: usize, max_rows: usize) -> CpuGridLayout {
+fn grid_layout(metrics: &SystemMetrics, width: usize, max_rows: usize) -> CpuGridLayout {
     let max_cpu_id = metrics
         .logical_cpus
         .iter()
@@ -34,10 +40,46 @@ pub(super) fn grid_layout(metrics: &SystemMetrics, width: usize, max_rows: usize
     cpu_grid_layout(metrics.logical_cpus.len(), max_cpu_id, width, max_rows)
 }
 
-pub(super) fn desired_height(metrics: &SystemMetrics, grid: CpuGridLayout) -> u16 {
-    6_u16
-        .saturating_add(u16::try_from(grid.rows).unwrap_or(u16::MAX))
-        .saturating_add(u16::from(grid.visible < metrics.logical_cpus.len()))
+/// Height the CPU section claims first: its summary plus a few rows of the
+/// densest grid, with an overflow line when that cannot show every CPU.
+pub(super) fn priority_height(metrics: &SystemMetrics, width: usize) -> u16 {
+    let count = metrics.logical_cpus.len();
+    if count == 0 {
+        return SUMMARY_LINES as u16;
+    }
+    let densest_columns = grid_layout(metrics, width, 1).columns.max(1);
+    let rows_for_all = count.div_ceil(densest_columns);
+    let rows = rows_for_all.min(PRIORITY_GRID_ROWS);
+    let height = SUMMARY_LINES + rows + usize::from(rows_for_all > rows);
+    u16::try_from(height).unwrap_or(u16::MAX)
+}
+
+/// Height at which every CPU fits in the preferred grid with breathing room.
+pub(super) fn comfortable_height(metrics: &SystemMetrics, width: usize) -> u16 {
+    let grid = grid_layout(metrics, width, metrics.logical_cpus.len());
+    u16::try_from(SUMMARY_LINES + 2 + grid.rows).unwrap_or(u16::MAX)
+}
+
+/// The model line is dropped in a minimal section so the overflow line still fits.
+fn shows_model_line(metrics: &SystemMetrics, height: usize) -> bool {
+    height > SUMMARY_LINES || metrics.logical_cpus.is_empty()
+}
+
+/// Chooses the grid from the height the section actually received, reserving a
+/// row for the overflow line whenever not every CPU fits.
+pub(super) fn grid_for_height(
+    metrics: &SystemMetrics,
+    width: usize,
+    height: usize,
+) -> CpuGridLayout {
+    let header = SUMMARY_LINES - usize::from(!shows_model_line(metrics, height));
+    let rows = height.saturating_sub(header);
+    let grid = grid_layout(metrics, width, rows);
+    if grid.visible < metrics.logical_cpus.len() {
+        grid_layout(metrics, width, rows.saturating_sub(1))
+    } else {
+        grid
+    }
 }
 
 pub(super) fn render(
@@ -45,7 +87,6 @@ pub(super) fn render(
     app: &App,
     inventory: Option<&HardwareInventory>,
     metrics: &SystemMetrics,
-    grid: CpuGridLayout,
     area: Rect,
 ) {
     if area.height == 0 {
@@ -53,15 +94,17 @@ pub(super) fn render(
     }
     let width = usize::from(area.width);
     let height = usize::from(area.height);
+    let grid = grid_for_height(metrics, width, height);
+    let show_model = shows_model_line(metrics, height);
     let grid_lines = cpu_grid_lines(&metrics.logical_cpus, width, grid);
     let has_overflow = grid.visible < metrics.logical_cpus.len();
-    let content_height = 4_usize
+    let content_height = (SUMMARY_LINES - usize::from(!show_model))
         .saturating_add(grid_lines.len())
         .saturating_add(usize::from(has_overflow));
     let spacing = height.saturating_sub(content_height).min(2);
     let mut lines = vec![section_heading("CPU")];
 
-    if lines.len() < height {
+    if show_model && lines.len() < height {
         let model = match inventory {
             None => "Discovering hardware…",
             Some(inventory) => inventory
@@ -130,13 +173,16 @@ fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize)
     let detailed_capacity = cpu_columns_that_fit(width, MIN_DETAILED_CPU_CELL_WIDTH)
         .clamp(1, MAX_DETAILED_CPU_COLUMNS)
         .min(count);
-    let dense_cell_width = format!("CPU{max_cpu_id}█100%").chars().count().max(8);
-    let dense_columns = cpu_columns_that_fit(width, dense_cell_width)
+    let dense_cell_width = dense_cell_width(format!("CPU{max_cpu_id}").chars().count());
+    let dense_columns = columns_that_fit(width, dense_cell_width, DENSE_CPU_CELL_GAP)
         .max(1)
         .min(count);
-    let dense = needed_columns > detailed_capacity;
+    // Dense cells drop the gauge, so they are only worth it when they add columns.
+    let dense = needed_columns > detailed_capacity && dense_columns > detailed_capacity;
     let columns = if dense {
-        dense_columns.max(detailed_capacity)
+        dense_columns
+    } else if needed_columns > detailed_capacity {
+        detailed_capacity
     } else {
         preferred_columns.max(needed_columns.min(detailed_capacity))
     };
@@ -150,8 +196,26 @@ fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize)
     }
 }
 
+/// `CPU<n> <level><percent>`: the label is always followed by a space.
+const fn dense_cell_width(label_width: usize) -> usize {
+    label_width + 6
+}
+
 fn cpu_columns_that_fit(width: usize, cell_width: usize) -> usize {
-    width.saturating_add(CPU_CELL_GAP) / cell_width.saturating_add(CPU_CELL_GAP)
+    columns_that_fit(width, cell_width, CPU_CELL_GAP)
+}
+
+fn columns_that_fit(width: usize, cell_width: usize, gap: usize) -> usize {
+    width.saturating_add(gap) / cell_width.saturating_add(gap)
+}
+
+/// Rows the section actually draws at `height`: content plus at most two
+/// spacer lines. Rows beyond that are better used as gaps between sections.
+pub(super) fn fitted_height(metrics: &SystemMetrics, width: usize, height: u16) -> u16 {
+    let grid = grid_for_height(metrics, width, usize::from(height));
+    let header = SUMMARY_LINES - usize::from(!shows_model_line(metrics, usize::from(height)));
+    let content = header + grid.rows + usize::from(grid.visible < metrics.logical_cpus.len());
+    height.min(u16::try_from(content + 2).unwrap_or(u16::MAX))
 }
 
 fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
@@ -159,9 +223,14 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
         return Vec::new();
     }
 
-    let total_gap = CPU_CELL_GAP.saturating_mul(grid.columns.saturating_sub(1));
+    let gap_width = if grid.dense {
+        DENSE_CPU_CELL_GAP
+    } else {
+        CPU_CELL_GAP
+    };
+    let total_gap = gap_width.saturating_mul(grid.columns.saturating_sub(1));
     let cell_width = width.saturating_sub(total_gap) / grid.columns;
-    let gap = " ".repeat(CPU_CELL_GAP);
+    let gap = " ".repeat(gap_width);
     let label_width = cpus[..grid.visible]
         .iter()
         .map(|cpu| format!("CPU{}", cpu.id.index()).chars().count())
@@ -173,12 +242,7 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
             row.iter()
                 .map(|cpu| {
                     let text = if grid.dense {
-                        format!(
-                            "CPU{}{}{}",
-                            cpu.id.index(),
-                            utilization_level(cpu.utilization_percent),
-                            format_percent(cpu.utilization_percent)
-                        )
+                        dense_cpu_cell(cpu, cell_width, label_width)
                     } else {
                         detailed_cpu_cell(cpu, cell_width, label_width)
                     };
@@ -201,6 +265,19 @@ fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: us
     format!(
         "{label:<label_width$} {percent:>4} {}",
         utilization_bar(cpu.utilization_percent, gauge_width)
+    )
+}
+
+fn dense_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize) -> String {
+    let label = format!("CPU{}", cpu.id.index());
+    let percent = format_percent(cpu.utilization_percent);
+    if cell_width < dense_cell_width(label_width) {
+        // No room for the level glyph; keep the separator and the value.
+        return format!("{label:<label_width$} {percent:>4}");
+    }
+    format!(
+        "{label:<label_width$} {}{percent:>4}",
+        utilization_level(cpu.utilization_percent)
     )
 }
 
@@ -273,7 +350,7 @@ mod tests {
 
     #[test]
     fn thirty_two_logical_cpus_switch_to_dense_cells() {
-        let grid = cpu_grid_layout(32, 31, 48, 10);
+        let grid = cpu_grid_layout(32, 31, 52, 10);
         assert!(grid.dense);
         assert_eq!(grid.columns, 4);
         assert_eq!(grid.rows, 8);
@@ -325,14 +402,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(
-                    frame,
-                    &app,
-                    None,
-                    app.system_metrics(),
-                    cpu_grid_layout(1, 0, 60, 1),
-                    frame.area(),
-                );
+                render(frame, &app, None, app.system_metrics(), frame.area());
             })
             .unwrap();
         let rows = terminal
@@ -437,7 +507,6 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let inventory = crate::linux::HardwareInventory::default();
         let metrics = SystemMetrics::default();
-        let grid = cpu_grid_layout(metrics.logical_cpus.len(), 0, 80, 20);
         terminal
             .draw(|frame| {
                 render(
@@ -445,7 +514,6 @@ mod tests {
                     &app,
                     Some(&inventory),
                     &metrics,
-                    grid,
                     Rect::new(0, 0, 80, 20),
                 );
             })
