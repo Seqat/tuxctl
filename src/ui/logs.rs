@@ -25,7 +25,7 @@ const COLUMN_SPACING: u16 = 1;
 const COLUMN_WIDTHS: [Constraint; 4] = [
     Constraint::Length(11),
     Constraint::Percentage(28),
-    Constraint::Length(7),
+    Constraint::Length(8),
     Constraint::Min(18),
 ];
 

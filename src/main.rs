@@ -25,6 +25,9 @@ const TICK_RATE: Duration = Duration::from_millis(250);
 const METRICS_REFRESH_RATE: Duration = Duration::from_secs(1);
 const SERVICES_REFRESH_RATE: Duration = Duration::from_secs(5);
 const HOVER_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const BACKGROUND_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+/// Upper bound on actions applied before the loop renders or blocks again.
+const MAX_ACTIONS_PER_TURN: usize = 16;
 
 fn main() -> io::Result<()> {
     let main_thread = std::thread::current().id();
@@ -37,7 +40,8 @@ fn main() -> io::Result<()> {
     }));
 
     let mut terminal = TerminalSession::new()?;
-    let mut app = App::default();
+    let mut app =
+        App::default().with_collector_periods(METRICS_REFRESH_RATE, SERVICES_REFRESH_RATE);
     let mut events = EventHandler::new(TICK_RATE);
     let metrics = match linux::SystemMetricsCollector::start(METRICS_REFRESH_RATE) {
         Ok(metrics) => metrics,
@@ -60,45 +64,43 @@ fn main() -> io::Result<()> {
         Ok(hardware) => hardware,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
-    let mut redraws = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
+    let mut redraws = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
 
     let run_result = (|| -> io::Result<()> {
         let mut regions = draw_app(&mut terminal, &mut app)?;
+        redraws.rendered(Instant::now());
 
         while !app.should_quit() {
-            let action = match poll_ready_action(
-                || events.poll_action(&regions, app.hovered()),
-                || metrics.latest().map(action::Action::SystemMetricsUpdated),
-                || processes.latest().map(action::Action::ProcessesUpdated),
-                || services.latest().map(action::Action::ServicesUpdated),
-                || network.latest().map(action::Action::NetworkUpdated),
-                || hardware.latest().map(action::Action::HardwareDiscovered),
-                || journal.latest().map(action::Action::LogsUpdated),
-            )? {
+            let ready = |events: &mut EventHandler, hovered: Option<&action::MouseTarget>| {
+                poll_ready_action(
+                    || events.poll_action(&regions, hovered),
+                    || metrics.latest().map(action::Action::SystemMetricsUpdated),
+                    || processes.latest().map(action::Action::ProcessesUpdated),
+                    || services.latest().map(action::Action::ServicesUpdated),
+                    || network.latest().map(action::Action::NetworkUpdated),
+                    || hardware.latest().map(action::Action::HardwareDiscovered),
+                    || journal.latest().map(action::Action::LogsUpdated),
+                )
+            };
+            let first = match ready(&mut events, app.hovered())? {
                 Some(action) => Some(action),
                 None => events.next_action(&regions, app.hovered(), redraws.deadline())?,
             };
-
-            if let Some(action) = action {
-                let redraw_policy = RedrawPolicy::for_action(&action);
-                if app.update(action) {
-                    match redraw_policy {
-                        RedrawPolicy::CoalescedHover => redraws.request_hover(Instant::now()),
-                        RedrawPolicy::Immediate if !app.should_quit() => {
-                            regions = draw_app(&mut terminal, &mut app)?;
-                            redraws.rendered();
-                        }
-                        RedrawPolicy::Immediate => {}
-                    }
-                }
-            }
+            let render_now = apply_actions(&mut app, &mut redraws, first, Instant::now(), |app| {
+                ready(&mut events, app.hovered())
+            })?;
 
             if let Some(generation) = app.take_service_refresh_request() {
                 services.request_refresh(generation);
             }
 
-            if redraws.take_due(Instant::now()) && !app.should_quit() {
+            if app.should_quit() {
+                break;
+            }
+            let now = Instant::now();
+            if render_now || redraws.take_due(now) {
                 regions = draw_app(&mut terminal, &mut app)?;
+                redraws.rendered(now);
             }
         }
 
@@ -148,18 +150,58 @@ fn poll_ready_action(
     Ok(journal())
 }
 
+/// Applies `first` and then further ready actions, up to [`MAX_ACTIONS_PER_TURN`].
+///
+/// Background updates only schedule a frame-limited redraw, so several snapshots
+/// arriving together cost one render. The first state-changing input action ends
+/// the turn and returns `true` so it is rendered immediately and later input is
+/// translated against regions that match the screen.
+fn apply_actions(
+    app: &mut App,
+    redraws: &mut RedrawScheduler,
+    first: Option<action::Action>,
+    now: Instant,
+    mut next_ready: impl FnMut(&App) -> io::Result<Option<action::Action>>,
+) -> io::Result<bool> {
+    let mut next = first;
+    let mut applied = 0;
+    while let Some(action) = next {
+        let redraw_policy = RedrawPolicy::for_action(&action);
+        applied += 1;
+        if app.update(action) {
+            match redraw_policy {
+                RedrawPolicy::Immediate => return Ok(true),
+                RedrawPolicy::CoalescedHover => redraws.request_hover(now),
+                RedrawPolicy::FrameLimited => redraws.request_background(now),
+            }
+        }
+        if app.should_quit() || applied >= MAX_ACTIONS_PER_TURN {
+            break;
+        }
+        next = next_ready(app)?;
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedrawPolicy {
     Immediate,
     CoalescedHover,
+    FrameLimited,
 }
 
 impl RedrawPolicy {
     fn for_action(action: &action::Action) -> Self {
-        if matches!(action, action::Action::HoverMouseTarget(_)) {
-            Self::CoalescedHover
-        } else {
-            Self::Immediate
+        use action::Action;
+        match action {
+            Action::HoverMouseTarget(_) => Self::CoalescedHover,
+            Action::SystemMetricsUpdated(_)
+            | Action::ProcessesUpdated(_)
+            | Action::ServicesUpdated(_)
+            | Action::NetworkUpdated(_)
+            | Action::HardwareDiscovered(_)
+            | Action::LogsUpdated(_) => Self::FrameLimited,
+            _ => Self::Immediate,
         }
     }
 }
@@ -167,37 +209,54 @@ impl RedrawPolicy {
 #[derive(Debug)]
 struct RedrawScheduler {
     hover_frame_interval: Duration,
-    hover_deadline: Option<Instant>,
+    background_frame_interval: Duration,
+    deadline: Option<Instant>,
+    last_render: Option<Instant>,
 }
 
 impl RedrawScheduler {
-    fn new(hover_frame_interval: Duration) -> Self {
+    fn new(hover_frame_interval: Duration, background_frame_interval: Duration) -> Self {
         Self {
             hover_frame_interval,
-            hover_deadline: None,
+            background_frame_interval,
+            deadline: None,
+            last_render: None,
         }
     }
 
     fn deadline(&self) -> Option<Instant> {
-        self.hover_deadline
+        self.deadline
     }
 
     fn request_hover(&mut self, now: Instant) {
-        self.hover_deadline
-            .get_or_insert(now + self.hover_frame_interval);
+        self.schedule(now + self.hover_frame_interval);
+    }
+
+    /// Renders background data promptly when idle, but at most once per
+    /// `background_frame_interval` while updates keep arriving.
+    fn request_background(&mut self, now: Instant) {
+        let earliest = self
+            .last_render
+            .map_or(now, |rendered| rendered + self.background_frame_interval);
+        self.schedule(earliest.max(now));
+    }
+
+    fn schedule(&mut self, at: Instant) {
+        self.deadline = Some(self.deadline.map_or(at, |deadline| deadline.min(at)));
     }
 
     fn take_due(&mut self, now: Instant) -> bool {
-        if self.hover_deadline.is_some_and(|deadline| now >= deadline) {
-            self.hover_deadline = None;
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
             true
         } else {
             false
         }
     }
 
-    fn rendered(&mut self) {
-        self.hover_deadline = None;
+    fn rendered(&mut self, now: Instant) {
+        self.deadline = None;
+        self.last_render = Some(now);
     }
 }
 
@@ -329,7 +388,7 @@ mod tests {
 
     #[test]
     fn idle_scheduler_does_not_request_continuous_frames() {
-        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
         let now = Instant::now();
 
         assert_eq!(scheduler.deadline(), None);
@@ -340,7 +399,7 @@ mod tests {
     #[test]
     fn hover_changes_coalesce_while_app_keeps_latest_target() {
         let mut app = App::default();
-        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
         let now = Instant::now();
 
         for (offset, tab) in [Tab::Overview, Tab::Processes, Tab::Services, Tab::Logs]
@@ -360,7 +419,7 @@ mod tests {
     #[test]
     fn rapid_hover_transitions_are_frame_limited() {
         let mut app = App::default();
-        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
         let start = Instant::now();
         let mut transitions = 0;
         let mut redraws = 0;
@@ -398,12 +457,240 @@ mod tests {
 
     #[test]
     fn immediate_render_satisfies_a_pending_hover_redraw() {
-        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL);
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
         scheduler.request_hover(Instant::now());
 
-        scheduler.rendered();
+        scheduler.rendered(Instant::now());
 
         assert_eq!(scheduler.deadline(), None);
+    }
+
+    fn queued(actions: Vec<Action>) -> impl FnMut(&App) -> io::Result<Option<Action>> {
+        let mut actions = std::collections::VecDeque::from(actions);
+        move |_| Ok(actions.pop_front())
+    }
+
+    fn metrics_with_cpu(cpu: f64) -> crate::linux::SystemMetrics {
+        crate::linux::SystemMetrics {
+            cpu_percent: Some(cpu),
+            ..Default::default()
+        }
+    }
+
+    fn process_snapshot(pids: &[u32]) -> crate::linux::ProcessSnapshot {
+        crate::linux::ProcessSnapshot {
+            processes: pids
+                .iter()
+                .map(|&pid| crate::linux::ProcessInfo {
+                    pid,
+                    name: format!("proc{pid}"),
+                    cpu_percent: None,
+                    memory_bytes: 0,
+                    command: None,
+                    state: "S".into(),
+                    parent_pid: 1,
+                    state_code: 'S',
+                    start_time: u64::from(pid),
+                })
+                .collect(),
+            error: None,
+        }
+    }
+
+    fn journal_batch(id: u64) -> crate::linux::JournalBatch {
+        crate::linux::JournalBatch {
+            entries: vec![crate::linux::JournalEntry {
+                id,
+                timestamp_micros: None,
+                source: "test".into(),
+                priority: Some(6),
+                message: format!("entry {id}"),
+            }],
+            dropped: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn background_updates_arriving_together_render_once() {
+        let mut app = App::default();
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let now = Instant::now();
+        scheduler.rendered(now - Duration::from_secs(1));
+        let mut remaining = queued(vec![
+            Action::ProcessesUpdated(process_snapshot(&[1, 2])),
+            Action::NetworkUpdated(crate::linux::NetworkSnapshot::default()),
+        ]);
+        let mut pulled = 0;
+
+        let render_now = apply_actions(
+            &mut app,
+            &mut scheduler,
+            Some(Action::SystemMetricsUpdated(metrics_with_cpu(12.0))),
+            now,
+            |app| {
+                pulled += 1;
+                remaining(app)
+            },
+        )
+        .unwrap();
+
+        assert!(!render_now);
+        assert_eq!(pulled, 3, "all ready snapshots are drained in one turn");
+        assert_eq!(app.process_summary().total, 2);
+        assert!(
+            scheduler.take_due(now),
+            "idle background data renders promptly"
+        );
+        assert!(!scheduler.take_due(now));
+    }
+
+    #[test]
+    fn inactive_tab_snapshots_do_not_schedule_a_redraw() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+
+        let render_now = apply_actions(
+            &mut app,
+            &mut scheduler,
+            Some(Action::ProcessesUpdated(process_snapshot(&[1]))),
+            Instant::now(),
+            queued(vec![Action::SystemMetricsUpdated(metrics_with_cpu(3.0))]),
+        )
+        .unwrap();
+
+        assert!(!render_now);
+        assert_eq!(scheduler.deadline(), None);
+    }
+
+    #[test]
+    fn continuous_journal_batches_are_frame_limited() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Logs));
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let start = Instant::now();
+        scheduler.rendered(start);
+        let mut renders = 0;
+
+        for millisecond in 1..=1000_u64 {
+            let now = start + Duration::from_millis(millisecond);
+            let render_now = apply_actions(
+                &mut app,
+                &mut scheduler,
+                Some(Action::LogsUpdated(journal_batch(millisecond))),
+                now,
+                queued(Vec::new()),
+            )
+            .unwrap();
+            assert!(!render_now);
+            if scheduler.take_due(now) {
+                renders += 1;
+                scheduler.rendered(now);
+            }
+        }
+
+        assert_eq!(app.log_count(), 1000);
+        assert_eq!(renders, 20);
+    }
+
+    #[test]
+    fn a_continuously_ready_source_cannot_monopolize_a_turn() {
+        let mut app = App::default();
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let mut next_id = 0;
+
+        apply_actions(
+            &mut app,
+            &mut scheduler,
+            Some(Action::LogsUpdated(journal_batch(0))),
+            Instant::now(),
+            |_| {
+                next_id += 1;
+                Ok(Some(Action::LogsUpdated(journal_batch(next_id))))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(next_id as usize, MAX_ACTIONS_PER_TURN - 1);
+    }
+
+    #[test]
+    fn state_changing_input_ends_the_turn_for_an_immediate_render() {
+        let mut app = App::default();
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let mut remaining = queued(vec![
+            Action::SelectTab(Tab::Processes),
+            Action::SelectTab(Tab::Logs),
+        ]);
+
+        let render_now = apply_actions(
+            &mut app,
+            &mut scheduler,
+            Some(Action::SystemMetricsUpdated(metrics_with_cpu(50.0))),
+            Instant::now(),
+            &mut remaining,
+        )
+        .unwrap();
+
+        assert!(render_now);
+        assert_eq!(app.active_tab(), Tab::Processes);
+        assert_eq!(
+            remaining(&app).unwrap(),
+            Some(Action::SelectTab(Tab::Logs)),
+            "later input waits for regions from the immediate render"
+        );
+    }
+
+    #[test]
+    fn quit_stops_draining_ready_actions() {
+        let mut app = App::default();
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let mut pulled = 0;
+
+        let render_now = apply_actions(
+            &mut app,
+            &mut scheduler,
+            Some(Action::Quit),
+            Instant::now(),
+            |_| {
+                pulled += 1;
+                Ok(Some(Action::LogsUpdated(journal_batch(1))))
+            },
+        )
+        .unwrap();
+
+        assert!(!render_now);
+        assert!(app.should_quit());
+        assert_eq!(pulled, 0);
+    }
+
+    #[test]
+    fn background_snapshots_use_frame_limited_redraws() {
+        for action in [
+            Action::SystemMetricsUpdated(Default::default()),
+            Action::ProcessesUpdated(Default::default()),
+            Action::ServicesUpdated(Default::default()),
+            Action::NetworkUpdated(Default::default()),
+            Action::LogsUpdated(Default::default()),
+        ] {
+            assert_eq!(
+                RedrawPolicy::for_action(&action),
+                RedrawPolicy::FrameLimited
+            );
+        }
+    }
+
+    #[test]
+    fn pending_hover_frame_is_not_delayed_by_background_requests() {
+        let mut scheduler = RedrawScheduler::new(HOVER_FRAME_INTERVAL, BACKGROUND_FRAME_INTERVAL);
+        let now = Instant::now();
+        scheduler.rendered(now);
+
+        scheduler.request_hover(now);
+        scheduler.request_background(now);
+
+        assert_eq!(scheduler.deadline(), Some(now + HOVER_FRAME_INTERVAL));
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use crate::{
     action::{
@@ -8,7 +12,7 @@ use crate::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
         NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
         ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot,
-        SystemMetrics,
+        SystemMetrics, SYSTEMCTL_TIMEOUT,
     },
 };
 
@@ -17,6 +21,56 @@ use crate::linux::verify_and_send_signal_at;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
+
+/// Background collectors whose last update time is tracked for the stale marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collector {
+    Metrics,
+    Processes,
+    Network,
+    Services,
+}
+
+impl Collector {
+    const ALL: [Self; 4] = [
+        Self::Metrics,
+        Self::Processes,
+        Self::Network,
+        Self::Services,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Processes => "processes",
+            Self::Network => "network",
+            Self::Services => "services",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    fn shown_on(self, tab: Tab) -> bool {
+        match self {
+            Self::Metrics | Self::Processes => matches!(tab, Tab::Overview | Tab::Processes),
+            Self::Network => matches!(tab, Tab::Overview | Tab::Network),
+            Self::Services => tab == Tab::Services,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CollectorHealth {
+    /// Disabled until [`App::with_collector_periods`] configures a threshold.
+    stale_after: Option<Duration>,
+    /// Tick time at which data last arrived; the first tick is the baseline so a
+    /// collector that never publishes still becomes stale.
+    last_update: Option<Instant>,
+    updated_since_tick: bool,
+    stale: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -66,8 +120,14 @@ pub struct App {
     hardware: Option<HardwareInventory>,
     aggregate_cpu_history: AggregateCpuHistory,
     processes: Vec<ProcessInfo>,
+    /// Lowercased search/sort keys parallel to `processes`; empty until the next
+    /// filter rebuild after a snapshot replaced `processes`.
+    process_keys: Vec<ProcessKeys>,
     process_summary: ProcessSummary,
     filtered_processes: Vec<usize>,
+    /// Set while Processes is hidden and `filtered_processes` has been cleared
+    /// instead of rebuilt; holds the selected row index to fall back to.
+    deferred_process_rebuild: Option<usize>,
     selected_process: Option<ProcessIdentity>,
     process_scroll: usize,
     process_view_height: usize,
@@ -109,6 +169,7 @@ pub struct App {
     network_detail_visible: bool,
     network_error: Option<String>,
     hovered: Option<MouseTarget>,
+    collector_health: [CollectorHealth; 4],
 }
 
 impl Default for App {
@@ -121,8 +182,10 @@ impl Default for App {
             hardware: None,
             aggregate_cpu_history: AggregateCpuHistory::default(),
             processes: Vec::new(),
+            process_keys: Vec::new(),
             process_summary: ProcessSummary::default(),
             filtered_processes: Vec::new(),
+            deferred_process_rebuild: None,
             selected_process: None,
             process_scroll: 0,
             process_view_height: 0,
@@ -164,11 +227,58 @@ impl Default for App {
             network_detail_visible: false,
             network_error: None,
             hovered: None,
+            collector_health: [CollectorHealth::default(); 4],
         }
     }
 }
 
 impl App {
+    /// Enables stale markers: a collector is stale after three missed periods.
+    /// Services also allow for a full `systemctl` timeout before being flagged.
+    pub fn with_collector_periods(mut self, sampling: Duration, services: Duration) -> Self {
+        for collector in Collector::ALL {
+            let threshold = match collector {
+                Collector::Services => services.saturating_mul(2) + SYSTEMCTL_TIMEOUT,
+                _ => sampling.saturating_mul(3),
+            };
+            self.collector_health[collector.index()].stale_after = Some(threshold);
+        }
+        self
+    }
+
+    /// Stale collectors whose data is shown on the active tab.
+    pub fn stale_collectors(&self) -> impl Iterator<Item = Collector> + '_ {
+        Collector::ALL.into_iter().filter(|collector| {
+            self.collector_health[collector.index()].stale && collector.shown_on(self.active_tab)
+        })
+    }
+
+    fn record_collector_update(&mut self, collector: Collector) {
+        self.collector_health[collector.index()].updated_since_tick = true;
+    }
+
+    /// Returns `true` only when a collector shown on the active tab changes
+    /// between fresh and stale.
+    fn check_collector_staleness(&mut self, now: Instant) -> bool {
+        let mut redraw = false;
+        for collector in Collector::ALL {
+            let health = &mut self.collector_health[collector.index()];
+            let Some(stale_after) = health.stale_after else {
+                continue;
+            };
+            if std::mem::take(&mut health.updated_since_tick) {
+                health.last_update = Some(now);
+            }
+            let last_update = *health.last_update.get_or_insert(now);
+            let stale = now.saturating_duration_since(last_update) > stale_after;
+            if stale != health.stale {
+                health.stale = stale;
+                redraw |= collector.shown_on(self.active_tab);
+            }
+        }
+        redraw
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -447,6 +557,7 @@ impl App {
                 false
             }
             Action::SystemMetricsUpdated(metrics) => {
+                self.record_collector_update(Collector::Metrics);
                 let process_metrics_changed = self.system_metrics.cpu_percent
                     != metrics.cpu_percent
                     || self.system_metrics.memory != metrics.memory;
@@ -471,10 +582,19 @@ impl App {
                     self.active_tab == Tab::Overview
                 }
             }
-            Action::ProcessesUpdated(snapshot) => self.update_processes(snapshot),
-            Action::ServicesUpdated(snapshot) => self.update_services(snapshot),
+            Action::ProcessesUpdated(snapshot) => {
+                self.record_collector_update(Collector::Processes);
+                self.update_processes(snapshot)
+            }
+            Action::ServicesUpdated(snapshot) => {
+                self.record_collector_update(Collector::Services);
+                self.update_services(snapshot)
+            }
             Action::LogsUpdated(batch) => self.update_logs(batch),
-            Action::NetworkUpdated(snapshot) => self.update_networks(snapshot),
+            Action::NetworkUpdated(snapshot) => {
+                self.record_collector_update(Collector::Network);
+                self.update_networks(snapshot)
+            }
             Action::ProcessViewportChanged { start, height } => {
                 self.process_view_height = height;
                 self.process_scroll = start;
@@ -507,6 +627,8 @@ impl App {
                     true
                 }
             }
+            // Staleness is global state, so it is checked even while a modal is open.
+            Action::Tick(now) => self.check_collector_staleness(now),
             Action::Escape => self.escape(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
@@ -595,7 +717,6 @@ impl App {
             Action::NetworkLast => self.select_network_index(self.networks.len().saturating_sub(1)),
             Action::SelectNetwork(name) => self.select_network(&name),
             Action::OpenNetworkDetails => self.open_network_details(),
-            Action::Tick => false,
         }
     }
 
@@ -621,6 +742,9 @@ impl App {
         self.log_detail_visible = false;
         self.network_detail_visible = false;
         self.hovered = None;
+        if tab == Tab::Processes && self.deferred_process_rebuild.is_some() {
+            self.rebuild_process_filter();
+        }
         changed
     }
 
@@ -689,9 +813,26 @@ impl App {
             return false;
         }
 
+        if !processes_visible {
+            // Filtering and sorting are only needed to show the table, so hidden
+            // snapshots defer them until Processes is selected again. The cleared
+            // index list keeps stale indices from pointing into the new Vec.
+            if self.deferred_process_rebuild.is_none() {
+                self.deferred_process_rebuild = Some(self.selected_process_index().unwrap_or(0));
+            }
+            self.filtered_processes.clear();
+            self.processes = snapshot.processes;
+            self.process_keys.clear();
+            self.process_summary = summary;
+            self.process_error = None;
+            self.close_confirmation_for_exited_process();
+            return overview_summary_changed || (overview_visible && was_stale);
+        }
+
         let previous_index = self.selected_process_index().unwrap_or(0);
         let previous_selection = self.selected_process;
         self.processes = snapshot.processes;
+        self.process_keys.clear();
         self.process_summary = summary;
         self.process_error = None;
         self.rebuild_process_filter();
@@ -704,6 +845,19 @@ impl App {
             })
         });
 
+        self.close_confirmation_for_exited_process();
+
+        if self.selected_process.is_none() {
+            let replacement = previous_index.min(self.filtered_processes.len().saturating_sub(1));
+            self.selected_process = self.process_at(replacement).map(ProcessInfo::identity);
+            self.process_detail_visible = false;
+        }
+        self.reconcile_hovered_process();
+        self.ensure_process_visible();
+        processes_visible || overview_summary_changed || (overview_visible && was_stale)
+    }
+
+    fn close_confirmation_for_exited_process(&mut self) {
         if let Some(confirmation) = &self.process_signal_confirmation {
             if !self
                 .processes
@@ -717,15 +871,6 @@ impl App {
                     Some(format!("Process {name} ({pid}) exited before signal"));
             }
         }
-
-        if self.selected_process.is_none() {
-            let replacement = previous_index.min(self.filtered_processes.len().saturating_sub(1));
-            self.selected_process = self.process_at(replacement).map(ProcessInfo::identity);
-            self.process_detail_visible = false;
-        }
-        self.reconcile_hovered_process();
-        self.ensure_process_visible();
-        processes_visible || overview_summary_changed || (overview_visible && was_stale)
     }
 
     fn begin_process_search(&mut self) -> bool {
@@ -760,21 +905,34 @@ impl App {
     }
 
     fn rebuild_process_filter(&mut self) {
-        let previous_index = self.selected_process_index().unwrap_or(0);
+        let previous_index = match self.deferred_process_rebuild.take() {
+            Some(index) => index,
+            None => self.selected_process_index().unwrap_or(0),
+        };
         let previous_selection = self.selected_process;
         let query = self.process_search_query.to_lowercase();
+        if self.process_keys.len() != self.processes.len() {
+            self.process_keys = self.processes.iter().map(ProcessKeys::new).collect();
+        }
 
+        let keys = &self.process_keys;
         self.filtered_processes = self
             .processes
             .iter()
+            .zip(keys)
             .enumerate()
-            .filter(|(_, process)| process_matches(process, &query))
+            .filter(|(_, (process, keys))| process_matches(process, keys, &query))
             .map(|(index, _)| index)
             .collect();
         let processes = &self.processes;
         let sort = self.process_sort;
-        self.filtered_processes
-            .sort_by(|left, right| compare_processes(&processes[*left], &processes[*right], sort));
+        self.filtered_processes.sort_by(|&left, &right| {
+            compare_processes(
+                (&processes[left], &keys[left]),
+                (&processes[right], &keys[right]),
+                sort,
+            )
+        });
 
         self.selected_process = previous_selection.filter(|identity| {
             self.filtered_processes.iter().any(|index| {
@@ -1524,7 +1682,31 @@ impl App {
     }
 }
 
-fn compare_processes(left: &ProcessInfo, right: &ProcessInfo, sort: ProcessSort) -> Ordering {
+/// Lowercased fields used for case-insensitive search and name sorting, computed
+/// once per snapshot instead of once per comparison.
+#[derive(Debug)]
+struct ProcessKeys {
+    name: Box<str>,
+    command: Option<Box<str>>,
+}
+
+impl ProcessKeys {
+    fn new(process: &ProcessInfo) -> Self {
+        Self {
+            name: process.name.to_lowercase().into(),
+            command: process
+                .command
+                .as_deref()
+                .map(|command| command.to_lowercase().into()),
+        }
+    }
+}
+
+fn compare_processes(
+    (left, left_keys): (&ProcessInfo, &ProcessKeys),
+    (right, right_keys): (&ProcessInfo, &ProcessKeys),
+    sort: ProcessSort,
+) -> Ordering {
     let order = match sort.field {
         ProcessSortField::Cpu => {
             compare_optional_cpu(left.cpu_percent, right.cpu_percent, sort.descending)
@@ -1533,10 +1715,7 @@ fn compare_processes(left: &ProcessInfo, right: &ProcessInfo, sort: ProcessSort)
             ordered(left.memory_bytes.cmp(&right.memory_bytes), sort.descending)
         }
         ProcessSortField::Pid => ordered(left.pid.cmp(&right.pid), sort.descending),
-        ProcessSortField::Name => ordered(
-            left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-            sort.descending,
-        ),
+        ProcessSortField::Name => ordered(left_keys.name.cmp(&right_keys.name), sort.descending),
     };
 
     order.then_with(|| left.pid.cmp(&right.pid))
@@ -1559,14 +1738,14 @@ fn ordered(order: Ordering, descending: bool) -> Ordering {
     }
 }
 
-fn process_matches(process: &ProcessInfo, query: &str) -> bool {
+fn process_matches(process: &ProcessInfo, keys: &ProcessKeys, query: &str) -> bool {
     query.is_empty()
-        || process.name.to_lowercase().contains(query)
+        || keys.name.contains(query)
         || process.pid.to_string().contains(query)
-        || process
+        || keys
             .command
             .as_deref()
-            .is_some_and(|command| command.to_lowercase().contains(query))
+            .is_some_and(|command| command.contains(query))
 }
 
 fn service_matches(service: &ServiceInfo, query: &str) -> bool {
@@ -2596,6 +2775,267 @@ mod tests {
         );
     }
 
+    fn processes_tab_with(pids: &[u32]) -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(
+            pids.iter()
+                .map(|&pid| process(pid, &format!("p{pid}")))
+                .collect(),
+        )));
+        app.update(Action::SortProcesses(ProcessSortField::Pid));
+        if app.process_sort().descending {
+            app.update(Action::SortProcesses(ProcessSortField::Pid));
+        }
+        app
+    }
+
+    #[test]
+    fn hidden_process_snapshots_defer_filtering_until_the_tab_returns() {
+        let mut app = processes_tab_with(&[1, 2, 3]);
+        app.update(Action::SelectTab(Tab::Overview));
+
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            process(2, "p2"),
+            process(3, "p3"),
+            process(4, "p4"),
+        ])));
+
+        assert_eq!(app.process_count(), 0, "hidden snapshots skip the rebuild");
+        assert_eq!(app.process_summary().total, 4);
+        assert!(app.select_tab(Tab::Processes));
+        assert_eq!(visible_pids(&app), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn selection_identity_survives_hidden_snapshots() {
+        let mut app = processes_tab_with(&[1, 2, 3]);
+        app.update(Action::SelectProcess(ProcessIdentity {
+            pid: 2,
+            start_time: 2,
+        }));
+        app.update(Action::SelectTab(Tab::Logs));
+
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(5, "p5"),
+            process(2, "p2"),
+            process(1, "p1"),
+        ])));
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(2, "p2"),
+            process(1, "p1"),
+            process(0, "p0"),
+        ])));
+        app.update(Action::SelectTab(Tab::Processes));
+
+        assert_eq!(visible_pids(&app), vec![0, 1, 2]);
+        assert_eq!(app.selected_process().map(|process| process.pid), Some(2));
+        assert_eq!(app.selected_process_index(), Some(2));
+    }
+
+    #[test]
+    fn exited_selection_falls_back_to_its_previous_row_after_hidden_snapshots() {
+        let mut app = processes_tab_with(&[1, 2, 3, 4]);
+        app.update(Action::SelectProcess(ProcessIdentity {
+            pid: 2,
+            start_time: 2,
+        }));
+        app.update(Action::SelectTab(Tab::Overview));
+
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            process(3, "p3"),
+            process(4, "p4"),
+        ])));
+        app.update(Action::SelectTab(Tab::Processes));
+
+        assert_eq!(app.selected_process_index(), Some(1));
+        assert_eq!(app.selected_process().map(|process| process.pid), Some(3));
+    }
+
+    #[test]
+    fn shrinking_hidden_snapshot_never_leaves_out_of_bounds_rows() {
+        let pids: Vec<u32> = (1..=10).collect();
+        let mut app = processes_tab_with(&pids);
+        app.update(Action::ProcessLast);
+        app.update(Action::SelectTab(Tab::Network));
+
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(20, "p20"),
+            process(21, "p21"),
+        ])));
+        for index in 0..10 {
+            assert!(app.process_at(index).is_none());
+        }
+        app.update(Action::SelectTab(Tab::Processes));
+
+        assert_eq!(visible_pids(&app), vec![20, 21]);
+        assert_eq!(app.selected_process().map(|process| process.pid), Some(21));
+    }
+
+    #[test]
+    fn active_search_applies_to_snapshots_received_while_hidden() {
+        let mut app = processes_tab_with(&[1, 2]);
+        app.update(Action::BeginProcessSearch);
+        for character in "ssh".chars() {
+            app.update(Action::AppendProcessSearch(character));
+        }
+        assert!(visible_pids(&app).is_empty());
+        app.update(Action::SelectTab(Tab::Overview));
+
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            process(7, "SSHD"),
+            ProcessInfo {
+                command: Some("/usr/bin/Agent --SSH-auth".into()),
+                ..process(8, "agent")
+            },
+        ])));
+        app.update(Action::SelectTab(Tab::Processes));
+
+        assert_eq!(visible_pids(&app), vec![7, 8]);
+        assert_eq!(app.process_search_query(), "ssh");
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive_with_cached_keys() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "beta"),
+            process(2, "Alpha"),
+            process(3, "gamma"),
+            process(4, "ALPHA"),
+        ])));
+
+        app.update(Action::SortProcesses(ProcessSortField::Name));
+        if app.process_sort().descending {
+            app.update(Action::SortProcesses(ProcessSortField::Name));
+        }
+
+        assert_eq!(visible_pids(&app), vec![2, 4, 1, 3]);
+    }
+
+    const SAMPLING: Duration = Duration::from_secs(1);
+    const SERVICES_PERIOD: Duration = Duration::from_secs(5);
+
+    fn stale_names(app: &App) -> Vec<&'static str> {
+        app.stale_collectors().map(Collector::label).collect()
+    }
+
+    fn fresh_tick(app: &mut App, now: Instant) -> bool {
+        app.update(Action::SystemMetricsUpdated(SystemMetrics::default()));
+        app.update(Action::ProcessesUpdated(ProcessSnapshot::default()));
+        app.update(Action::NetworkUpdated(NetworkSnapshot::default()));
+        app.update(Action::ServicesUpdated(ServiceSnapshot::default()));
+        app.update(Action::Tick(now))
+    }
+
+    #[test]
+    fn staleness_is_disabled_without_configured_periods() {
+        let mut app = App::default();
+        let start = Instant::now();
+
+        app.update(Action::Tick(start));
+        assert!(!app.update(Action::Tick(start + Duration::from_secs(3600))));
+        assert!(stale_names(&app).is_empty());
+    }
+
+    #[test]
+    fn collector_becomes_stale_only_after_three_missed_periods() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(!app.update(Action::Tick(start + SAMPLING * 3)));
+        assert!(
+            stale_names(&app).is_empty(),
+            "exactly at the threshold is fresh"
+        );
+
+        assert!(app.update(Action::Tick(
+            start + SAMPLING * 3 + Duration::from_millis(1)
+        )));
+        assert_eq!(stale_names(&app), ["metrics", "processes", "network"]);
+    }
+
+    #[test]
+    fn stale_transitions_redraw_once_and_recovery_clears_the_marker() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        for seconds in 5..10 {
+            assert!(
+                !app.update(Action::Tick(start + Duration::from_secs(seconds))),
+                "no redraw while staying stale"
+            );
+        }
+
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "back",
+        )])));
+        assert!(app.update(Action::Tick(start + Duration::from_secs(10))));
+        assert_eq!(stale_names(&app), ["metrics", "network"]);
+    }
+
+    #[test]
+    fn hidden_collector_transitions_do_not_redraw() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        app.update(Action::SelectTab(Tab::Logs));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        assert!(!app.update(Action::Tick(start + Duration::from_secs(60))));
+        assert!(stale_names(&app).is_empty());
+
+        app.update(Action::SelectTab(Tab::Services));
+        assert_eq!(stale_names(&app), ["services"]);
+    }
+
+    #[test]
+    fn services_threshold_exceeds_the_systemctl_timeout() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        app.update(Action::SelectTab(Tab::Services));
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+        let slowest_healthy_gap = SERVICES_PERIOD + SYSTEMCTL_TIMEOUT;
+
+        assert!(!app.update(Action::Tick(start + slowest_healthy_gap)));
+        assert!(stale_names(&app).is_empty());
+        assert!(app.update(Action::Tick(
+            start + SERVICES_PERIOD * 2 + SYSTEMCTL_TIMEOUT + Duration::from_millis(1)
+        )));
+        assert_eq!(stale_names(&app), ["services"]);
+    }
+
+    #[test]
+    fn collector_that_never_publishes_becomes_stale_from_the_first_tick() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+
+        assert!(!app.update(Action::Tick(start)));
+        assert!(
+            stale_names(&app).is_empty(),
+            "starting collectors are not stale"
+        );
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        assert_eq!(stale_names(&app), ["metrics", "processes", "network"]);
+    }
+
+    #[test]
+    fn staleness_is_checked_while_a_modal_is_open() {
+        let mut app = App::default().with_collector_periods(SAMPLING, SERVICES_PERIOD);
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+        app.update(Action::ShowHelp);
+
+        assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
+        assert!(!stale_names(&app).is_empty());
+    }
+
     #[test]
     fn inactive_screen_snapshot_updates_do_not_trigger_redraw() {
         let mut app = App::default();
@@ -2606,7 +3046,7 @@ mod tests {
             1, "test",
         )])));
         assert!(proc_redraw);
-        assert_eq!(app.process_count(), 1);
+        assert_eq!(app.process_summary().total, 1);
 
         // Process details may refresh without changing the summary shown on Overview.
         let same_summary_redraw = app.update(Action::ProcessesUpdated(processes(vec![process(

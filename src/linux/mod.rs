@@ -19,7 +19,9 @@ pub use process::{
     send_process_signal, ProcessCollector, ProcessIdentity, ProcessInfo, ProcessSignal,
     ProcessSignalError, ProcessSnapshot, ProcessSummary,
 };
-pub use service::{ServiceCollector, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot};
+pub use service::{
+    ServiceCollector, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot, SYSTEMCTL_TIMEOUT,
+};
 #[cfg(test)]
 pub(crate) use system::LogicalCpuId;
 pub use system::{ByteUsage, LogicalCpuMetrics, SystemMetrics, SystemMetricsCollector};

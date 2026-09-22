@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::{
     action::{InputMode, MouseTarget, ProcessSortField, Tab},
-    app::App,
+    app::{App, Collector},
     linux::ByteUsage,
 };
 
@@ -334,7 +334,14 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         return UiRegions::default();
     }
 
-    let outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    let mut outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    if let Some(marker) = stale_marker(app, area.width) {
+        outer = outer.title_top(
+            Line::from(marker)
+                .right_aligned()
+                .style(Style::default().fg(Color::Yellow)),
+        );
+    }
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -428,6 +435,22 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     }
 
     regions
+}
+
+/// Names the collectors behind this screen whose data stopped updating, falling
+/// back to a bare marker when the names would crowd the title.
+fn stale_marker(app: &App, width: u16) -> Option<String> {
+    let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let detailed = format!(" stale: {} ", names.join(", "));
+    let room = usize::from(width).saturating_sub(" tuxctl ".len() + 4);
+    Some(if detailed.chars().count() <= room {
+        detailed
+    } else {
+        " stale ".to_owned()
+    })
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -900,6 +923,157 @@ mod tests {
             regions.target_at(confirm.x, confirm.y),
             Some(MouseTarget::ProcessSignalConfirm)
         );
+    }
+
+    fn populated_app(tab: Tab) -> App {
+        let mut app = App::default();
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            memory: Some(ByteUsage {
+                used: 4 << 30,
+                total: 16 << 30,
+            }),
+            root_filesystem: Some(ByteUsage {
+                used: 50 << 30,
+                total: 100 << 30,
+            }),
+            ..SystemMetrics::default()
+        }));
+        app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+            interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                name: "lo".into(),
+                operstate: crate::linux::OperState::Unknown,
+                mac_address: None,
+                mtu: Some(65536),
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: 0,
+                tx_packets: 0,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                rx_rate_bytes_per_sec: None,
+                tx_rate_bytes_per_sec: None,
+            }],
+            error: None,
+        }));
+        app.update(Action::LogsUpdated(crate::linux::JournalBatch {
+            entries: vec![crate::linux::JournalEntry {
+                id: 1,
+                timestamp_micros: Some(1_000_000),
+                source: "sshd.service".into(),
+                priority: Some(4),
+                message: "warning message".into(),
+            }],
+            dropped: 0,
+            error: None,
+        }));
+        app.update(Action::SelectTab(tab));
+        app
+    }
+
+    #[test]
+    fn stale_marker_is_shown_in_the_frame_without_hiding_search_state() {
+        let mut app = App::default().with_collector_periods(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        );
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('x'));
+        let start = std::time::Instant::now();
+        app.update(Action::Tick(start));
+        app.update(Action::Tick(start + std::time::Duration::from_secs(10)));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" stale: metrics, processes "));
+        assert!(text.contains("Search: x_"));
+
+        app.update(Action::SelectTab(Tab::Overview));
+        let mut narrow = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        rendered_regions(&mut narrow, &app);
+        let text = buffer_text(&narrow);
+        assert!(
+            text.contains(" stale "),
+            "three names fall back to a bare marker"
+        );
+        assert!(text.contains(" tuxctl "));
+    }
+
+    #[test]
+    fn logs_header_shows_the_full_priority_label() {
+        let app = populated_app(Tab::Logs);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        rendered_regions(&mut terminal, &app);
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PRIORITY"), "priority header was truncated");
+        assert!(text.contains("warning"));
+    }
+
+    #[test]
+    fn overview_filesystem_row_keeps_label_and_bar_separate() {
+        let app = populated_app(Tab::Overview);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        rendered_regions(&mut terminal, &app);
+
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.contains("Filesystem"))
+            .expect("filesystem heading");
+        let row = &lines[heading + 1];
+        let usage = format_usage(ByteUsage {
+            used: 50 << 30,
+            total: 100 << 30,
+        });
+        assert!(row.contains("/  50%  █"), "row: {row}");
+        assert!(row.contains(&format!("░  {usage}")), "row: {row}");
+    }
+
+    #[test]
+    fn loopback_unknown_state_renders_neutrally() {
+        let app = populated_app(Tab::Network);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        rendered_regions(&mut terminal, &app);
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("◌ unknown"));
+        assert!(!text.contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn every_tab_renders_populated_data_at_the_minimum_size() {
+        for tab in [
+            Tab::Overview,
+            Tab::Processes,
+            Tab::Services,
+            Tab::Logs,
+            Tab::Network,
+        ] {
+            let app = populated_app(tab);
+            for (width, height) in [
+                (layout::MIN_TERMINAL_WIDTH, layout::MIN_TERMINAL_HEIGHT),
+                (
+                    layout::MIN_TERMINAL_WIDTH + 1,
+                    layout::MIN_TERMINAL_HEIGHT + 1,
+                ),
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let regions = rendered_regions(&mut terminal, &app);
+                assert!(!regions.tabs.is_empty(), "{tab:?} at {width}x{height}");
+            }
+        }
     }
 
     #[test]

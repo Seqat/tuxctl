@@ -3,7 +3,9 @@
 
 
 # Agent Files
-AGENT.md
+AGENTS.md
+CLAUDE.md
+docs/ROADMAP.md
 
 # Local environment files
 .env

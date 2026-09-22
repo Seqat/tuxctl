@@ -116,7 +116,7 @@ fn render_ram(
     if lines.len() < usize::from(area.height) {
         let usage_line = metrics.memory.map_or_else(
             || "Used  N/A".into(),
-            |memory| ram_usage_line(memory, width),
+            |memory| usage_bar_line("Used  ", memory, width),
         );
         lines.push(Line::from(layout::truncate(&usage_line, width)));
     }
@@ -140,18 +140,20 @@ fn render_ram(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn ram_usage_line(memory: crate::linux::ByteUsage, width: usize) -> String {
-    let percent = memory.percent();
+/// Formats `<label>N%  [bar]  used / total`, dropping the bar when it would be too narrow.
+pub(super) fn usage_bar_line(label: &str, usage: crate::linux::ByteUsage, width: usize) -> String {
+    let percent = usage.percent();
     let percent_text = format!("{percent:.0}%");
-    let usage = format_usage_compact(memory.used, memory.total);
-    let fixed_width = "Used  ".len() + percent_text.chars().count() + 4 + usage.chars().count();
+    let usage = format_usage_compact(usage.used, usage.total);
+    let fixed_width =
+        label.chars().count() + percent_text.chars().count() + 4 + usage.chars().count();
     let gauge_width = width.saturating_sub(fixed_width).min(MAX_RAM_GAUGE_WIDTH);
     if gauge_width < 4 {
-        return layout::truncate(&format!("Used  {percent_text}  {usage}"), width);
+        return layout::truncate(&format!("{label}{percent_text}  {usage}"), width);
     }
     layout::truncate(
         &format!(
-            "Used  {percent_text}  {}  {usage}",
+            "{label}{percent_text}  {}  {usage}",
             utilization_bar(Some(percent), gauge_width)
         ),
         width,
@@ -335,8 +337,8 @@ mod tests {
             used: 8 * 1024 * 1024 * 1024,
             total: 32 * 1024 * 1024 * 1024,
         };
-        let wide = ram_usage_line(memory, 100);
-        let narrow = ram_usage_line(memory, 32);
+        let wide = usage_bar_line("Used  ", memory, 100);
+        let narrow = usage_bar_line("Used  ", memory, 32);
 
         assert_eq!(wide.matches(['█', '░']).count(), MAX_RAM_GAUGE_WIDTH);
         let percent = wide.find("25%").unwrap();

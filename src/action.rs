@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use crate::linux::{
     HardwareInventory, JournalBatch, NetworkSnapshot, ProcessIdentity, ProcessSignal,
@@ -76,7 +76,7 @@ pub enum Action {
     LogViewportChanged { start: usize, height: usize },
     NetworkViewportChanged { start: usize, height: usize },
     Resize,
-    Tick,
+    Tick(Instant),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
