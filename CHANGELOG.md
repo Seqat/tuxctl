@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-22
+
 Reliability and efficiency release. No new keys or screens.
 
 ### Added
@@ -64,6 +66,7 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Seqat/tuxctl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Seqat/tuxctl/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Seqat/tuxctl/releases/tag/v0.1.0

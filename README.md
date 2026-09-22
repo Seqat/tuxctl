@@ -94,6 +94,7 @@ It provides real-time system monitoring, process management, systemd service ins
   - `● up`
   - `○ down`
   - `◌ dormant`
+  - `◌ unknown` (for example, loopback)
 - Detailed interface inspection (`Enter`) including:
   - MAC address
   - MTU
@@ -314,6 +315,9 @@ Repeated sort commands toggle the sort direction.
 - Periodic system, process, service, and network snapshots use bounded newest-state semantics.
 - CPU history and log storage are bounded.
 - Journal processing is bounded per main-loop turn.
+- Background snapshots that arrive together are applied before a single redraw, and background redraws are limited to one every 50 ms; keyboard, mouse, and resize still redraw immediately.
+- `systemctl` listings are bounded by a 10 second timeout, so a hung call cannot stall the Services tab or exit.
+- If a collector stops delivering data, the frame title shows a `stale` marker for the affected screen instead of presenting frozen data as live.
 - Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
 - Inactive screens can update cached state without forcing unnecessary redraws.
 - Terminal restoration remains owned by the main UI lifecycle.
