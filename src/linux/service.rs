@@ -1,5 +1,6 @@
 use std::{
     io::{self, Read},
+    os::unix::process::CommandExt,
     process::{Child, Command, Output, Stdio},
     sync::Arc,
     thread::{self, JoinHandle},
@@ -200,6 +201,9 @@ fn run_with_deadline(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Lead a new process group so helpers the command spawns can be killed
+        // with it; otherwise they would keep our pipes open after a timeout.
+        .process_group(0)
         .spawn()
         .map_err(CommandError::Spawn)?;
     let stdout = drain_pipe(child.stdout.take(), "systemctl-stdout");
@@ -259,6 +263,16 @@ fn drain_pipe(
 }
 
 fn kill_and_reap(child: &mut Child) {
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        if group > 0 {
+            // SAFETY: kill(2) takes plain integers. The child leads its own process
+            // group (`process_group(0)`) and has not been reaped yet, so `-group`
+            // names only that group and cannot refer to a reused PID.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -417,7 +431,7 @@ mod tests {
         let control = CollectorControl::default();
         let started = Instant::now();
 
-        let result = run_with_deadline(shell("sleep 30"), Duration::from_millis(200), &control);
+        let result = run_with_deadline(shell("sleep 30; :"), Duration::from_millis(200), &control);
 
         assert!(matches!(result, Err(CommandError::TimedOut)));
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -429,7 +443,11 @@ mod tests {
         let worker_control = Arc::clone(&control);
         let started = Instant::now();
         let worker = thread::spawn(move || {
-            run_with_deadline(shell("sleep 30"), Duration::from_secs(60), &worker_control)
+            run_with_deadline(
+                shell("sleep 30; :"),
+                Duration::from_secs(60),
+                &worker_control,
+            )
         });
 
         thread::sleep(Duration::from_millis(100));
@@ -495,7 +513,8 @@ mod tests {
             run_collector(
                 Duration::from_secs(60),
                 &worker_control,
-                || match run_with_deadline(shell("sleep 30"), SYSTEMCTL_TIMEOUT, &worker_control) {
+                || match run_with_deadline(shell("sleep 30; :"), SYSTEMCTL_TIMEOUT, &worker_control)
+                {
                     Ok(_) => ServiceSnapshot::default(),
                     Err(_) => ServiceSnapshot::error("stopped".into()),
                 },
