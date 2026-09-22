@@ -963,6 +963,7 @@ mod tests {
             entries: vec![crate::linux::JournalEntry {
                 id: 1,
                 timestamp_micros: Some(1_000_000),
+                local_time: None,
                 source: "sshd.service".into(),
                 priority: Some(4),
                 message: "warning message".into(),

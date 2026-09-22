@@ -390,6 +390,7 @@ mod tests {
         let error_entry = JournalEntry {
             id: 1,
             timestamp_micros: None,
+            local_time: None,
             source: "app".into(),
             priority: Some(3),
             message: "something happened".into(),
@@ -397,6 +398,7 @@ mod tests {
         let warn_entry = JournalEntry {
             id: 2,
             timestamp_micros: None,
+            local_time: None,
             source: "app".into(),
             priority: Some(4),
             message: "look out".into(),

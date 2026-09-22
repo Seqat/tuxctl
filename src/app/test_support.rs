@@ -66,6 +66,7 @@ pub(super) fn log_entry(id: u64, source: &str, priority: u8, message: &str) -> J
     JournalEntry {
         id,
         timestamp_micros: Some(id.saturating_mul(1_000_000)),
+        local_time: None,
         source: source.into(),
         priority: Some(priority),
         message: message.into(),

@@ -76,6 +76,7 @@ It provides real-time system monitoring, process management, systemd service ins
 ### Logs
 
 - Streaming systemd journal viewer using `journalctl`, started the first time the Logs tab is opened.
+- Timestamps in local time (`HH:MM:SS` in the table; full date and UTC offset in the detail view).
 - Bounded log storage to prevent unbounded memory growth.
 - Bounded journal ingestion with dropped-entry accounting under sustained load.
 - Follow mode (`f`).

@@ -564,6 +564,7 @@ mod tests {
             entries: vec![crate::linux::JournalEntry {
                 id,
                 timestamp_micros: None,
+                local_time: None,
                 source: "test".into(),
                 priority: Some(6),
                 message: format!("entry {id}"),

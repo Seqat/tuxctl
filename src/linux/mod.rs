@@ -2,6 +2,7 @@ mod control;
 mod hardware;
 mod journal;
 mod latest_snapshot;
+mod localtime;
 mod network;
 mod process;
 mod rate;
@@ -14,6 +15,8 @@ pub use hardware::{
     GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
 };
 pub use journal::{priority_label, JournalBatch, JournalCollector, JournalEntry};
+#[cfg(test)]
+pub(crate) use localtime::LocalTime;
 pub use network::{NetworkCollector, NetworkInterfaceInfo, NetworkSnapshot, OperState};
 #[cfg(test)]
 pub use process::verify_and_send_signal_at;

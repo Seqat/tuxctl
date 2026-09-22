@@ -22,6 +22,8 @@ pub struct LogRender {
 }
 
 const COLUMN_SPACING: u16 = 1;
+/// Shown when a journal entry has no convertible timestamp.
+const UNKNOWN_TIME: &str = "--:--:--";
 const COLUMN_WIDTHS: [Constraint; 4] = [
     Constraint::Length(11),
     Constraint::Percentage(28),
@@ -85,7 +87,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> LogRender {
             Row::new([
                 Cell::from(format!(
                     "{prefix}{}",
-                    format_timestamp(entry.timestamp_micros)
+                    entry
+                        .local_time
+                        .map_or_else(|| UNKNOWN_TIME.to_owned(), |time| time.clock())
                 )),
                 Cell::from(entry.source.as_str()),
                 Cell::from(priority_label(entry.priority)).style(priority_style(entry.priority)),
@@ -95,7 +99,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> LogRender {
         )
     });
 
-    let header = Row::new(["  TIME UTC", "UNIT/SOURCE", "PRIORITY", "MESSAGE"]).style(
+    let header = Row::new(["  TIME", "UNIT/SOURCE", "PRIORITY", "MESSAGE"]).style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -216,7 +220,9 @@ pub fn render_detail(frame: &mut Frame, entry: Option<&JournalEntry>, area: Rect
             let mut lines = vec![
                 Line::from(format!(
                     "Time:     {}",
-                    format_timestamp(entry.timestamp_micros)
+                    entry
+                        .local_time
+                        .map_or_else(|| UNKNOWN_TIME.to_owned(), |time| time.full())
                 )),
                 Line::from(format!("Source:   {}", entry.source)),
                 Line::from(format!("Priority: {}", priority_label(entry.priority))),
@@ -260,19 +266,6 @@ fn priority_style(priority: Option<u8>) -> Style {
     }
 }
 
-fn format_timestamp(timestamp_micros: Option<u64>) -> String {
-    let Some(seconds) = timestamp_micros.map(|value| value / 1_000_000) else {
-        return "--:--:--".into();
-    };
-    let seconds = seconds % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3_600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
-}
-
 fn single_line(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -284,11 +277,78 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
-    fn formats_timestamp_and_priorities() {
-        assert_eq!(format_timestamp(Some(3_723_000_000)), "01:02:03");
-        assert_eq!(format_timestamp(None), "--:--:--");
+    fn formats_priorities() {
         assert_eq!(priority_label(Some(3)), "error");
         assert_eq!(priority_label(Some(99)), "-");
+    }
+
+    fn rendered_rows(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn entry_at(local_time: Option<crate::linux::LocalTime>) -> JournalEntry {
+        JournalEntry {
+            id: 7,
+            timestamp_micros: Some(1_000_000),
+            local_time,
+            source: "sshd.service".into(),
+            priority: Some(6),
+            message: "Accepted publickey".into(),
+        }
+    }
+
+    const EVENING: crate::linux::LocalTime = crate::linux::LocalTime {
+        year: 2026,
+        month: 9,
+        day: 22,
+        hour: 21,
+        minute: 4,
+        second: 5,
+        utc_offset_seconds: 3 * 3600,
+    };
+
+    #[test]
+    fn table_shows_local_clock_time_under_a_time_header() {
+        let mut app = App::default();
+        app.update(crate::action::Action::SelectTab(crate::action::Tab::Logs));
+        app.update(crate::action::Action::LogsUpdated(
+            crate::linux::JournalBatch {
+                entries: vec![entry_at(Some(EVENING))],
+                dropped: 0,
+                error: None,
+            },
+        ));
+
+        let rows = rendered_rows(100, 10, |frame| {
+            render(frame, &app, frame.area());
+        });
+        let text = rows.join("\n");
+        assert!(text.contains("  TIME "), "{text}");
+        assert!(!text.contains("UTC"), "{text}");
+        assert!(text.contains("21:04:05"), "{text}");
+    }
+
+    #[test]
+    fn detail_shows_full_local_time_and_falls_back_when_unknown() {
+        let rows = rendered_rows(100, 20, |frame| {
+            render_detail(frame, Some(&entry_at(Some(EVENING))), frame.area());
+        });
+        assert!(rows
+            .join("\n")
+            .contains("Time:     2026-09-22 21:04:05 +0300"));
+
+        let rows = rendered_rows(100, 20, |frame| {
+            render_detail(frame, Some(&entry_at(None)), frame.area());
+        });
+        assert!(rows.join("\n").contains("Time:     --:--:--"));
     }
 
     #[test]
@@ -301,6 +361,7 @@ mod tests {
         let entry = JournalEntry {
             id: 1,
             timestamp_micros: Some(1_000_000),
+            local_time: None,
             source: "test".into(),
             priority: Some(3),
             message: "line1\nline2\nline3".into(),
