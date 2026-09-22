@@ -70,11 +70,12 @@ It provides real-time system monitoring, process management, systemd service ins
   - `◌ activating`
 - Case-insensitive search (`/`).
 - On-demand refresh (`r`).
+- Services are collected only while the tab is visible and refreshed each time it is opened.
 - Read-only service inspection (`Enter`).
 
 ### Logs
 
-- Streaming systemd journal viewer using `journalctl`.
+- Streaming systemd journal viewer using `journalctl`, started the first time the Logs tab is opened.
 - Bounded log storage to prevent unbounded memory growth.
 - Bounded journal ingestion with dropped-entry accounting under sustained load.
 - Follow mode (`f`).
@@ -317,6 +318,7 @@ Repeated sort commands toggle the sort direction.
 - Journal processing is bounded per main-loop turn.
 - Background snapshots that arrive together are applied before a single redraw, and background redraws are limited to one every 50 ms; keyboard, mouse, and resize still redraw immediately.
 - `systemctl` listings are bounded by a 10 second timeout, so a hung call cannot stall the Services tab or exit.
+- `systemctl` and `journalctl` are not run until the Services or Logs tab is opened; Services collection pauses again while its tab is hidden.
 - If a collector stops delivering data, the frame title shows a `stale` marker for the affected screen instead of presenting frozen data as live.
 - Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
 - Inactive screens can update cached state without forcing unnecessary redraws.
@@ -335,7 +337,7 @@ The normal interface requires a terminal size of at least:
 
 Below either dimension, `tuxctl` displays a terminal-too-small warning instead of attempting to render the normal interface.
 
-Within supported dimensions, layouts adapt to available space. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
+Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview sections that do not fit are omitted rather than shown as empty headings; the CPU grid always reports how many logical CPUs are not shown. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
 
 ---
 
