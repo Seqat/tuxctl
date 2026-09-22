@@ -7,6 +7,7 @@ mod network;
 mod overview;
 mod processes;
 mod services;
+mod status;
 
 use std::sync::Arc;
 
@@ -1242,6 +1243,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The rendered row containing `persistent` (the search or filter text).
+    fn status_row(app: &App, width: u16, persistent: &str) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        rendered_regions(&mut terminal, app);
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .find(|row| row.contains(persistent))
+            .unwrap_or_else(|| panic!("{persistent:?} is not visible at width {width}"))
+    }
+
+    fn process_info(pid: u32, name: &str) -> crate::linux::ProcessInfo {
+        crate::linux::ProcessInfo {
+            pid,
+            name: name.into(),
+            cpu_percent: None,
+            memory_bytes: 0,
+            command: None,
+            state: "S".into(),
+            parent_pid: 1,
+            state_code: 'S',
+            start_time: u64::from(pid),
+        }
+    }
+
+    fn process_snapshot(processes: Vec<crate::linux::ProcessInfo>) -> Action {
+        Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes,
+            error: None,
+        })
+    }
+
+    /// Processes tab with a committed filter "ss" (typed, detail opened and closed).
+    fn filtered_processes_app() -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(process_snapshot(vec![
+            process_info(1, "sshd"),
+            process_info(2, "init"),
+        ]));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('s'));
+        app.update(Action::AppendProcessSearch('s'));
+        app.update(Action::OpenProcessDetails);
+        app.update(Action::Escape);
+        assert_eq!(app.input_mode(), InputMode::Normal);
+        app
+    }
+
+    #[test]
+    fn process_filter_stays_visible_with_an_action_message() {
+        let mut app = filtered_processes_app();
+        app.update(Action::RequestProcessSignal(
+            crate::linux::ProcessSignal::Term,
+        ));
+        app.update(process_snapshot(vec![process_info(2, "init")]));
+        assert!(app.process_action_message().is_some());
+
+        status_row(&app, 40, "Filter: \"ss\"");
+        let row = status_row(&app, 120, "Filter: \"ss\"");
+        assert!(row.contains("exited before signal"), "{row}");
+    }
+
+    #[test]
+    fn process_filter_stays_visible_with_a_refresh_error() {
+        let mut app = filtered_processes_app();
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        }));
+
+        status_row(&app, 40, "Filter: \"ss\"");
+        let row = status_row(&app, 120, "Filter: \"ss\"");
+        assert!(row.contains("Refresh error: proc unavailable"), "{row}");
+    }
+
+    #[test]
+    fn service_search_and_filter_stay_visible_while_refreshing_or_failing() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        assert!(app.service_refreshing());
+        app.update(Action::BeginServiceSearch);
+        app.update(Action::AppendServiceSearch('x'));
+        status_row(&app, 40, "Search: x_");
+        let row = status_row(&app, 120, "Search: x_");
+        assert!(row.contains("Refreshing system services"), "{row}");
+
+        let generation = app.take_service_refresh_request().unwrap();
+        app.update(Action::ServicesUpdated(crate::linux::ServiceSnapshot {
+            services: vec![crate::linux::ServiceInfo {
+                unit: "xyz.service".into(),
+                load_state: "loaded".into(),
+                active_state: "active".into(),
+                sub_state: "running".into(),
+                description: "X".into(),
+            }],
+            error: None,
+            completed_refresh_generation: generation,
+        }));
+        app.update(Action::OpenServiceDetails);
+        app.update(Action::Escape);
+        app.update(Action::ServicesUpdated(crate::linux::ServiceSnapshot {
+            error: Some("bus unavailable".into()),
+            ..Default::default()
+        }));
+        status_row(&app, 40, "Filter: \"x\"");
+        let row = status_row(&app, 120, "Filter: \"x\"");
+        assert!(row.contains("Refresh error: bus unavailable"), "{row}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
 };
@@ -13,7 +13,7 @@ use crate::{
     linux::{ProcessIdentity, ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
-use super::{format_bytes, hardware::utilization_bar, layout};
+use super::{format_bytes, hardware::utilization_bar, layout, status};
 
 pub struct ProcessRender {
     pub rows: Vec<(ProcessIdentity, Rect)>,
@@ -251,38 +251,39 @@ fn system_percent(percent: Option<f64>) -> String {
 }
 
 fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.process_searching() {
-        format!(" Search: {}_", app.process_search_query())
-    } else if let Some(msg) = app.process_action_message() {
-        format!(" {msg}")
-    } else if let Some(error) = app.process_error() {
-        format!(" Refresh error: {error}")
-    } else if app.process_search_query().is_empty() {
-        let sort_info = format!(
-            "Sort: {}{}",
-            app.process_sort().field.as_str(),
-            if app.process_sort().descending {
-                "▼"
-            } else {
-                "▲"
-            }
-        );
-        if area.width >= 85 {
-            format!(" {sort_info}   / search   Enter details   t term   K kill")
-        } else if area.width >= 60 {
-            " / search   Enter details   t term   K kill".into()
-        } else {
-            " / find   Enter view".into()
-        }
-    } else if area.width >= 75 {
-        format!(
-            " Filter: \"{}\"   / edit   Esc clear   t term   K kill",
-            app.process_search_query()
+    let query = app.process_search_query();
+    let (persistent, hints): (String, &[&str]) = if app.process_searching() {
+        (format!("Search: {query}_"), &[])
+    } else if !query.is_empty() {
+        (
+            format!("Filter: \"{query}\""),
+            &["/ edit   Esc clear   t term   K kill", "Esc clear"],
         )
     } else {
-        format!(" Filter: \"{}\"   Esc clear", app.process_search_query())
+        let sort = app.process_sort();
+        (
+            format!(
+                "Sort: {}{}",
+                sort.field.as_str(),
+                if sort.descending { "▼" } else { "▲" }
+            ),
+            &[
+                "/ search   Enter details   t term   K kill",
+                "/ find   Enter view",
+            ],
+        )
     };
-    frame.render_widget(Paragraph::new(text), area);
+    let notice = app
+        .process_action_message()
+        .map(|message| Span::raw(message.to_owned()))
+        .or_else(|| {
+            app.process_error()
+                .map(|error| Span::raw(format!("Refresh error: {error}")))
+        });
+    frame.render_widget(
+        Paragraph::new(status::status_line(persistent, notice, hints, area.width)),
+        area,
+    );
 }
 
 pub fn render_signal_confirmation(

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
 };
@@ -14,7 +14,7 @@ use crate::{
     linux::ServiceInfo,
 };
 
-use super::layout;
+use super::{layout, status};
 
 pub struct ServiceRender {
     pub rows: Vec<(Arc<str>, Rect)>,
@@ -144,35 +144,33 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ServiceRender {
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.service_refreshing() {
-        " Refreshing system services…".to_owned()
-    } else if let Some(error) = app.service_error() {
-        format!(" Refresh error: {error}   r retry")
-    } else if app.service_searching() {
-        format!(" Search: {}_", app.service_search_query())
-    } else if app.service_search_query().is_empty() {
-        if area.width >= 70 {
-            format!(
-                " {} services   / search   Enter details   r refresh",
-                app.service_count()
-            )
-        } else {
-            format!(" {} services   / search   r refresh", app.service_count())
-        }
-    } else if area.width >= 70 {
-        format!(
-            " Filter: \"{}\" ({} matches)   / edit   Esc clear   Enter details",
-            app.service_search_query(),
-            app.service_count()
+    let query = app.service_search_query();
+    let (persistent, hints): (String, &[&str]) = if app.service_searching() {
+        (format!("Search: {query}_"), &[])
+    } else if !query.is_empty() {
+        (
+            format!("Filter: \"{query}\" ({} matches)", app.service_count()),
+            &["/ edit   Esc clear   Enter details", "Esc clear"],
         )
     } else {
-        format!(
-            " Filter: \"{}\" ({} matches)   Esc clear",
-            app.service_search_query(),
-            app.service_count()
+        (
+            format!("{} services", app.service_count()),
+            &[
+                "/ search   Enter details   r refresh",
+                "/ search   r refresh",
+            ],
         )
     };
-    frame.render_widget(Paragraph::new(text), area);
+    let notice = if app.service_refreshing() {
+        Some(Span::raw("Refreshing system services…"))
+    } else {
+        app.service_error()
+            .map(|error| Span::raw(format!("Refresh error: {error}   r retry")))
+    };
+    frame.render_widget(
+        Paragraph::new(status::status_line(persistent, notice, hints, area.width)),
+        area,
+    );
 }
 
 pub fn render_detail(frame: &mut Frame, service: Option<&ServiceInfo>, area: Rect) {
