@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod event;
 mod linux;
+mod shutdown;
 mod ui;
 
 use std::{
@@ -47,6 +48,7 @@ fn main() -> io::Result<()> {
         }
     };
     let periods = CollectorPeriods::for_sampling_interval(interval);
+    let shutdown = shutdown::Shutdown::install()?;
 
     let main_thread = std::thread::current().id();
     let default_panic = std::panic::take_hook();
@@ -93,7 +95,7 @@ fn main() -> io::Result<()> {
         while !app.should_quit() {
             let ready = |events: &mut EventHandler, hovered: Option<&action::MouseTarget>| {
                 poll_ready_action(
-                    || events.poll_action(&regions, hovered),
+                    || input_action(&shutdown, || events.poll_action(&regions, hovered)),
                     || metrics.latest().map(action::Action::SystemMetricsUpdated),
                     || processes.latest().map(action::Action::ProcessesUpdated),
                     || services.latest().map(action::Action::ServicesUpdated),
@@ -141,11 +143,18 @@ fn main() -> io::Result<()> {
         Ok(())
     })();
 
-    finish_application(
+    let result = finish_application(
         terminal,
         (hardware, network, journal, services, processes, metrics),
         run_result,
-    )
+    );
+    // After a signal the terminal is restored and the workers have stopped;
+    // end the way the signal would have, even if the loop ended in an error
+    // (after SIGHUP the terminal is usually gone).
+    if let Some(signal) = shutdown.requested() {
+        shutdown::terminate(signal)?;
+    }
+    result
 }
 
 fn finish_application<T, W, R>(terminal: T, workers: W, result: io::Result<R>) -> io::Result<R> {
@@ -182,6 +191,18 @@ fn poll_ready_action(
         return Ok(Some(action));
     }
     Ok(journal())
+}
+
+/// Input source for the main loop: a termination signal becomes `Quit` and
+/// outranks pending terminal input.
+fn input_action(
+    shutdown: &shutdown::Shutdown,
+    terminal: impl FnOnce() -> io::Result<Option<action::Action>>,
+) -> io::Result<Option<action::Action>> {
+    match shutdown.requested() {
+        Some(_) => Ok(Some(action::Action::Quit)),
+        None => terminal(),
+    }
 }
 
 /// Applies `first` and then further ready actions, up to [`MAX_ACTIONS_PER_TURN`].
@@ -828,6 +849,43 @@ mod tests {
 
         assert!(matches!(action, Some(Action::NetworkUpdated(_))));
         assert_eq!(journal_polls, 0);
+    }
+
+    #[test]
+    fn a_termination_signal_quits_before_pending_input_and_snapshots() {
+        let shutdown = crate::shutdown::Shutdown::default();
+        let mut terminal_polls = 0;
+        assert_eq!(
+            input_action(&shutdown, || {
+                terminal_polls += 1;
+                Ok(Some(Action::NextTab))
+            })
+            .unwrap(),
+            Some(Action::NextTab)
+        );
+
+        shutdown.simulate(signal_hook::consts::SIGTERM);
+        let action = poll_ready_action(
+            || {
+                input_action(&shutdown, || {
+                    terminal_polls += 1;
+                    Ok(Some(Action::NextTab))
+                })
+            },
+            || Some(Action::SystemMetricsUpdated(metrics_with_cpu(1.0))),
+            no_ready_action,
+            no_ready_action,
+            no_ready_action,
+            no_ready_action,
+            no_ready_action,
+        )
+        .unwrap();
+
+        assert_eq!(action, Some(Action::Quit));
+        assert_eq!(
+            terminal_polls, 1,
+            "pending input is not read after a signal"
+        );
     }
 
     #[test]

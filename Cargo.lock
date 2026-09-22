@@ -501,6 +501,7 @@ dependencies = [
  "libc",
  "ratatui",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]
