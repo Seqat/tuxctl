@@ -285,15 +285,28 @@ impl Drop for ProcessCollector {
 struct ProcessSampler {
     previous_system_ticks: Option<u64>,
     previous_process_ticks: HashMap<ProcessIdentity, u64>,
+    /// Command lines of live processes, keyed by identity and tagged with the
+    /// `comm` name they were read under. Rebuilt every collection, so it only
+    /// holds processes present in the latest snapshot.
+    commands: HashMap<ProcessIdentity, CachedCommand>,
+}
+
+struct CachedCommand {
+    name: String,
+    command: Option<String>,
 }
 
 impl ProcessSampler {
     fn collect(&mut self) -> ProcessSnapshot {
-        let system_cpu = fs::read_to_string(Path::new(PROC).join("stat"))
+        self.collect_at(Path::new(PROC))
+    }
+
+    fn collect_at(&mut self, proc_root: &Path) -> ProcessSnapshot {
+        let system_cpu = fs::read_to_string(proc_root.join("stat"))
             .ok()
             .and_then(|contents| parse_system_cpu(&contents));
         let page_size = page_size();
-        let entries = match fs::read_dir(PROC) {
+        let entries = match fs::read_dir(proc_root) {
             Ok(entries) => entries,
             Err(error) => {
                 return ProcessSnapshot {
@@ -304,6 +317,7 @@ impl ProcessSampler {
         };
 
         let mut raw_processes = Vec::new();
+        let mut next_commands = HashMap::with_capacity(self.commands.len());
         for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -313,10 +327,28 @@ impl ProcessSampler {
                 continue;
             };
 
-            if let Some(process) = read_process(&entry.path(), pid, page_size) {
+            let path = entry.path();
+            if let Some(mut process) = read_process(&path, pid, page_size) {
+                let identity = ProcessIdentity {
+                    pid: process.pid,
+                    start_time: process.start_time,
+                };
+                // Only new identities read cmdline/exe. A changed comm means the
+                // process exec'd since it was cached, so its command is re-read.
+                let cached = self
+                    .commands
+                    .remove(&identity)
+                    .filter(|cached| cached.name == process.name)
+                    .unwrap_or_else(|| CachedCommand {
+                        name: process.name.clone(),
+                        command: read_command(&path),
+                    });
+                process.command = cached.command.clone();
+                next_commands.insert(identity, cached);
                 raw_processes.push(process);
             }
         }
+        self.commands = next_commands;
 
         let system_delta = system_cpu.zip(self.previous_system_ticks).and_then(
             |((current, cpu_count), previous)| {
@@ -377,12 +409,11 @@ struct RawProcess {
 
 fn read_process(path: &Path, expected_pid: u32, page_size: u64) -> Option<RawProcess> {
     let contents = fs::read_to_string(path.join("stat")).ok()?;
-    let mut process = parse_process_stat(&contents, page_size)?;
+    let process = parse_process_stat(&contents, page_size)?;
     if process.pid != expected_pid {
         return None;
     }
 
-    process.command = read_command(path);
     Some(process)
 }
 
@@ -551,6 +582,133 @@ mod tests {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
+    }
+
+    /// Removes a temporary proc tree when a test ends, including on assertion failure.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_cmdline(proc_dir: &Path, pid: u32, cmdline: &[u8]) {
+        fs::write(proc_dir.join(pid.to_string()).join("cmdline"), cmdline).unwrap();
+    }
+
+    fn collected_command(
+        sampler: &mut ProcessSampler,
+        proc_dir: &Path,
+        pid: u32,
+    ) -> Option<String> {
+        sampler
+            .collect_at(proc_dir)
+            .processes
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .expect("process collected")
+            .command
+    }
+
+    #[test]
+    fn command_line_is_read_once_per_process_identity() {
+        let proc_dir = temp_proc_dir("cmdline_cache");
+        let _cleanup = TempDir(proc_dir.clone());
+        write_process_stat(&proc_dir, 10, "server", 500);
+        write_cmdline(&proc_dir, 10, b"/usr/bin/server\0--flag\0");
+        let mut sampler = ProcessSampler::default();
+
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("/usr/bin/server --flag")
+        );
+        write_cmdline(&proc_dir, 10, b"rewritten\0");
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("/usr/bin/server --flag"),
+            "an unchanged identity must reuse the cached command"
+        );
+    }
+
+    #[test]
+    fn reused_pid_with_new_start_time_rereads_the_command() {
+        let proc_dir = temp_proc_dir("cmdline_pid_reuse");
+        let _cleanup = TempDir(proc_dir.clone());
+        write_process_stat(&proc_dir, 10, "server", 500);
+        write_cmdline(&proc_dir, 10, b"old\0");
+        let mut sampler = ProcessSampler::default();
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("old")
+        );
+
+        write_process_stat(&proc_dir, 10, "server", 501);
+        write_cmdline(&proc_dir, 10, b"new\0");
+
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn exec_detected_by_comm_change_rereads_the_command() {
+        let proc_dir = temp_proc_dir("cmdline_exec");
+        let _cleanup = TempDir(proc_dir.clone());
+        write_process_stat(&proc_dir, 10, "bash", 500);
+        write_cmdline(&proc_dir, 10, b"bash\0");
+        let mut sampler = ProcessSampler::default();
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("bash")
+        );
+
+        write_process_stat(&proc_dir, 10, "ls", 500);
+        write_cmdline(&proc_dir, 10, b"ls\0-l\0");
+
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 10).as_deref(),
+            Some("ls -l")
+        );
+    }
+
+    #[test]
+    fn exited_processes_are_evicted_from_the_command_cache() {
+        let proc_dir = temp_proc_dir("cmdline_evict");
+        let _cleanup = TempDir(proc_dir.clone());
+        write_process_stat(&proc_dir, 10, "short", 500);
+        write_process_stat(&proc_dir, 11, "long", 600);
+        let mut sampler = ProcessSampler::default();
+        sampler.collect_at(&proc_dir);
+        assert_eq!(sampler.commands.len(), 2);
+
+        fs::remove_dir_all(proc_dir.join("10")).unwrap();
+        sampler.collect_at(&proc_dir);
+
+        assert_eq!(sampler.commands.len(), 1);
+        assert!(sampler.commands.contains_key(&ProcessIdentity {
+            pid: 11,
+            start_time: 600
+        }));
+    }
+
+    #[test]
+    fn kernel_threads_without_a_command_are_not_retried() {
+        let proc_dir = temp_proc_dir("cmdline_kthread");
+        let _cleanup = TempDir(proc_dir.clone());
+        write_process_stat(&proc_dir, 2, "kthreadd", 3);
+        write_cmdline(&proc_dir, 2, b"");
+        let mut sampler = ProcessSampler::default();
+        assert_eq!(collected_command(&mut sampler, &proc_dir, 2), None);
+
+        write_cmdline(&proc_dir, 2, b"late\0");
+
+        assert_eq!(
+            collected_command(&mut sampler, &proc_dir, 2),
+            None,
+            "a missing command is cached for the identity instead of re-read every sample"
+        );
     }
 
     #[test]
