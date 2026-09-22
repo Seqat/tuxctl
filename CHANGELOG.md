@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-23
+
+Groundwork for v0.3.0, plus a few small features pulled forward.
+
+### Added
+
+- `--interval <DURATION>` sets the sampling interval for CPU, memory and
+  network (`250ms` to `60s`; default `1s`). Process scans stay at most once
+  per second and `systemctl` at most every 5 seconds.
+- `-h`/`--help` and `-V`/`--version`.
+- The Overview CPU history states the time span its sparkline covers.
+- The process detail view shows whether a process is a kernel thread.
+- Journal timestamps are shown in local time; the log detail view includes
+  the full date and UTC offset.
+- CI on GitHub Actions (fmt, clippy, tests, MSRV 1.88) and development
+  scripts for pty smoke tests and CPU/RSS/redraw measurements
+  (`scripts/`, opt-in `redraw-counter` feature).
+
+### Changed
+
+- The process sort indicator is shown at every terminal width.
+- Stale markers use each collector's own sampling period.
+
+### Fixed
+
+- Status lines no longer hide an active search or filter: on Processes a
+  signal result or refresh error, and on Services "Refreshing…" or a
+  refresh error, now appear after it instead of replacing it.
+- A timed-out `systemctl` that had spawned helper processes could keep its
+  output pipes open and delay collector shutdown; the whole process group is
+  now killed.
+
+### Internal
+
+- `src/app.rs` split into per-screen modules; modals tracked as a single
+  overlay; global tab keys shared; key-binding, README and Esc-order tests;
+  shared counter-rate helper.
+
 ## [0.2.2] - 2026-09-22
 
 Collector lifecycle and narrow-layout release. No new keys or screens.
@@ -88,7 +126,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5
 [0.2.2]: https://github.com/Seqat/tuxctl/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Seqat/tuxctl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Seqat/tuxctl/compare/v0.1.0...v0.2.0

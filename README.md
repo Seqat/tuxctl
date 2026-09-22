@@ -334,6 +334,7 @@ Repeated sort commands toggle the sort direction.
 - Background snapshots that arrive together are applied before a single redraw, and background redraws are limited to one every 50 ms; keyboard, mouse, and resize still redraw immediately.
 - `systemctl` listings are bounded by a 10 second timeout, so a hung call cannot stall the Services tab or exit.
 - `systemctl` and `journalctl` are not run until the Services or Logs tab is opened; Services collection pauses again while its tab is hidden.
+- Status lines keep an active search or filter visible; messages and errors are shown after it, never instead of it.
 - If a collector stops delivering data, the frame title shows a `stale` marker for the affected screen instead of presenting frozen data as live.
 - Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
 - Inactive screens can update cached state without forcing unnecessary redraws.
