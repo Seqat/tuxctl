@@ -42,7 +42,7 @@ impl App {
     }
 
     pub fn service_detail_visible(&self) -> bool {
-        self.service_detail_visible
+        self.overlay == Some(Overlay::ServiceDetail)
     }
 
     pub fn service_error(&self) -> Option<&str> {
@@ -97,7 +97,7 @@ impl App {
             self.selected_service = self
                 .service_at(replacement)
                 .map(|service| service.unit.clone());
-            self.service_detail_visible = false;
+            self.close_overlay(&Overlay::ServiceDetail);
         }
         self.reconcile_hovered_service();
         self.ensure_service_visible();
@@ -201,7 +201,7 @@ impl App {
     pub(super) fn open_service_details(&mut self) -> bool {
         if self.active_tab == Tab::Services && self.selected_service().is_some() {
             self.service_searching = false;
-            self.service_detail_visible = true;
+            self.overlay = Some(Overlay::ServiceDetail);
             self.hovered = None;
             true
         } else {

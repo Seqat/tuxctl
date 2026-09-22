@@ -76,11 +76,24 @@ impl AggregateCpuHistory {
     }
 }
 
+/// The modal layer shown above the active screen; at most one is open at a time.
+///
+/// v0.3.0 adds the Esc main menu, About and Options pages here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Overlay {
+    Help,
+    ProcessDetail,
+    ServiceDetail,
+    LogDetail,
+    NetworkDetail,
+    ProcessSignal(ProcessSignalConfirmation),
+}
+
 #[derive(Debug)]
 pub struct App {
+    overlay: Option<Overlay>,
     should_quit: bool,
     active_tab: Tab,
-    help_visible: bool,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
     aggregate_cpu_history: AggregateCpuHistory,
@@ -98,10 +111,8 @@ pub struct App {
     process_view_height: usize,
     process_search_query: String,
     process_searching: bool,
-    process_detail_visible: bool,
     process_error: Option<String>,
     process_sort: ProcessSort,
-    process_signal_confirmation: Option<ProcessSignalConfirmation>,
     process_action_message: Option<String>,
     services: Vec<ServiceInfo>,
     filtered_services: Vec<usize>,
@@ -110,7 +121,6 @@ pub struct App {
     service_view_height: usize,
     service_search_query: String,
     service_searching: bool,
-    service_detail_visible: bool,
     service_error: Option<String>,
     service_refresh_generation: ServiceRefreshGeneration,
     service_refresh_requested: Option<ServiceRefreshGeneration>,
@@ -122,7 +132,6 @@ pub struct App {
     log_view_height: usize,
     log_search_query: String,
     log_searching: bool,
-    log_detail_visible: bool,
     log_following: bool,
     log_paused: bool,
     log_dropped: usize,
@@ -131,7 +140,6 @@ pub struct App {
     selected_network: Option<String>,
     network_scroll: usize,
     network_view_height: usize,
-    network_detail_visible: bool,
     network_error: Option<String>,
     hovered: Option<MouseTarget>,
     collector_health: [CollectorHealth; 4],
@@ -141,9 +149,9 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            overlay: None,
             should_quit: false,
             active_tab: Tab::Overview,
-            help_visible: false,
             system_metrics: SystemMetrics::default(),
             hardware: None,
             aggregate_cpu_history: AggregateCpuHistory::default(),
@@ -157,10 +165,8 @@ impl Default for App {
             process_view_height: 0,
             process_search_query: String::new(),
             process_searching: false,
-            process_detail_visible: false,
             process_error: None,
             process_sort: ProcessSort::default(),
-            process_signal_confirmation: None,
             process_action_message: None,
             services: Vec::new(),
             filtered_services: Vec::new(),
@@ -169,7 +175,6 @@ impl Default for App {
             service_view_height: 0,
             service_search_query: String::new(),
             service_searching: false,
-            service_detail_visible: false,
             service_error: None,
             service_refresh_generation: 0,
             service_refresh_requested: None,
@@ -181,7 +186,6 @@ impl Default for App {
             log_view_height: 0,
             log_search_query: String::new(),
             log_searching: false,
-            log_detail_visible: false,
             log_following: true,
             log_paused: false,
             log_dropped: 0,
@@ -190,7 +194,6 @@ impl Default for App {
             selected_network: None,
             network_scroll: 0,
             network_view_height: 0,
-            network_detail_visible: false,
             network_error: None,
             hovered: None,
             collector_health: [CollectorHealth::default(); 4],
@@ -219,7 +222,7 @@ impl App {
     }
 
     pub fn help_visible(&self) -> bool {
-        self.help_visible
+        self.overlay == Some(Overlay::Help)
     }
 
     pub fn system_metrics(&self) -> &SystemMetrics {
@@ -235,18 +238,15 @@ impl App {
     }
 
     pub fn input_mode(&self) -> InputMode {
-        if self.help_visible {
-            InputMode::Help
-        } else if self.process_signal_confirmation.is_some() {
-            InputMode::ProcessSignalConfirm
-        } else if self.process_detail_visible {
-            InputMode::ProcessDetail
-        } else if self.service_detail_visible {
-            InputMode::ServiceDetail
-        } else if self.log_detail_visible {
-            InputMode::LogDetail
-        } else if self.network_detail_visible {
-            InputMode::NetworkDetail
+        if let Some(overlay) = &self.overlay {
+            match overlay {
+                Overlay::Help => InputMode::Help,
+                Overlay::ProcessSignal(_) => InputMode::ProcessSignalConfirm,
+                Overlay::ProcessDetail => InputMode::ProcessDetail,
+                Overlay::ServiceDetail => InputMode::ServiceDetail,
+                Overlay::LogDetail => InputMode::LogDetail,
+                Overlay::NetworkDetail => InputMode::NetworkDetail,
+            }
         } else if self.process_searching {
             InputMode::ProcessSearch
         } else if self.service_searching {
@@ -361,17 +361,9 @@ impl App {
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
             Action::Resize => unreachable!("resize actions return before modal suppression"),
-            _ if self.help_visible
-                || self.process_signal_confirmation.is_some()
-                || self.process_detail_visible
-                || self.service_detail_visible
-                || self.log_detail_visible
-                || self.network_detail_visible =>
-            {
-                false
-            }
+            _ if self.overlay.is_some() => false,
             Action::ShowHelp => {
-                self.help_visible = true;
+                self.overlay = Some(Overlay::Help);
                 self.hovered = None;
                 true
             }
@@ -445,28 +437,26 @@ impl App {
         }
     }
 
+    /// Closes `overlay` if it is the one open; other overlays stay.
+    fn close_overlay(&mut self, overlay: &Overlay) {
+        if self.overlay.as_ref() == Some(overlay) {
+            self.overlay = None;
+        }
+    }
+
     fn select_tab(&mut self, tab: Tab) -> bool {
         let entering_services = tab == Tab::Services && self.active_tab != Tab::Services;
+        // Tab actions are blocked while an overlay is open, so none is open here.
         let changed = self.active_tab != tab
-            || self.process_signal_confirmation.is_some()
             || self.process_searching
-            || self.process_detail_visible
             || self.service_searching
-            || self.service_detail_visible
             || self.log_searching
-            || self.log_detail_visible
-            || self.network_detail_visible
             || self.hovered.is_some();
         self.active_tab = tab;
-        self.process_signal_confirmation = None;
         self.process_action_message = None;
         self.process_searching = false;
-        self.process_detail_visible = false;
         self.service_searching = false;
-        self.service_detail_visible = false;
         self.log_searching = false;
-        self.log_detail_visible = false;
-        self.network_detail_visible = false;
         self.hovered = None;
         if tab == Tab::Processes && self.deferred_process_rebuild.is_some() {
             self.rebuild_process_filter();
@@ -482,22 +472,9 @@ impl App {
     }
 
     fn escape(&mut self) -> bool {
-        if self.help_visible {
-            self.help_visible = false;
-            true
-        } else if self.process_signal_confirmation.is_some() {
+        if matches!(self.overlay, Some(Overlay::ProcessSignal(_))) {
             self.cancel_process_signal()
-        } else if self.process_detail_visible {
-            self.process_detail_visible = false;
-            true
-        } else if self.service_detail_visible {
-            self.service_detail_visible = false;
-            true
-        } else if self.log_detail_visible {
-            self.log_detail_visible = false;
-            true
-        } else if self.network_detail_visible {
-            self.network_detail_visible = false;
+        } else if self.overlay.take().is_some() {
             true
         } else {
             match self.active_tab {
@@ -560,6 +537,173 @@ pub(crate) fn calculate_scroll(
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum OverlayKind {
+        Help,
+        ProcessDetail,
+        ProcessSignal,
+        ServiceDetail,
+        LogDetail,
+        NetworkDetail,
+    }
+
+    const OVERLAYS: [OverlayKind; 6] = [
+        OverlayKind::Help,
+        OverlayKind::ProcessDetail,
+        OverlayKind::ProcessSignal,
+        OverlayKind::ServiceDetail,
+        OverlayKind::LogDetail,
+        OverlayKind::NetworkDetail,
+    ];
+
+    /// An app with data on every screen and `kind` open over its screen.
+    fn app_with_overlay(kind: OverlayKind) -> App {
+        let mut app = App::default();
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "init"),
+            process(2, "worker"),
+        ])));
+        app.update(Action::ServicesUpdated(services(vec![service(
+            "sshd.service",
+            "active",
+            "OpenSSH",
+        )])));
+        app.update(Action::LogsUpdated(log_batch(vec![log_entry(
+            1, "kernel", 6, "boot",
+        )])));
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![dummy_network("eth0")],
+            error: None,
+        }));
+        let (tab, open) = match kind {
+            OverlayKind::Help => (Tab::Overview, Action::ShowHelp),
+            OverlayKind::ProcessDetail => (Tab::Processes, Action::OpenProcessDetails),
+            OverlayKind::ProcessSignal => (
+                Tab::Processes,
+                Action::RequestProcessSignal(ProcessSignal::Term),
+            ),
+            OverlayKind::ServiceDetail => (Tab::Services, Action::OpenServiceDetails),
+            OverlayKind::LogDetail => (Tab::Logs, Action::OpenLogDetails),
+            OverlayKind::NetworkDetail => (Tab::Network, Action::OpenNetworkDetails),
+        };
+        app.update(Action::SelectTab(tab));
+        assert!(app.update(open), "{kind:?} did not open");
+        assert!(app.overlay.is_some());
+        app
+    }
+
+    #[test]
+    fn open_overlay_blocks_tab_and_navigation_actions() {
+        for kind in OVERLAYS {
+            let mut app = app_with_overlay(kind);
+            let tab = app.active_tab();
+            let mode = app.input_mode();
+
+            for action in [
+                Action::SelectTab(Tab::Logs),
+                Action::NextTab,
+                Action::PreviousTab,
+                Action::ShowHelp,
+                Action::ProcessNext,
+                Action::ServiceNext,
+                Action::LogNext,
+                Action::NetworkNext,
+                Action::BeginProcessSearch,
+                Action::OpenProcessDetails,
+                Action::RequestProcessSignal(ProcessSignal::Kill),
+            ] {
+                assert!(
+                    !app.update(action.clone()),
+                    "{kind:?} let {action:?} through"
+                );
+            }
+            assert_eq!(app.active_tab(), tab, "{kind:?}");
+            assert_eq!(app.input_mode(), mode, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn escape_closes_exactly_one_overlay_per_press() {
+        for kind in OVERLAYS {
+            let mut app = app_with_overlay(kind);
+
+            assert!(app.update(Action::Escape), "{kind:?}");
+            assert!(app.overlay.is_none(), "{kind:?}");
+            assert!(
+                !app.update(Action::Escape),
+                "{kind:?}: nothing left to close"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_a_detail_before_clearing_the_search_behind_it() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "init",
+        )])));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('i'));
+        app.update(Action::OpenProcessDetails);
+        assert!(app.process_detail_visible());
+
+        assert!(app.update(Action::Escape));
+        assert!(!app.process_detail_visible());
+        assert_eq!(
+            app.process_search_query(),
+            "i",
+            "the first Esc only closes the detail"
+        );
+
+        assert!(app.update(Action::Escape));
+        assert_eq!(app.process_search_query(), "");
+    }
+
+    #[test]
+    fn background_snapshots_still_apply_while_an_overlay_is_open() {
+        for kind in OVERLAYS {
+            let mut app = app_with_overlay(kind);
+
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                cpu_percent: Some(42.0),
+                ..SystemMetrics::default()
+            }));
+            app.update(Action::ProcessesUpdated(processes(vec![
+                process(1, "init"),
+                process(2, "worker"),
+                process(3, "new"),
+            ])));
+
+            assert_eq!(app.system_metrics().cpu_percent, Some(42.0), "{kind:?}");
+            assert_eq!(app.process_summary().total, 3, "{kind:?}");
+            assert!(
+                app.overlay.is_some(),
+                "{kind:?} closed on a background update"
+            );
+        }
+    }
+
+    #[test]
+    fn signal_actions_leave_other_overlays_open() {
+        for kind in [OverlayKind::Help, OverlayKind::ProcessDetail] {
+            let mut app = app_with_overlay(kind);
+
+            for action in [
+                Action::ConfirmProcessSignal,
+                Action::CancelProcessSignal,
+                Action::ExecuteFocusedProcessSignal,
+                Action::ToggleProcessSignalFocus,
+            ] {
+                assert!(
+                    !app.update(action.clone()),
+                    "{kind:?} reacted to {action:?}"
+                );
+                assert!(app.overlay.is_some(), "{action:?} closed {kind:?}");
+            }
+        }
+    }
 
     #[test]
     fn quit_action_stops_the_app() {

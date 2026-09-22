@@ -30,7 +30,7 @@ impl App {
     }
 
     pub fn network_detail_visible(&self) -> bool {
-        self.network_detail_visible
+        self.overlay == Some(Overlay::NetworkDetail)
     }
 
     pub fn network_error(&self) -> Option<&str> {
@@ -65,7 +65,7 @@ impl App {
                 .networks
                 .get(replacement)
                 .map(|iface| iface.name.clone());
-            self.network_detail_visible = false;
+            self.close_overlay(&Overlay::NetworkDetail);
         }
         self.reconcile_hovered_network();
         self.ensure_network_visible();
@@ -119,8 +119,8 @@ impl App {
 
     pub(super) fn open_network_details(&mut self) -> bool {
         if self.active_tab == Tab::Network && self.selected_network.is_some() {
-            let changed = !self.network_detail_visible;
-            self.network_detail_visible = true;
+            let changed = !self.network_detail_visible();
+            self.overlay = Some(Overlay::NetworkDetail);
             self.hovered = None;
             changed
         } else {

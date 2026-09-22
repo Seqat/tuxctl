@@ -46,7 +46,7 @@ impl App {
     }
 
     pub fn process_detail_visible(&self) -> bool {
-        self.process_detail_visible
+        self.overlay == Some(Overlay::ProcessDetail)
     }
 
     pub fn process_error(&self) -> Option<&str> {
@@ -58,7 +58,21 @@ impl App {
     }
 
     pub fn process_signal_confirmation(&self) -> Option<&ProcessSignalConfirmation> {
-        self.process_signal_confirmation.as_ref()
+        match &self.overlay {
+            Some(Overlay::ProcessSignal(confirmation)) => Some(confirmation),
+            _ => None,
+        }
+    }
+
+    /// Removes and returns the signal confirmation, leaving any other overlay open.
+    fn take_process_signal_confirmation(&mut self) -> Option<ProcessSignalConfirmation> {
+        match self.overlay.take() {
+            Some(Overlay::ProcessSignal(confirmation)) => Some(confirmation),
+            other => {
+                self.overlay = other;
+                None
+            }
+        }
     }
 
     pub fn process_action_message(&self) -> Option<&str> {
@@ -120,7 +134,7 @@ impl App {
         if self.selected_process.is_none() {
             let replacement = previous_index.min(self.filtered_processes.len().saturating_sub(1));
             self.selected_process = self.process_at(replacement).map(ProcessInfo::identity);
-            self.process_detail_visible = false;
+            self.close_overlay(&Overlay::ProcessDetail);
         }
         self.reconcile_hovered_process();
         self.ensure_process_visible();
@@ -128,7 +142,7 @@ impl App {
     }
 
     fn close_confirmation_for_exited_process(&mut self) {
-        if let Some(confirmation) = &self.process_signal_confirmation {
+        if let Some(confirmation) = self.process_signal_confirmation() {
             if !self
                 .processes
                 .iter()
@@ -136,7 +150,7 @@ impl App {
             {
                 let name = confirmation.name.clone();
                 let pid = confirmation.identity.pid;
-                self.process_signal_confirmation = None;
+                self.overlay = None;
                 self.process_action_message =
                     Some(format!("Process {name} ({pid}) exited before signal"));
             }
@@ -264,7 +278,7 @@ impl App {
     pub(super) fn open_process_details(&mut self) -> bool {
         if self.active_tab == Tab::Processes && self.selected_process().is_some() {
             self.process_searching = false;
-            self.process_detail_visible = true;
+            self.overlay = Some(Overlay::ProcessDetail);
             self.hovered = None;
             true
         } else {
@@ -284,18 +298,18 @@ impl App {
         };
         self.process_searching = false;
         self.process_action_message = None;
-        self.process_signal_confirmation = Some(ProcessSignalConfirmation {
+        self.overlay = Some(Overlay::ProcessSignal(ProcessSignalConfirmation {
             identity,
             name,
             signal,
             focused_button: SignalConfirmButton::Cancel,
-        });
+        }));
         self.hovered = None;
         true
     }
 
     pub(super) fn cancel_process_signal(&mut self) -> bool {
-        if self.process_signal_confirmation.take().is_some() {
+        if self.take_process_signal_confirmation().is_some() {
             self.hovered = None;
             true
         } else {
@@ -304,7 +318,7 @@ impl App {
     }
 
     pub(super) fn toggle_process_signal_focus(&mut self) -> bool {
-        if let Some(confirmation) = &mut self.process_signal_confirmation {
+        if let Some(Overlay::ProcessSignal(confirmation)) = &mut self.overlay {
             confirmation.focused_button = match confirmation.focused_button {
                 SignalConfirmButton::Cancel => SignalConfirmButton::Confirm,
                 SignalConfirmButton::Confirm => SignalConfirmButton::Cancel,
@@ -316,7 +330,7 @@ impl App {
     }
 
     pub(super) fn focus_process_signal(&mut self, button: SignalConfirmButton) -> bool {
-        if let Some(confirmation) = &mut self.process_signal_confirmation {
+        if let Some(Overlay::ProcessSignal(confirmation)) = &mut self.overlay {
             if confirmation.focused_button != button {
                 confirmation.focused_button = button;
                 return true;
@@ -326,7 +340,7 @@ impl App {
     }
 
     pub(super) fn execute_focused_process_signal(&mut self) -> bool {
-        let Some(confirmation) = &self.process_signal_confirmation else {
+        let Some(confirmation) = self.process_signal_confirmation() else {
             return false;
         };
         match confirmation.focused_button {
@@ -336,7 +350,7 @@ impl App {
     }
 
     pub(super) fn confirm_process_signal(&mut self) -> bool {
-        let Some(confirmation) = self.process_signal_confirmation.take() else {
+        let Some(confirmation) = self.take_process_signal_confirmation() else {
             return false;
         };
         let result = send_process_signal(confirmation.identity, confirmation.signal);
@@ -354,7 +368,7 @@ impl App {
         O: FnOnce(libc::pid_t) -> std::io::Result<H>,
         S: FnOnce(&H, libc::c_int) -> std::io::Result<()>,
     {
-        let Some(confirmation) = self.process_signal_confirmation.take() else {
+        let Some(confirmation) = self.take_process_signal_confirmation() else {
             return false;
         };
         let result = verify_and_send_signal_at(

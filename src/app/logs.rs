@@ -40,7 +40,7 @@ impl App {
     }
 
     pub fn log_detail_visible(&self) -> bool {
-        self.log_detail_visible
+        self.overlay == Some(Overlay::LogDetail)
     }
 
     pub fn log_following(&self) -> bool {
@@ -155,7 +155,7 @@ impl App {
         if self.selected_log.is_none() {
             let replacement = previous_index.min(self.filtered_logs.len().saturating_sub(1));
             self.selected_log = self.log_at(replacement).map(|entry| entry.id);
-            self.log_detail_visible = false;
+            self.close_overlay(&Overlay::LogDetail);
         }
     }
 
@@ -208,7 +208,7 @@ impl App {
     pub(super) fn open_log_details(&mut self) -> bool {
         if self.active_tab == Tab::Logs && self.selected_log().is_some() {
             self.log_searching = false;
-            self.log_detail_visible = true;
+            self.overlay = Some(Overlay::LogDetail);
             self.hovered = None;
             true
         } else {
