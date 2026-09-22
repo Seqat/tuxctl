@@ -22,6 +22,8 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
+      # A dry run reports every target; publishing still needs all of them.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -54,7 +56,7 @@ jobs:
       - name: Check the binary
         run: |
           file "$BIN"
-          if ! file "$BIN" | grep -Eq 'static(-pie)? linked'; then
+          if ! file "$BIN" | grep -Eq 'static(ally|-pie) linked'; then
             echo "::error::$BIN is not statically linked"
             exit 1
           fi
