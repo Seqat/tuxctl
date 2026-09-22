@@ -699,6 +699,7 @@ mod tests {
                 parent_pid: 1,
                 state_code: 'R',
                 start_time: 100,
+                kernel_thread: false,
             }],
             error: None,
         }));
@@ -1270,6 +1271,7 @@ mod tests {
             parent_pid: 1,
             state_code: 'S',
             start_time: u64::from(pid),
+            kernel_thread: false,
         }
     }
 
@@ -1780,6 +1782,7 @@ mod tests {
                     parent_pid: 1,
                     state_code: 'R',
                     start_time: 100,
+                    kernel_thread: false,
                 }],
                 error: None,
             }));

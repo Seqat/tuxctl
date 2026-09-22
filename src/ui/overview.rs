@@ -229,6 +229,7 @@ mod tests {
             parent_pid: 1,
             state_code,
             start_time: u64::from(pid),
+            kernel_thread: false,
         }
     }
 

@@ -450,6 +450,14 @@ pub fn render_detail(frame: &mut Frame, process: Option<&ProcessInfo>, area: Rec
                     format_bytes(process.memory_bytes)
                 )),
                 Line::from(format!("State:       {}", process.state)),
+                Line::from(format!(
+                    "Type:        {}",
+                    if process.kernel_thread {
+                        "kernel thread"
+                    } else {
+                        "user process"
+                    }
+                )),
                 Line::from(format!("Parent PID:  {}", process.parent_pid)),
                 Line::from(""),
                 Line::from("Read-only inspection; Esc closes")

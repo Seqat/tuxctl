@@ -13,6 +13,7 @@ pub(super) fn process(pid: u32, name: &str) -> ProcessInfo {
         parent_pid: 1,
         state_code: 'S',
         start_time: u64::from(pid),
+        kernel_thread: false,
     }
 }
 
