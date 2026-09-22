@@ -1,0 +1,115 @@
+name: Release
+
+# Publishing a GitHub release attaches static Linux binaries and checksums to
+# it. Other triggers are dry runs that upload the same files as workflow
+# artifacts only: a manual run, or a push to dev that changes this workflow.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths: [.github/workflows/release.yml]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      TARGET: ${{ matrix.target }}
+      BIN: target/${{ matrix.target }}/release/tuxctl
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned so release builds are reproducible; bump deliberately.
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+      - name: Read the package version
+        run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
+      - name: Check the tag matches Cargo.toml
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::release tag $TAG does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+      - run: cargo test --locked --target "$TARGET"
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Check the binary
+        run: |
+          file "$BIN"
+          if ! file "$BIN" | grep -Eq 'static(-pie)? linked'; then
+            echo "::error::$BIN is not statically linked"
+            exit 1
+          fi
+          test "$("$BIN" --version)" = "tuxctl $VERSION"
+      - name: Smoke test
+        run: scripts/smoke.py "$BIN"
+      - name: Package
+        run: |
+          name="tuxctl-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$BIN" README.md LICENSE CHANGELOG.md "dist/$name/"
+          # Stable ordering, ownership and timestamps for repeatable archives.
+          tar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" -cf - "$name" | gzip -n > "dist/$name.tar.gz"
+          {
+            echo "### $TARGET"
+            echo '```'
+            rustc -V
+            file "$BIN"
+            echo "binary: $(stat -c %s "$BIN") bytes, archive: $(stat -c %s "dist/$name.tar.gz") bytes"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuxctl-${{ matrix.target }}
+          path: dist/tuxctl-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: checksums and upload
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum tuxctl-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuxctl-release
+          path: dist/
+          if-no-files-found: error
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: >
+          gh release upload "$TAG" dist/tuxctl-*.tar.gz dist/SHA256SUMS
+          --clobber --repo "$GITHUB_REPOSITORY"
