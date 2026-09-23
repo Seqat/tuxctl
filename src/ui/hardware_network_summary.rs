@@ -205,7 +205,7 @@ fn network_traffic(interface: &NetworkInterfaceInfo) -> Option<(String, String)>
     ))
 }
 
-fn format_rate_tight(rate: Option<f64>) -> String {
+pub(super) fn format_rate_tight(rate: Option<f64>) -> String {
     const UNITS: [&str; 5] = ["B/s", "K/s", "M/s", "G/s", "T/s"];
     let Some(mut value) = rate else {
         return "--".into();

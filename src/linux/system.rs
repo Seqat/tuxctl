@@ -1,22 +1,30 @@
 use std::{
     collections::BTreeMap,
     ffi::CString,
-    fs, io,
+    fs,
+    io::{self, Read},
     mem::MaybeUninit,
+    path::Path,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{
     control::{run_periodic, CollectorControl},
+    hardware::is_whole_disk,
     latest_snapshot::{self, LatestReceiver},
+    rate::CounterSample,
 };
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
 const PROC_UPTIME: &str = "/proc/uptime";
 const PROC_LOADAVG: &str = "/proc/loadavg";
+const PROC_DISKSTATS: &str = "/proc/diskstats";
+/// /proc/diskstats counts sectors in 512-byte units, whatever the device's
+/// real sector size.
+const DISKSTATS_SECTOR_BYTES: f64 = 512.0;
 const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 const PROC_KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
 
@@ -29,6 +37,17 @@ pub struct SystemMetrics {
     pub load_average: Option<LoadAverage>,
     pub root_filesystem: Option<ByteUsage>,
     pub system_identity: SystemIdentity,
+    /// Throughput of whole disks; empty when /proc/diskstats is unreadable.
+    pub disks: Vec<DiskIo>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskIo {
+    /// Kernel name, matching `StorageDevice::system_name`.
+    pub name: Arc<str>,
+    /// `None` until a second sample exists for this disk.
+    pub read_bytes_per_sec: Option<f64>,
+    pub write_bytes_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,6 +164,7 @@ struct CpuSample {
 struct SystemMetricsSampler {
     previous_cpu: Option<CpuSample>,
     system_identity: SystemIdentity,
+    disks: DiskIoSampler,
 }
 
 impl SystemMetricsSampler {
@@ -152,6 +172,7 @@ impl SystemMetricsSampler {
         Self {
             previous_cpu: None,
             system_identity,
+            disks: DiskIoSampler::default(),
         }
     }
 
@@ -181,8 +202,73 @@ impl SystemMetricsSampler {
                 .and_then(|contents| parse_load_average(&contents)),
             root_filesystem: filesystem_usage("/").ok(),
             system_identity: self.system_identity.clone(),
+            disks: self
+                .disks
+                .collect(Path::new(PROC_DISKSTATS), Instant::now()),
         }
     }
+}
+
+/// Read/write rates of whole disks from one read of /proc/diskstats per sample.
+#[derive(Default)]
+struct DiskIoSampler {
+    /// Reused between samples so steady-state reads do not allocate.
+    buffer: String,
+    /// Sector counters of the last sample; one entry per disk present then.
+    previous: Vec<(Arc<str>, CounterSample<2>)>,
+}
+
+impl DiskIoSampler {
+    fn collect(&mut self, path: &Path, now: Instant) -> Vec<DiskIo> {
+        self.buffer.clear();
+        let read = fs::File::open(path).and_then(|mut file| file.read_to_string(&mut self.buffer));
+        if read.is_err() {
+            // A later successful read must not compute rates across the gap.
+            self.previous.clear();
+            return Vec::new();
+        }
+
+        let mut next = Vec::with_capacity(self.previous.len());
+        let mut disks = Vec::with_capacity(self.previous.len());
+        for (name, sectors) in parse_diskstats(&self.buffer) {
+            if next.iter().any(|(seen, _): &(Arc<str>, _)| **seen == *name) {
+                continue;
+            }
+            let previous = self.previous.iter().find(|(known, _)| **known == *name);
+            let name = previous.map_or_else(|| Arc::from(name), |(known, _)| Arc::clone(known));
+            let sample = CounterSample::new(sectors, now);
+            let [read, write] = sample.rates_since(previous.map(|(_, sample)| sample));
+            next.push((Arc::clone(&name), sample));
+            disks.push(DiskIo {
+                name,
+                read_bytes_per_sec: read.map(|sectors| sectors * DISKSTATS_SECTOR_BYTES),
+                write_bytes_per_sec: write.map(|sectors| sectors * DISKSTATS_SECTOR_BYTES),
+            });
+        }
+        // Disks that disappeared drop out here, so a reappearing disk starts
+        // without a rate instead of spanning the gap.
+        self.previous = next;
+        disks
+    }
+}
+
+/// Whole-disk `(name, [sectors read, sectors written])` rows. Lines with fewer
+/// than the 14 fields of the oldest format, or non-numeric counters, are skipped.
+fn parse_diskstats(contents: &str) -> impl Iterator<Item = (&str, [u64; 2])> {
+    contents.lines().filter_map(|line| {
+        // major minor name, then reads, reads merged, sectors read, ms reading,
+        // writes, writes merged, sectors written, ms writing, in flight, ms, weighted ms.
+        let mut fields = line.split_whitespace().skip(2);
+        let name = fields.next()?;
+        if !is_whole_disk(name) {
+            return None;
+        }
+        let mut counters = [0_u64; 11];
+        for counter in &mut counters {
+            *counter = fields.next()?.parse().ok()?;
+        }
+        Some((name, [counters[2], counters[6]]))
+    })
 }
 
 fn parse_cpu_sample(contents: &str) -> Option<CpuSample> {
@@ -496,6 +582,241 @@ mod tests {
                 total: 1000 * 1024,
             })
         );
+    }
+
+    /// A /proc/diskstats line with `extra` trailing fields beyond the 14 of
+    /// the oldest format (4 from Linux 4.18, 6 from 5.5).
+    fn diskstats_line(name: &str, sectors_read: u64, sectors_written: u64, extra: usize) -> String {
+        let mut line = format!(
+            "   8       0 {name} 100 5 {sectors_read} 40 200 7 {sectors_written} 90 0 120 130"
+        );
+        for _ in 0..extra {
+            line.push_str(" 0");
+        }
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn diskstats_keeps_whole_disks_in_every_kernel_format() {
+        let contents = [
+            diskstats_line("sda", 10, 20, 0),
+            diskstats_line("sda1", 1, 2, 0),
+            diskstats_line("nvme0n1", 30, 40, 4),
+            diskstats_line("nvme0n1p2", 3, 4, 4),
+            diskstats_line("vdb", 50, 60, 6),
+            diskstats_line("loop0", 5, 6, 6),
+            diskstats_line("zram0", 5, 6, 6),
+            diskstats_line("dm-0", 5, 6, 6),
+            diskstats_line("md127", 5, 6, 6),
+            diskstats_line("sr0", 5, 6, 6),
+        ]
+        .concat();
+
+        let rows: Vec<_> = parse_diskstats(&contents).collect();
+
+        assert_eq!(
+            rows,
+            [("sda", [10, 20]), ("nvme0n1", [30, 40]), ("vdb", [50, 60])]
+        );
+    }
+
+    #[test]
+    fn malformed_diskstats_lines_are_skipped() {
+        let max = u64::MAX;
+        let contents = format!(
+            "{}{}{}{}{}{}",
+            "",
+            "   8 0 sdb 1 2 3\n",
+            "   8 0 sdc 1 2 x 4 5 6 7 8 9 10 11\n",
+            "garbage\n\n",
+            "   8 0 sdd -1 0 0 0 0 0 0 0 0 0 0\n",
+            diskstats_line("sde", max, max, 0),
+        );
+
+        assert_eq!(
+            parse_diskstats(&contents).collect::<Vec<_>>(),
+            [("sde", [max, max])]
+        );
+        assert_eq!(parse_diskstats("").count(), 0);
+    }
+
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            Self(std::env::temp_dir().join(format!(
+                "tuxctl_diskstats_{label}_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )))
+        }
+
+        fn write(&self, contents: &str) {
+            fs::write(&self.0, contents).unwrap();
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn rates(disks: &[DiskIo]) -> Vec<(&str, Option<f64>, Option<f64>)> {
+        disks
+            .iter()
+            .map(|disk| {
+                (
+                    &*disk.name,
+                    disk.read_bytes_per_sec,
+                    disk.write_bytes_per_sec,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disk_rates_come_from_sector_deltas_over_elapsed_time() {
+        let file = TempFile::new("rates");
+        let mut sampler = DiskIoSampler::default();
+        let t0 = Instant::now();
+
+        file.write(&diskstats_line("sda", 1_000, 2_000, 4));
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0)),
+            [("sda", None, None)],
+            "no rate without a previous sample"
+        );
+
+        // 4096 sectors read and 2048 written in 2 s.
+        file.write(&diskstats_line("sda", 5_096, 4_048, 4));
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(2))),
+            [("sda", Some(1_048_576.0), Some(524_288.0))]
+        );
+
+        // A counter that went backwards (reset or 32-bit wrap) reads as zero once.
+        file.write(&diskstats_line("sda", 10, 4_048, 4));
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(3))),
+            [("sda", Some(0.0), Some(0.0))]
+        );
+
+        // Samples less than 1 ms apart report no rate.
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(3))),
+            [("sda", None, None)]
+        );
+    }
+
+    #[test]
+    fn counters_near_u64_max_do_not_overflow() {
+        let file = TempFile::new("overflow");
+        let mut sampler = DiskIoSampler::default();
+        let t0 = Instant::now();
+
+        file.write(&diskstats_line("sda", u64::MAX - 10, u64::MAX - 1, 0));
+        sampler.collect(&file.0, t0);
+        file.write(&diskstats_line("sda", u64::MAX, u64::MAX, 0));
+
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(1))),
+            [("sda", Some(5_120.0), Some(512.0))]
+        );
+    }
+
+    #[test]
+    fn disappearing_disks_restart_without_a_rate_across_the_gap() {
+        let file = TempFile::new("hotplug");
+        let mut sampler = DiskIoSampler::default();
+        let t0 = Instant::now();
+        let both = [
+            diskstats_line("sda", 100, 100, 0),
+            diskstats_line("sdb", 100, 100, 0),
+        ]
+        .concat();
+
+        file.write(&both);
+        sampler.collect(&file.0, t0);
+        file.write(&diskstats_line("sda", 612, 100, 0));
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(1))),
+            [("sda", Some(262_144.0), Some(0.0))],
+            "sdb vanished"
+        );
+
+        file.write(
+            &[
+                diskstats_line("sda", 612, 100, 0),
+                diskstats_line("sdb", 9_000, 9_000, 0),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(2))),
+            [("sda", Some(0.0), Some(0.0)), ("sdb", None, None)],
+            "a returning disk gets no rate spanning its absence"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_clears_the_rate_baselines() {
+        let file = TempFile::new("failure");
+        let mut sampler = DiskIoSampler::default();
+        let t0 = Instant::now();
+
+        file.write(&diskstats_line("sda", 100, 100, 0));
+        sampler.collect(&file.0, t0);
+        let missing = std::path::Path::new("/nonexistent/tuxctl/diskstats");
+        assert!(sampler
+            .collect(missing, t0 + Duration::from_secs(1))
+            .is_empty());
+
+        file.write(&diskstats_line("sda", 900, 900, 0));
+        assert_eq!(
+            rates(&sampler.collect(&file.0, t0 + Duration::from_secs(2))),
+            [("sda", None, None)]
+        );
+    }
+
+    #[test]
+    fn duplicate_disk_names_keep_the_first_row() {
+        let file = TempFile::new("duplicates");
+        let mut sampler = DiskIoSampler::default();
+        file.write(
+            &[
+                diskstats_line("sda", 1, 1, 0),
+                diskstats_line("sda", 2, 2, 0),
+            ]
+            .concat(),
+        );
+
+        assert_eq!(sampler.collect(&file.0, Instant::now()).len(), 1);
+    }
+
+    #[test]
+    fn steady_state_disk_sampling_reuses_its_read_buffer() {
+        let file = TempFile::new("buffer");
+        let mut sampler = DiskIoSampler::default();
+        let t0 = Instant::now();
+        file.write(
+            &[
+                diskstats_line("sda", 1, 1, 6),
+                diskstats_line("nvme0n1", 1, 1, 6),
+            ]
+            .concat(),
+        );
+        sampler.collect(&file.0, t0);
+        let capacity = sampler.buffer.capacity();
+
+        for second in 1..20 {
+            sampler.collect(&file.0, t0 + Duration::from_secs(second));
+        }
+
+        assert_eq!(sampler.buffer.capacity(), capacity);
+        assert_eq!(sampler.previous.len(), 2);
     }
 
     #[test]

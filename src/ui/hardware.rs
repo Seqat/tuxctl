@@ -11,7 +11,7 @@ use crate::{
     linux::{GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics},
 };
 
-use super::{format_bytes, hardware_cpu, hardware_network_summary, layout};
+use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network};
 
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
 const MAX_STORAGE_ROWS: u16 = 4;
@@ -68,7 +68,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
     render_ram(frame, inventory, metrics, areas[1]);
     render_gpu(frame, inventory, areas[2]);
-    render_storage(frame, inventory, areas[3]);
+    render_storage(frame, inventory, metrics, areas[3]);
     hardware_network_summary::render(frame, app, inventory, areas[4]);
 }
 
@@ -250,7 +250,12 @@ fn render_gpu(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Re
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_storage(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Rect) {
+fn render_storage(
+    frame: &mut Frame,
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    area: Rect,
+) {
     if area.height == 0 {
         return;
     }
@@ -271,8 +276,9 @@ fn render_storage(frame: &mut Frame, inventory: Option<&HardwareInventory>, area
                     let (label, count_index) = storage_label(device.kind);
                     let index = counts[count_index];
                     counts[count_index] += 1;
-                    lines.push(Line::from(layout::truncate(
+                    lines.push(Line::from(storage_line(
                         &format_storage_device(label, index, device),
+                        disk_rates(metrics, &device.system_name),
                         width,
                     )));
                 }
@@ -344,6 +350,65 @@ fn format_storage_device(label: &str, index: usize, device: &StorageDevice) -> S
         .map(|bytes| format!("  {}", format_decimal_capacity(bytes)))
         .unwrap_or_default();
     format!("{label}{index}  {model}{capacity}")
+}
+
+/// Read/write rates of a storage device. `None` hides the rates entirely
+/// (no disk statistics at all); a device missing from them shows `--`.
+fn disk_rates(metrics: &SystemMetrics, name: &str) -> Option<(Option<f64>, Option<f64>)> {
+    if metrics.disks.is_empty() {
+        return None;
+    }
+    Some(
+        metrics
+            .disks
+            .iter()
+            .find(|disk| *disk.name == *name)
+            .map_or((None, None), |disk| {
+                (disk.read_bytes_per_sec, disk.write_bytes_per_sec)
+            }),
+    )
+}
+
+/// The device description with its rates right-aligned: the model is
+/// truncated first, then the rates switch to a tight form, and they are left
+/// out when not even the device label would remain.
+fn storage_line(
+    description: &str,
+    rates: Option<(Option<f64>, Option<f64>)>,
+    width: usize,
+) -> String {
+    let Some((read, write)) = rates else {
+        return layout::truncate(description, width);
+    };
+    let label_width = description
+        .split("  ")
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count();
+    let candidates = [
+        format!(
+            "  R {}  W {}",
+            network::format_rate(read),
+            network::format_rate(write)
+        ),
+        format!(
+            "  R{} W{}",
+            hardware_network_summary::format_rate_tight(read),
+            hardware_network_summary::format_rate_tight(write)
+        ),
+    ];
+    candidates
+        .iter()
+        .find_map(|rates| {
+            let room = width.checked_sub(rates.chars().count())?;
+            (room >= label_width).then(|| {
+                let description = layout::truncate(description, room);
+                let padding = room.saturating_sub(description.chars().count());
+                format!("{description}{}{rates}", " ".repeat(padding))
+            })
+        })
+        .unwrap_or_else(|| layout::truncate(description, width))
 }
 
 fn format_binary_capacity(bytes: u64) -> String {
@@ -446,6 +511,53 @@ mod tests {
         };
 
         assert_eq!(format_memory_module(0, &module), "SLOT0  8 GiB");
+    }
+
+    #[test]
+    fn storage_rates_are_right_aligned_and_the_model_truncates_first() {
+        let description = "NVMe0  Samsung SSD 980 PRO 1TB  1.0 TB";
+        let rates = Some((Some(12.3 * 1024.0 * 1024.0), Some(0.0)));
+
+        let wide = storage_line(description, rates, 70);
+        assert_eq!(wide.chars().count(), 70);
+        assert!(wide.starts_with(description), "{wide}");
+        assert!(wide.ends_with("  R 12.3 MiB/s  W 0 B/s"), "{wide}");
+
+        let medium = storage_line(description, rates, 40);
+        assert_eq!(medium.chars().count(), 40);
+        assert!(medium.starts_with("NVMe0  Sams"), "{medium}");
+        assert!(medium.ends_with("  R 12.3 MiB/s  W 0 B/s"), "{medium}");
+
+        let narrow = storage_line(description, rates, 20);
+        assert!(narrow.chars().count() <= 20, "{narrow}");
+        assert!(narrow.starts_with("NVMe0"), "{narrow}");
+        assert!(narrow.ends_with("  R12M/s W0B/s"), "{narrow}");
+
+        let tiny = storage_line(description, rates, 8);
+        assert_eq!(tiny, layout::truncate(description, 8), "rates dropped");
+    }
+
+    #[test]
+    fn storage_rates_show_dashes_for_a_missing_disk_and_hide_without_statistics() {
+        let mut metrics = SystemMetrics {
+            disks: vec![crate::linux::DiskIo {
+                name: "sda".into(),
+                read_bytes_per_sec: Some(1024.0),
+                write_bytes_per_sec: None,
+            }],
+            ..SystemMetrics::default()
+        };
+
+        assert_eq!(disk_rates(&metrics, "sda"), Some((Some(1024.0), None)));
+        assert_eq!(disk_rates(&metrics, "nvme0n1"), Some((None, None)));
+        assert!(
+            storage_line("SATA0  disk", disk_rates(&metrics, "nvme0n1"), 40)
+                .ends_with("  R --  W --")
+        );
+
+        metrics.disks.clear();
+        assert_eq!(disk_rates(&metrics, "sda"), None);
+        assert_eq!(storage_line("SATA0  disk", None, 40), "SATA0  disk");
     }
 
     #[test]

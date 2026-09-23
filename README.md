@@ -46,7 +46,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - CPU model information.
   - RAM module information via EDAC sysfs when available.
   - GPU devices using DRM/NVIDIA sysfs metadata.
-  - NVMe and SATA/SCSI storage devices.
+  - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
 - Compact physical network interface summary with live RX/TX rates.
 - Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
 
