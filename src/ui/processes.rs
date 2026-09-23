@@ -10,13 +10,13 @@ use crate::{
     action::{MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton},
     app::calculate_scroll,
     app::{App, ProcessSignalConfirmation},
-    linux::{ProcessIdentity, ProcessInfo, ProcessSignal, SystemMetrics},
+    linux::{ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
-use super::{format_bytes, hardware::utilization_bar, layout, status};
+use super::{format_bytes, hardware::utilization_bar, layout, status, ProcessRowRegion};
 
-pub struct ProcessRender {
-    pub rows: Vec<(ProcessIdentity, Rect)>,
+pub(super) struct ProcessRender {
+    pub rows: Vec<ProcessRowRegion>,
     pub headers: Vec<(ProcessSortField, Rect)>,
     pub scroll_area: Rect,
     pub start: usize,
@@ -24,6 +24,12 @@ pub struct ProcessRender {
 }
 
 const COLUMN_SPACING: u16 = 1;
+/// Shown before the PID of a pinned process.
+const PIN_MARKER: &str = "*";
+/// Row width needed for the ▲/▼ controls to fit after the MEMORY value.
+const PIN_CONTROLS_MIN_WIDTH: u16 = 70;
+/// Each control is two cells wide, at the right edge of the row.
+const PIN_CONTROL_WIDTH: u16 = 2;
 const COLUMN_WIDTHS: [Constraint; 4] = [
     Constraint::Length(10),
     Constraint::Percentage(45),
@@ -57,23 +63,43 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
     );
     let end = start.saturating_add(height).min(app.process_count());
 
-    let selected = app.selected_process().map(ProcessInfo::identity);
+    let selected = app.selected_process_identity();
     let hovered = app.hovered();
+    // The pinned section ends with an underline when unpinned rows follow it,
+    // instead of a separator row that would shift scrolling and hit regions.
+    let pinned_rows = app.pinned_row_count();
+    let section_end =
+        (pinned_rows > 0 && pinned_rows < app.process_count()).then(|| pinned_rows - 1);
     let mut hit_rows = Vec::with_capacity(end.saturating_sub(start));
+    let controls = row_area.width >= PIN_CONTROLS_MIN_WIDTH && pinned_rows > 1;
     let rows = (start..end).filter_map(|index| {
-        let process = app.process_at(index)?;
+        let row = app.process_row_at(index)?;
+        let process = row.process;
         let offset = u16::try_from(index.saturating_sub(start)).ok()?;
-        hit_rows.push((
-            process.identity(),
+        let area = Rect::new(
+            row_area.x,
+            row_area.y.saturating_add(offset),
+            row_area.width,
+            1,
+        );
+        let control = |slot: u16| {
             Rect::new(
-                row_area.x,
-                row_area.y.saturating_add(offset),
-                row_area.width,
+                area.right().saturating_sub(PIN_CONTROL_WIDTH * slot),
+                area.y,
+                PIN_CONTROL_WIDTH,
                 1,
-            ),
-        ));
+            )
+        };
+        let movable = controls && row.pinned;
+        hit_rows.push(ProcessRowRegion {
+            identity: process.identity(),
+            area,
+            pin_up: (movable && index > 0).then(|| control(2)),
+            pin_down: (movable && index + 1 < pinned_rows).then(|| control(1)),
+        });
 
-        let style = if selected == Some(process.identity()) {
+        let is_selected = selected == Some(process.identity());
+        let mut style = if is_selected {
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
@@ -82,20 +108,31 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         } else {
             Style::default()
         };
+        if row.dimmed || row.exited {
+            style = style.fg(Color::DarkGray);
+        }
+        if section_end == Some(index) {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        let (cpu, memory) = if row.exited {
+            ("exited".to_owned(), "--".to_owned())
+        } else {
+            (
+                format_cpu(process.cpu_percent),
+                format_bytes(process.memory_bytes),
+            )
+        };
         Some(
             Row::new([
                 Cell::from(format!(
-                    "{}{}",
-                    if selected == Some(process.identity()) {
-                        "> "
-                    } else {
-                        "  "
-                    },
+                    "{}{}{}",
+                    if is_selected { ">" } else { " " },
+                    if row.pinned { PIN_MARKER } else { " " },
                     process.pid
                 )),
                 Cell::from(process.name.as_str()),
-                Cell::from(format_cpu(process.cpu_percent)),
-                Cell::from(format_bytes(process.memory_bytes)),
+                Cell::from(cpu),
+                Cell::from(memory),
             ])
             .style(style),
         )
@@ -113,6 +150,16 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         .column_spacing(COLUMN_SPACING)
         .flex(Flex::Start);
     frame.render_widget(table, table_area);
+    for region in &hit_rows {
+        for (control, glyph) in [(region.pin_up, "▲"), (region.pin_down, "▼")] {
+            if let Some(area) = control {
+                frame.render_widget(
+                    Paragraph::new(glyph).style(Style::default().fg(Color::Cyan)),
+                    area,
+                );
+            }
+        }
+    }
 
     let header_area = Rect::new(
         table_area.x,
@@ -188,7 +235,7 @@ fn sort_header(
 
 fn render_resource_summary(frame: &mut Frame, app: &App, area: Rect) {
     let text = resource_summary_text(
-        app.process_count(),
+        app.listed_process_count(),
         app.system_metrics(),
         usize::from(area.width),
     );
@@ -257,7 +304,11 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
     } else if !query.is_empty() {
         (
             format!("Filter: \"{query}\""),
-            &["/ edit   Esc clear   t term   K kill", "Esc clear"],
+            &[
+                "/ edit   Esc clear   P pin   t term   K kill",
+                "/ edit   Esc clear   t term   K kill",
+                "Esc clear",
+            ],
         )
     } else {
         let sort = app.process_sort();
@@ -268,11 +319,14 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
                 if sort.descending { "▼" } else { "▲" }
             ),
             &[
+                "/ search   Enter details   P pin   v view   t term   K kill",
+                "/ search   Enter details   P pin   t term   K kill",
                 "/ search   Enter details   t term   K kill",
                 "/ find   Enter view",
             ],
         )
     };
+    let persistent = status::with_view(persistent, app.process_view_label());
     let notice = app
         .process_action_message()
         .map(|message| Span::raw(message.to_owned()))
@@ -477,7 +531,7 @@ pub fn render_detail(frame: &mut Frame, process: Option<&ProcessInfo>, area: Rec
     );
 }
 
-fn format_cpu(percent: Option<f64>) -> String {
+pub(super) fn format_cpu(percent: Option<f64>) -> String {
     percent
         .map(|percent| format!("{percent:.1}%"))
         .unwrap_or_else(|| "N/A".into())
@@ -487,7 +541,10 @@ fn format_cpu(percent: Option<f64>) -> String {
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
-    use crate::{action::Action, linux::ByteUsage};
+    use crate::{
+        action::Action,
+        linux::{ByteUsage, ProcessIdentity},
+    };
 
     use super::*;
 
@@ -548,6 +605,101 @@ mod tests {
         assert!(!text.contains(['█', '░']));
         assert!(!text.contains("GiB"));
         assert!(text.chars().count() <= 40);
+    }
+
+    fn test_process(pid: u32) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            name: format!("proc{pid}"),
+            cpu_percent: Some(f64::from(pid)),
+            memory_bytes: 4096,
+            command: None,
+            state: "S (sleeping)".into(),
+            parent_pid: 1,
+            state_code: 'S',
+            start_time: u64::from(pid),
+            kernel_thread: false,
+        }
+    }
+
+    fn snapshot(pids: impl IntoIterator<Item = u32>) -> Action {
+        Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: pids.into_iter().map(test_process).collect(),
+            error: None,
+        })
+    }
+
+    fn pinned_app(pins: &[u32]) -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(crate::action::Tab::Processes));
+        app.update(snapshot(1..=30));
+        for &pid in pins {
+            app.update(Action::SelectProcess(ProcessIdentity {
+                pid,
+                start_time: u64::from(pid),
+            }));
+            app.update(Action::TogglePin);
+        }
+        app
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.right())
+            .map(|x| buffer[(x, area.y + row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn pinned_rows_have_a_marker_and_an_underlined_section_end() {
+        let mut app = pinned_app(&[3, 7]);
+        // Pin 7 exits: its row stays, dimmed, as `exited`.
+        app.update(snapshot((1..=30).filter(|pid| *pid != 7)));
+        app.update(Action::ProcessViewportChanged {
+            start: 0,
+            height: 16,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut rendered = None;
+        terminal
+            .draw(|frame| rendered = Some(render(frame, &app, frame.area())))
+            .unwrap();
+        let rendered = rendered.unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = rendered.scroll_area;
+
+        let first = row_text(buffer, rows, 0);
+        let second = row_text(buffer, rows, 1);
+        let third = row_text(buffer, rows, 2);
+        assert!(first.starts_with(" *3 "), "{first}");
+        // The exited pin was pinned last, so it is still the selection.
+        assert!(second.starts_with(">*7 "), "{second}");
+        assert!(second.contains("exited"), "{second}");
+        assert!(third.starts_with("  30"), "{third}");
+
+        let modifier = |row: u16| buffer[(rows.x + 4, rows.y + row)].modifier;
+        assert!(!modifier(0).contains(Modifier::UNDERLINED));
+        assert!(modifier(1).contains(Modifier::UNDERLINED), "section end");
+        assert!(!modifier(2).contains(Modifier::UNDERLINED));
+        assert_eq!(buffer[(rows.x + 4, rows.y + 1)].fg, Color::DarkGray);
+
+        // Every row, pinned or not, keeps a one-line hit region inside the body.
+        assert!(rendered
+            .rows
+            .iter()
+            .all(|region| region.area.height == 1 && region.area.y >= rows.y));
+    }
+
+    #[test]
+    fn the_maximum_number_of_pins_renders_at_the_minimum_size() {
+        let app = pinned_app(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        for (width, height) in [(40, 15), (40, 5), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render(frame, &app, frame.area());
+                })
+                .unwrap();
+        }
     }
 
     #[test]

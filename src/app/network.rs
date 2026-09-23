@@ -1,6 +1,53 @@
 //! Network screen: interface snapshots, selection and details.
 
 use super::*;
+use crate::linux::HardwareInventory;
+
+/// Whether `name` is a physical interface in the hardware inventory.
+pub(crate) fn is_physical_interface(name: &str, inventory: Option<&HardwareInventory>) -> bool {
+    inventory.is_some_and(|inventory| {
+        inventory
+            .network_devices
+            .iter()
+            .any(|device| device.interface_name == name)
+    })
+}
+
+/// Interfaces the Overview summarizes: physical ones, and others unless the
+/// name marks them as loopback, container, bridge, VPN or tunnel devices,
+/// whose traffic would otherwise be counted twice.
+pub(crate) fn is_overview_interface(name: &str, inventory: Option<&HardwareInventory>) -> bool {
+    is_physical_interface(name, inventory) || !is_virtual_interface_name(name)
+}
+
+fn is_virtual_interface_name(name: &str) -> bool {
+    name == "lo"
+        || [
+            "docker",
+            "veth",
+            "br-",
+            "virbr",
+            "cni",
+            "flannel",
+            "cali",
+            "kube",
+            "vboxnet",
+            "vmnet",
+            "tun",
+            "tap",
+            "wg",
+            "tailscale",
+            "sit",
+            "ip6tnl",
+            "gre",
+            "gretap",
+            "erspan",
+            "geneve",
+            "vxlan",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
 
 impl App {
     pub fn network_count(&self) -> usize {
@@ -47,8 +94,12 @@ impl App {
             return visible;
         }
 
+        // One sample per snapshot, even an unchanged one, keeps the history's
+        // time axis even; the Overview shows it.
+        let history_changed =
+            self.record_network_sample(&snapshot.interfaces) && self.active_tab == Tab::Overview;
         if self.network_error.is_none() && self.networks == snapshot.interfaces {
-            return false;
+            return history_changed;
         }
 
         let previous_index = self.selected_network_index().unwrap_or(0);
@@ -70,6 +121,27 @@ impl App {
         self.reconcile_hovered_network();
         self.ensure_network_visible();
         visible
+    }
+
+    /// Adds the combined RX+TX rate of the Overview's interfaces; nothing
+    /// while no interface has a rate yet (the first sample after a gap).
+    fn record_network_sample(&mut self, interfaces: &[NetworkInterfaceInfo]) -> bool {
+        let inventory = self.hardware.as_ref();
+        let rates = interfaces
+            .iter()
+            .filter(|interface| is_overview_interface(&interface.name, inventory))
+            .flat_map(|interface| {
+                [
+                    interface.rx_rate_bytes_per_sec,
+                    interface.tx_rate_bytes_per_sec,
+                ]
+            })
+            .flatten();
+        let mut total = None;
+        for rate in rates {
+            *total.get_or_insert(0.0) += rate;
+        }
+        total.is_some_and(|total| self.network_history.push(total))
     }
 
     pub(super) fn move_network_selection(&mut self, delta: isize) -> bool {

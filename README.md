@@ -23,7 +23,7 @@ tar xzf tuxctl-$(uname -m)-unknown-linux-musl.tar.gz
 ./tuxctl-$(uname -m)-unknown-linux-musl/tuxctl
 ```
 
-Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.2.7 --locked`. See [Installation](#installation) for checksums and other options.
+Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked`. See [Installation](#installation) for checksums and other options.
 
 ## Features
 
@@ -35,19 +35,20 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Uptime.
   - Process, running-process, and zombie counts.
   - Root filesystem usage.
+  - Pinned processes (pin them with `P` on the Processes tab) with live CPU and memory.
 - Live CPU monitoring:
   - Aggregate CPU utilization.
   - Bounded CPU utilization history.
   - 1-minute, 5-minute, and 15-minute load averages.
   - Per-logical-CPU utilization.
   - Responsive logical-CPU grid for different terminal sizes.
-- Live RAM usage with used/total capacity.
+- Live RAM usage with used/total capacity and a usage trend.
 - Hardware inventory:
   - CPU model information.
   - RAM module information via EDAC sysfs when available.
   - GPU devices using DRM/NVIDIA sysfs metadata.
-  - NVMe and SATA/SCSI storage devices.
-- Compact physical network interface summary with live RX/TX rates.
+  - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
+- Compact physical network interface summary with live RX/TX rates and a combined traffic trend with its peak.
 - Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
 
 ### Processes
@@ -61,6 +62,8 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - PID (`p`)
   - Name (`n`)
 - Case-insensitive search (`/`).
+- Pinning (`P`): keep up to 8 processes at the top of the list, in your own order.
+- Kernel-thread filter (`v`).
 - Detailed process inspection (`Enter`).
 - Safe process signaling:
   - SIGTERM with `t`.
@@ -86,6 +89,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - `○ inactive`
   - `◌ activating`
 - Case-insensitive search (`/`).
+- View filter (`v`): hide `not-found` units or show only failed ones.
 - On-demand refresh (`r`).
 - Services are collected only while the tab is visible and refreshed each time it is opened.
 - Read-only service inspection (`Enter`).
@@ -100,6 +104,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 - Pause/resume (`Space`).
 - Severity-based styling for errors, warnings, informational messages, and debug output.
 - Search/filter mode (`/`).
+- Minimum-priority view (`v`): notice, warning, or error and above.
 - Detailed multiline message viewer (`Enter`).
 - Journal ingestion is scheduled so sustained log traffic does not monopolize terminal input handling.
 
@@ -122,9 +127,10 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Dropped packets
 - Safe rate-baseline recovery across interface changes and temporary `/proc/net/dev` failures.
 
-### Help
+### Help and Menu
 
 - Contextual keybinding reference overlay (`?`).
+- Main menu (`Esc`) with an About page (version, license, source, minimum Rust version) and Exit.
 
 ---
 
@@ -227,7 +233,7 @@ install -Dm755 "tuxctl-$arch-unknown-linux-musl/tuxctl" ~/.local/bin/tuxctl
 Install a tagged version directly with Cargo:
 
 ```sh
-cargo install --git https://github.com/Seqat/tuxctl --tag v0.2.7 --locked
+cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked
 ```
 
 Or from a clone of the repository:
@@ -261,7 +267,7 @@ tuxctl [--interval <DURATION>]
 
 | Option | Description |
 | --- | --- |
-| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. |
+| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. `+` and `-` change the interval while `tuxctl` runs. |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print the version. |
 
@@ -285,7 +291,8 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
-| `Esc` | Dismiss dialog / clear active search |
+| `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the top-right corner) |
+| `Esc` | Dismiss dialog / clear the search, then the view filter / open the main menu |
 | `q` | Quit |
 | `Ctrl+C` | Quit globally |
 
@@ -297,7 +304,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `↓` / `j` | Move selection down |
 | `PageUp` / `PageDown` | Move selection by page |
 | `Home` / `End` | Jump to first / last item |
-| `/` | Begin search / filter |
+| `/` | Begin search / filter; `↑` / `↓` and `PageUp` / `PageDown` move through the matches while typing |
 | `Enter` | Open detailed inspection |
 
 ### Processes
@@ -310,8 +317,11 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `n` | Sort by Name |
 | `t` | Request `SIGTERM` for selected process |
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
+| `P` / `Shift+P` | Pin / unpin the selected process (up to 8) |
+| `Shift+↑` / `Shift+↓` | Move the selected pinned process up / down (`Alt+↑` / `Alt+↓` also work) |
+| `v` | Hide / show kernel threads |
 
-Repeated sort commands toggle the sort direction.
+Repeated sort commands toggle the sort direction. Pinned processes stay at the top in the order you give them, marked with `*`; sorting applies to the rows below them. While a search is active, pinned processes that do not match stay visible but dimmed. A pinned process that exits is shown as `exited` for a few seconds and then removed; it can never be signaled.
 
 #### Signal Confirmation
 
@@ -321,11 +331,22 @@ Repeated sort commands toggle the sort direction.
 | `Enter` | Execute focused action |
 | `Esc` | Cancel and close |
 
+#### Main Menu
+
+`Esc` opens the main menu when there is no dialog, search, or view filter to clear.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move between About and Exit (`k` / `j` also work) |
+| `Enter` | Open About, or exit `tuxctl` |
+| `Esc` | Close the menu (from About, go back to the menu) |
+
 ### Services
 
 | Key | Action |
 | --- | --- |
 | `r` | Request an immediate service refresh |
+| `v` | Cycle the view: all units → loaded units (hide `not-found`) → failed units |
 
 ### Logs
 
@@ -333,6 +354,7 @@ Repeated sort commands toggle the sort direction.
 | --- | --- |
 | `f` | Toggle follow mode |
 | `Space` | Pause / resume |
+| `v` | Cycle the minimum priority: all → notice → warning → error |
 
 ### Mouse Controls
 
@@ -340,23 +362,26 @@ Repeated sort commands toggle the sort direction.
 - **Selection:** Click rows in Processes, Services, Logs, or Network.
 - **Scrolling:** Use the mouse wheel over list/table areas.
 - **Process sorting:** Click `PID`, `NAME`, `CPU`, or `MEMORY` headers.
+- **Pinned processes:** Click `▲` / `▼` at the end of a pinned row to move it (shown when there are at least two pins and the terminal is wide enough).
 - **Confirmation dialogs:** Click `Cancel` or the confirmation action.
+- **Main menu:** Click `About` or `Exit`.
+- **Sampling interval:** Click `[-]` / `[+]` next to `⟳` in the top-right corner.
 
 ---
 
 ## Performance
 
-Measured on an AMD Ryzen 5 7500F with the v0.2.7 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
+Measured on an AMD Ryzen 5 7500F with the v0.3.0 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
 
 | Scenario | CPU | Redraws/s |
 | --- | --- | --- |
-| Overview, idle | 0.60 % | 1.2 |
-| Processes, idle | 0.65 % | 2.0 |
-| Logs, idle | 0.55 % | 0.0 |
-| Logs, 200 journal messages/s | 0.80 % | 3.9 |
-| Mouse hover at 240 Hz | 1.29 % | 13.4 |
+| Overview, idle | 0.60 % | 1.1 |
+| Processes, idle | 0.75 % | 2.0 |
+| Logs, idle | 0.60 % | 0.0 |
+| Logs, 200 journal messages/s | 0.87 % | 3.9 |
+| Mouse hover at 240 Hz | 1.39 % | 13.5 |
 
-RSS is about 2.2 MiB at startup and 2.3 MiB after 15 minutes, with no growth after warm-up; the binary is 1.4 MB. Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
+RSS is about 2.3 MiB at startup and after 15 minutes, with no growth after warm-up; the binary is 1.45 MB. Measured alternately with v0.2.7 on the same machine, every difference is within run-to-run noise. Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
 
 ---
 
@@ -378,6 +403,7 @@ render from cached state ──▶ hit regions for the mouse
 ```
 
 - Linux collection happens outside rendering.
+- Process names, command lines, journal messages, and other system data are treated as untrusted: control characters and bidirectional overrides are removed before anything reaches the terminal, so escape sequences planted by other users cannot act on it.
 - Render paths consume cached state rather than performing blocking `/proc`, `/sys`, `systemctl`, or `journalctl` work.
 - Periodic system, process, service, and network snapshots use bounded newest-state semantics.
 - CPU history and log storage are bounded.

@@ -28,5 +28,7 @@ pub use service::{
     ServiceCollector, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot, SYSTEMCTL_TIMEOUT,
 };
 #[cfg(test)]
+pub(crate) use system::DiskIo;
+#[cfg(test)]
 pub(crate) use system::LogicalCpuId;
 pub use system::{ByteUsage, LogicalCpuMetrics, SystemMetrics, SystemMetricsCollector};

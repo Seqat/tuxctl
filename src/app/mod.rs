@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     action::{
-        Action, InputMode, MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton, Tab,
+        Action, InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSort,
+        ProcessSortField, SignalConfirmButton, Tab,
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
@@ -31,11 +32,14 @@ mod services;
 mod test_support;
 
 use health::CollectorHealth;
-pub use health::{Collector, CollectorPeriods};
-use processes::ProcessKeys;
+pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
+use logs::LogView;
+pub(crate) use network::{is_overview_interface, is_physical_interface};
+use processes::{PinnedProcess, ProcessKeys, ProcessRow, ProcessView};
+use services::ServiceView;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
-const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
+const METRIC_HISTORY_CAPACITY: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -45,35 +49,46 @@ pub struct ProcessSignalConfirmation {
     pub focused_button: SignalConfirmButton,
 }
 
+/// The last `METRIC_HISTORY_CAPACITY` samples of one metric (CPU %, RAM %,
+/// network bytes/s), one per sampling interval. The buffer is allocated once
+/// and never grows.
 #[derive(Debug)]
-pub struct AggregateCpuHistory {
+pub struct MetricHistory {
     samples: VecDeque<f64>,
 }
 
-impl Default for AggregateCpuHistory {
+impl Default for MetricHistory {
     fn default() -> Self {
         Self {
-            samples: VecDeque::with_capacity(AGGREGATE_CPU_HISTORY_CAPACITY),
+            samples: VecDeque::with_capacity(METRIC_HISTORY_CAPACITY),
         }
     }
 }
 
-impl AggregateCpuHistory {
-    fn push(&mut self, utilization_percent: f64) -> bool {
-        if !utilization_percent.is_finite() {
+impl MetricHistory {
+    /// Records a sample; non-finite or negative values are rejected.
+    fn push(&mut self, value: f64) -> bool {
+        if !value.is_finite() || value < 0.0 {
             return false;
         }
-        if self.samples.len() == AGGREGATE_CPU_HISTORY_CAPACITY {
+        if self.samples.len() == METRIC_HISTORY_CAPACITY {
             self.samples.pop_front();
         }
-        self.samples
-            .push_back(utilization_percent.clamp(0.0, 100.0));
+        self.samples.push_back(value);
         true
+    }
+
+    fn push_percent(&mut self, percent: f64) -> bool {
+        percent.is_finite() && self.push(percent.clamp(0.0, 100.0))
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
     }
 
     /// Number of samples kept; the history covers `capacity × sampling interval`.
     pub fn capacity(&self) -> usize {
-        AGGREGATE_CPU_HISTORY_CAPACITY
+        METRIC_HISTORY_CAPACITY
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = f64> + ExactSizeIterator + '_ {
@@ -82,10 +97,14 @@ impl AggregateCpuHistory {
 }
 
 /// The modal layer shown above the active screen; at most one is open at a time.
-///
-/// v0.3.0 adds the Esc main menu, About and Options pages here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Overlay {
+    /// The main menu, opened by `Esc` when there is nothing else to close.
+    Menu {
+        selected: MenuItem,
+    },
+    /// Opened from the menu; `Esc` returns to the menu.
+    About,
     Help,
     ProcessDetail,
     ServiceDetail,
@@ -101,13 +120,20 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
-    aggregate_cpu_history: AggregateCpuHistory,
+    aggregate_cpu_history: MetricHistory,
+    memory_history: MetricHistory,
+    /// Combined RX+TX bytes/s of the interfaces the Overview lists.
+    network_history: MetricHistory,
     processes: Vec<ProcessInfo>,
     /// Lowercased search/sort keys parallel to `processes`; empty until the next
     /// filter rebuild after a snapshot replaced `processes`.
     process_keys: Vec<ProcessKeys>,
     process_summary: ProcessSummary,
-    filtered_processes: Vec<usize>,
+    /// Rows of the Processes table: the pinned section, then the filtered and
+    /// sorted unpinned processes.
+    filtered_processes: Vec<ProcessRow>,
+    /// Pinned processes in the user's order; at most `MAX_PINNED_PROCESSES`.
+    pinned: Vec<PinnedProcess>,
     /// Set while Processes is hidden and `filtered_processes` has been cleared
     /// instead of rebuilt; holds the selected row index to fall back to.
     deferred_process_rebuild: Option<usize>,
@@ -118,6 +144,7 @@ pub struct App {
     process_searching: bool,
     process_error: Option<String>,
     process_sort: ProcessSort,
+    process_view: ProcessView,
     process_action_message: Option<String>,
     services: Vec<ServiceInfo>,
     filtered_services: Vec<usize>,
@@ -126,6 +153,7 @@ pub struct App {
     service_view_height: usize,
     service_search_query: String,
     service_searching: bool,
+    service_view: ServiceView,
     service_error: Option<String>,
     service_refresh_generation: ServiceRefreshGeneration,
     service_refresh_requested: Option<ServiceRefreshGeneration>,
@@ -137,6 +165,7 @@ pub struct App {
     log_view_height: usize,
     log_search_query: String,
     log_searching: bool,
+    log_view: LogView,
     log_following: bool,
     log_paused: bool,
     log_dropped: usize,
@@ -149,6 +178,8 @@ pub struct App {
     hovered: Option<MouseTarget>,
     collector_health: [CollectorHealth; 4],
     cpu_history_interval: Duration,
+    sampling_interval: Duration,
+    sampling_interval_changed: bool,
     logs_visited: bool,
 }
 
@@ -160,11 +191,14 @@ impl Default for App {
             active_tab: Tab::Overview,
             system_metrics: SystemMetrics::default(),
             hardware: None,
-            aggregate_cpu_history: AggregateCpuHistory::default(),
+            aggregate_cpu_history: MetricHistory::default(),
+            memory_history: MetricHistory::default(),
+            network_history: MetricHistory::default(),
             processes: Vec::new(),
             process_keys: Vec::new(),
             process_summary: ProcessSummary::default(),
             filtered_processes: Vec::new(),
+            pinned: Vec::new(),
             deferred_process_rebuild: None,
             selected_process: None,
             process_scroll: 0,
@@ -173,6 +207,7 @@ impl Default for App {
             process_searching: false,
             process_error: None,
             process_sort: ProcessSort::default(),
+            process_view: ProcessView::All,
             process_action_message: None,
             services: Vec::new(),
             filtered_services: Vec::new(),
@@ -181,6 +216,7 @@ impl Default for App {
             service_view_height: 0,
             service_search_query: String::new(),
             service_searching: false,
+            service_view: ServiceView::All,
             service_error: None,
             service_refresh_generation: 0,
             service_refresh_requested: None,
@@ -192,6 +228,7 @@ impl Default for App {
             log_view_height: 0,
             log_search_query: String::new(),
             log_searching: false,
+            log_view: LogView::All,
             log_following: true,
             log_paused: false,
             log_dropped: 0,
@@ -203,7 +240,9 @@ impl Default for App {
             network_error: None,
             hovered: None,
             collector_health: [CollectorHealth::default(); 4],
-            cpu_history_interval: Duration::from_secs(1),
+            cpu_history_interval: DEFAULT_SAMPLING_INTERVAL,
+            sampling_interval: DEFAULT_SAMPLING_INTERVAL,
+            sampling_interval_changed: false,
             logs_visited: false,
         }
     }
@@ -232,12 +271,32 @@ impl App {
         self.overlay == Some(Overlay::Help)
     }
 
+    /// The highlighted item while the main menu is open.
+    pub fn menu_selection(&self) -> Option<MenuItem> {
+        match self.overlay {
+            Some(Overlay::Menu { selected }) => Some(selected),
+            _ => None,
+        }
+    }
+
+    pub fn about_visible(&self) -> bool {
+        self.overlay == Some(Overlay::About)
+    }
+
     pub fn system_metrics(&self) -> &SystemMetrics {
         &self.system_metrics
     }
 
-    pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
+    pub fn aggregate_cpu_history(&self) -> &MetricHistory {
         &self.aggregate_cpu_history
+    }
+
+    pub fn memory_history(&self) -> &MetricHistory {
+        &self.memory_history
+    }
+
+    pub fn network_history(&self) -> &MetricHistory {
+        &self.network_history
     }
 
     pub fn hardware(&self) -> Option<&HardwareInventory> {
@@ -248,6 +307,8 @@ impl App {
         if let Some(overlay) = &self.overlay {
             match overlay {
                 Overlay::Help => InputMode::Help,
+                Overlay::Menu { .. } => InputMode::Menu,
+                Overlay::About => InputMode::About,
                 Overlay::ProcessSignal(_) => InputMode::ProcessSignalConfirm,
                 Overlay::ProcessDetail => InputMode::ProcessDetail,
                 Overlay::ServiceDetail => InputMode::ServiceDetail,
@@ -293,9 +354,13 @@ impl App {
                 let process_metrics_changed = self.system_metrics.cpu_percent
                     != metrics.cpu_percent
                     || self.system_metrics.memory != metrics.memory;
-                let history_changed = metrics
+                let cpu_recorded = metrics
                     .cpu_percent
-                    .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
+                    .is_some_and(|sample| self.aggregate_cpu_history.push_percent(sample));
+                let memory_recorded = metrics
+                    .memory
+                    .is_some_and(|memory| self.memory_history.push_percent(memory.percent()));
+                let history_changed = cpu_recorded || memory_recorded;
                 let metrics_changed = self.system_metrics != metrics;
                 if metrics_changed {
                     self.system_metrics = metrics;
@@ -360,13 +425,20 @@ impl App {
                 }
             }
             // Staleness is global state, so it is checked even while a modal is open.
-            Action::Tick(now) => self.check_collector_staleness(now),
+            Action::Tick(now) => self.check_collector_staleness(now) | self.expire_exited_pins(now),
             Action::Escape => self.escape(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
+            Action::MenuPrevious => self.move_menu_selection(-1),
+            Action::MenuNext => self.move_menu_selection(1),
+            Action::ActivateSelectedMenuItem => match self.menu_selection() {
+                Some(item) => self.activate_menu_item(item),
+                None => false,
+            },
+            Action::ActivateMenuItem(item) => self.activate_menu_item(item),
             Action::Resize => unreachable!("resize actions return before modal suppression"),
             _ if self.overlay.is_some() => false,
             Action::ShowHelp => {
@@ -374,6 +446,7 @@ impl App {
                 self.hovered = None;
                 true
             }
+            Action::StepSamplingInterval(step) => self.step_sampling_interval(step),
             Action::SelectTab(tab) => self.select_tab(tab),
             Action::NextTab => self.select_tab(self.active_tab.next()),
             Action::PreviousTab => self.select_tab(self.active_tab.previous()),
@@ -396,6 +469,15 @@ impl App {
             Action::OpenProcessDetails => self.open_process_details(),
             Action::RequestProcessSignal(signal) => self.request_process_signal(signal),
             Action::SortProcesses(field) => self.sort_processes(field),
+            Action::TogglePin => self.toggle_selected_pin(),
+            Action::CycleViewFilter => match self.active_tab {
+                Tab::Processes => self.cycle_process_view(),
+                Tab::Services => self.cycle_service_view(),
+                Tab::Logs => self.cycle_log_view(),
+                Tab::Overview | Tab::Network => false,
+            },
+            Action::MoveSelectedPin(direction) => self.move_selected_pin(direction),
+            Action::MovePin(identity, direction) => self.move_pin(identity, direction),
             Action::ServicePrevious => self.move_service_selection(-1),
             Action::ServiceNext => self.move_service_selection(1),
             Action::ServicePreviousPage => {
@@ -478,9 +560,16 @@ impl App {
         changed
     }
 
+    /// Esc order: close the overlay (About goes back to the menu), else clear
+    /// the tab's search, else its view filter, else open the main menu.
     fn escape(&mut self) -> bool {
         if matches!(self.overlay, Some(Overlay::ProcessSignal(_))) {
             self.cancel_process_signal()
+        } else if self.overlay == Some(Overlay::About) {
+            self.overlay = Some(Overlay::Menu {
+                selected: MenuItem::About,
+            });
+            true
         } else if self.overlay.take().is_some() {
             true
         } else {
@@ -493,11 +582,21 @@ impl App {
                     self.rebuild_process_filter();
                     true
                 }
+                Tab::Processes if self.process_view != ProcessView::All => {
+                    self.process_view = ProcessView::All;
+                    self.rebuild_process_filter();
+                    true
+                }
                 Tab::Services
                     if self.service_searching || !self.service_search_query.is_empty() =>
                 {
                     self.service_searching = false;
                     self.service_search_query.clear();
+                    self.rebuild_service_filter();
+                    true
+                }
+                Tab::Services if self.service_view != ServiceView::All => {
+                    self.service_view = ServiceView::All;
                     self.rebuild_service_filter();
                     true
                 }
@@ -507,7 +606,52 @@ impl App {
                     self.rebuild_log_filter();
                     true
                 }
-                _ => false,
+                Tab::Logs if self.log_view != LogView::All => {
+                    self.log_view = LogView::All;
+                    self.rebuild_log_filter();
+                    true
+                }
+                _ => {
+                    self.overlay = Some(Overlay::Menu {
+                        selected: MenuItem::About,
+                    });
+                    self.hovered = None;
+                    true
+                }
+            }
+        }
+    }
+
+    fn move_menu_selection(&mut self, delta: isize) -> bool {
+        let Some(Overlay::Menu { selected }) = &mut self.overlay else {
+            return false;
+        };
+        let current = MenuItem::ALL
+            .iter()
+            .position(|item| item == selected)
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(MenuItem::ALL.len() - 1);
+        let changed = MenuItem::ALL[next] != *selected;
+        *selected = MenuItem::ALL[next];
+        changed
+    }
+
+    fn activate_menu_item(&mut self, item: MenuItem) -> bool {
+        if self.menu_selection().is_none() {
+            return false;
+        }
+        match item {
+            MenuItem::About => {
+                self.overlay = Some(Overlay::About);
+                self.hovered = None;
+                true
+            }
+            MenuItem::Exit => {
+                // Not destructive: leaving tuxctl needs no confirmation.
+                self.should_quit = true;
+                false
             }
         }
     }
@@ -553,15 +697,19 @@ mod tests {
         ServiceDetail,
         LogDetail,
         NetworkDetail,
+        Menu,
+        About,
     }
 
-    const OVERLAYS: [OverlayKind; 6] = [
+    const OVERLAYS: [OverlayKind; 8] = [
         OverlayKind::Help,
         OverlayKind::ProcessDetail,
         OverlayKind::ProcessSignal,
         OverlayKind::ServiceDetail,
         OverlayKind::LogDetail,
         OverlayKind::NetworkDetail,
+        OverlayKind::Menu,
+        OverlayKind::About,
     ];
 
     /// The input mode of a tab with no overlay and no search in progress.
@@ -603,6 +751,11 @@ mod tests {
             OverlayKind::ServiceDetail => (Tab::Services, Action::OpenServiceDetails),
             OverlayKind::LogDetail => (Tab::Logs, Action::OpenLogDetails),
             OverlayKind::NetworkDetail => (Tab::Network, Action::OpenNetworkDetails),
+            OverlayKind::Menu => (Tab::Overview, Action::Escape),
+            OverlayKind::About => {
+                app.update(Action::Escape);
+                (Tab::Overview, Action::ActivateMenuItem(MenuItem::About))
+            }
         };
         app.update(Action::SelectTab(tab));
         assert!(app.update(open), "{kind:?} did not open");
@@ -640,17 +793,20 @@ mod tests {
         }
     }
 
-    /// Current Esc order: close the overlay, else clear the tab's search or
-    /// filter, else do nothing. v0.3.0 opens the main menu in that last case.
+    /// Esc order: close the overlay, else clear the tab's search, else its
+    /// view filter, else open the main menu; Esc then closes the menu.
     #[test]
-    fn escape_with_nothing_to_close_does_nothing_on_every_tab() {
+    fn escape_with_nothing_to_close_opens_the_menu_on_every_tab() {
         for tab in Tab::ALL {
             let mut app = app_with_overlay(OverlayKind::Help);
             app.update(Action::Escape);
             app.update(Action::SelectTab(tab));
 
-            assert!(!app.update(Action::Escape), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?}");
+            assert_eq!(app.menu_selection(), Some(MenuItem::About), "{tab:?}");
             assert_eq!(app.active_tab(), tab);
+
+            assert!(app.update(Action::Escape), "{tab:?} closes the menu");
             assert!(app.overlay.is_none());
         }
     }
@@ -695,21 +851,175 @@ mod tests {
             assert!(app.update(Action::Escape), "{tab:?} closes details first");
             assert!(app.overlay.is_none());
             assert!(app.update(Action::Escape), "{tab:?} clears the filter");
-            assert!(!app.update(Action::Escape), "{tab:?} has nothing left");
+            assert!(app.menu_selection().is_none(), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?} opens the menu last");
+            assert!(app.menu_selection().is_some(), "{tab:?}");
+        }
+    }
+
+    /// Arrow keys during search move through the matches, the query stays
+    /// active, and Enter opens the row the user moved to.
+    #[test]
+    fn navigating_during_search_chooses_the_row_enter_opens() {
+        let mut app = App::default();
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "sshd"),
+            process(2, "bash"),
+            process(3, "ssh-agent"),
+        ])));
+        app.update(Action::ServicesUpdated(services(vec![
+            service("sshd.service", "active", "OpenSSH"),
+            service("dbus.service", "active", "D-Bus"),
+            service("ssh-agent.service", "active", "Agent"),
+        ])));
+        app.update(Action::LogsUpdated(log_batch(vec![
+            log_entry(1, "sshd", 6, "ssh accepted"),
+            log_entry(2, "kernel", 6, "boot"),
+            log_entry(3, "sshd", 6, "ssh closed"),
+        ])));
+
+        let cases = [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                Action::AppendProcessSearch('s'),
+                Action::ProcessNext,
+                Action::OpenProcessDetails,
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                Action::AppendServiceSearch('s'),
+                Action::ServiceNext,
+                Action::OpenServiceDetails,
+            ),
+            // Following logs select the newest match, so the move is upwards.
+            (
+                Tab::Logs,
+                Action::BeginLogSearch,
+                Action::AppendLogSearch('s'),
+                Action::LogPrevious,
+                Action::OpenLogDetails,
+            ),
+        ];
+        let selected = |app: &App, tab: Tab| match tab {
+            Tab::Processes => app.selected_process().map(|p| p.name.clone()),
+            Tab::Services => app.selected_service().map(|s| s.unit.clone()),
+            _ => app.selected_log().map(|entry| entry.id.to_string()),
+        };
+        for (tab, begin, append, step, open) in cases {
+            app.update(Action::SelectTab(tab));
+            app.update(begin);
+            app.update(append.clone());
+            app.update(append);
+            let searching = app.input_mode();
+            let before = selected(&app, tab);
+
+            assert!(app.update(step), "{tab:?} moved");
+            let chosen = selected(&app, tab);
+            assert_ne!(chosen, before, "{tab:?}");
+            assert_eq!(app.input_mode(), searching, "{tab:?} search stays active");
+
+            assert!(app.update(open), "{tab:?} opens details");
+            assert_eq!(selected(&app, tab), chosen, "{tab:?}");
+            app.update(Action::Escape);
+        }
+        assert_eq!(app.process_search_query(), "ss");
+    }
+
+    #[test]
+    fn navigating_an_empty_search_result_is_a_no_op() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "init",
+        )])));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('z'));
+
+        for action in [
+            Action::ProcessNext,
+            Action::ProcessPrevious,
+            Action::ProcessNextPage,
+            Action::ProcessPreviousPage,
+        ] {
+            assert!(!app.update(action));
+        }
+        assert!(!app.update(Action::OpenProcessDetails));
+    }
+
+    #[test]
+    fn escape_clears_the_search_then_the_view_filter() {
+        let cases = [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                Action::AppendProcessSearch('i'),
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                Action::AppendServiceSearch('s'),
+            ),
+            (
+                Tab::Logs,
+                Action::BeginLogSearch,
+                Action::AppendLogSearch('b'),
+            ),
+        ];
+        for (tab, begin, append) in cases {
+            let mut app = app_with_overlay(OverlayKind::Help);
+            app.update(Action::Escape);
+            app.update(Action::SelectTab(tab));
+            assert!(app.update(Action::CycleViewFilter), "{tab:?}");
+            app.update(begin);
+            app.update(append);
+            let view = |app: &App| match tab {
+                Tab::Processes => app.process_view_label(),
+                Tab::Services => app.service_view_label(),
+                _ => app.log_view_label(),
+            };
+            assert!(view(&app).is_some(), "{tab:?}");
+
+            assert!(app.update(Action::Escape), "{tab:?} clears the search");
+            assert!(view(&app).is_some(), "{tab:?} keeps the view");
+            assert!(app.update(Action::Escape), "{tab:?} clears the view");
+            assert!(view(&app).is_none(), "{tab:?}");
+            assert!(app.menu_selection().is_none(), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?} opens the menu last");
+            assert!(app.menu_selection().is_some(), "{tab:?}");
         }
     }
 
     #[test]
+    fn view_filters_cycle_only_on_their_screen() {
+        let mut app = App::default();
+        for tab in [Tab::Overview, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            assert!(!app.update(Action::CycleViewFilter), "{tab:?}");
+        }
+        app.update(Action::SelectTab(Tab::Services));
+        app.update(Action::ShowHelp);
+        assert!(
+            !app.update(Action::CycleViewFilter),
+            "blocked by an overlay"
+        );
+    }
+
+    #[test]
     fn escape_closes_exactly_one_overlay_per_press() {
-        for kind in OVERLAYS {
+        // About goes back to the menu instead (tested below).
+        for kind in OVERLAYS
+            .into_iter()
+            .filter(|kind| !matches!(kind, OverlayKind::About))
+        {
             let mut app = app_with_overlay(kind);
 
             assert!(app.update(Action::Escape), "{kind:?}");
             assert!(app.overlay.is_none(), "{kind:?}");
-            assert!(
-                !app.update(Action::Escape),
-                "{kind:?}: nothing left to close"
-            );
+            // With nothing left to close, the next Esc opens the menu.
+            assert!(app.update(Action::Escape), "{kind:?}");
+            assert!(app.menu_selection().is_some(), "{kind:?}");
         }
     }
 
@@ -735,6 +1045,48 @@ mod tests {
 
         assert!(app.update(Action::Escape));
         assert_eq!(app.process_search_query(), "");
+    }
+
+    #[test]
+    fn the_menu_moves_between_items_and_opens_about() {
+        let mut app = App::default();
+        assert!(!app.update(Action::MenuNext), "no menu open");
+
+        assert!(app.update(Action::Escape));
+        assert_eq!(app.input_mode(), InputMode::Menu);
+        assert!(!app.update(Action::MenuPrevious), "already at the top");
+        assert!(app.update(Action::MenuNext));
+        assert_eq!(app.menu_selection(), Some(MenuItem::Exit));
+        assert!(!app.update(Action::MenuNext), "already at the bottom");
+        assert!(app.update(Action::MenuPrevious));
+
+        assert!(app.update(Action::ActivateSelectedMenuItem));
+        assert!(app.about_visible());
+        assert_eq!(app.input_mode(), InputMode::About);
+
+        assert!(app.update(Action::Escape), "About goes back to the menu");
+        assert_eq!(app.menu_selection(), Some(MenuItem::About));
+        assert!(app.update(Action::Escape));
+        assert!(app.overlay.is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn exit_quits_without_confirmation_but_only_from_the_menu() {
+        let mut app = App::default();
+        // A stale click on where the menu was must not quit.
+        app.update(Action::ActivateMenuItem(MenuItem::Exit));
+        assert!(!app.should_quit());
+
+        app.update(Action::Escape);
+        app.update(Action::MenuNext);
+        app.update(Action::ActivateSelectedMenuItem);
+        assert!(app.should_quit());
+
+        let mut app = App::default();
+        app.update(Action::Escape);
+        app.update(Action::ActivateMenuItem(MenuItem::Exit));
+        assert!(app.should_quit());
     }
 
     #[test]
@@ -991,9 +1343,86 @@ mod tests {
     }
 
     #[test]
+    fn metric_history_never_grows_and_rejects_invalid_samples() {
+        let mut history = MetricHistory::default();
+        let capacity = history.samples.capacity();
+
+        for sample in 0..(METRIC_HISTORY_CAPACITY * 3) {
+            assert!(history.push(sample as f64));
+        }
+        assert!(!history.push(f64::NAN));
+        assert!(!history.push(f64::INFINITY));
+        assert!(!history.push(-1.0));
+        assert!(history.push_percent(250.0), "percentages are clamped");
+
+        assert_eq!(history.iter().len(), METRIC_HISTORY_CAPACITY);
+        assert_eq!(history.iter().last(), Some(100.0));
+        assert_eq!(history.samples.capacity(), capacity, "no reallocation");
+    }
+
+    #[test]
+    fn memory_usage_is_recorded_with_each_metrics_sample() {
+        let mut app = App::default();
+        for used in [1, 2, 3] {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                memory: Some(crate::linux::ByteUsage { used, total: 4 }),
+                ..SystemMetrics::default()
+            }));
+        }
+        assert_eq!(
+            app.memory_history().iter().collect::<Vec<_>>(),
+            [25.0, 50.0, 75.0]
+        );
+    }
+
+    #[test]
+    fn network_history_sums_the_overview_interfaces_once_per_snapshot() {
+        let mut app = App::default();
+        let interface = |name: &str, rx, tx| NetworkInterfaceInfo {
+            rx_rate_bytes_per_sec: rx,
+            tx_rate_bytes_per_sec: tx,
+            ..dummy_network(name)
+        };
+        let snapshot = NetworkSnapshot {
+            interfaces: vec![
+                interface("enp6s0", Some(1000.0), Some(24.0)),
+                interface("wlan0", Some(1.0), None),
+                interface("lo", Some(5000.0), Some(5000.0)),
+                interface("docker0", Some(700.0), Some(700.0)),
+                interface("veth12ab", Some(700.0), Some(700.0)),
+            ],
+            error: None,
+        };
+
+        assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
+        // An unchanged snapshot still adds a sample and redraws the Overview.
+        assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
+        assert_eq!(
+            app.network_history().iter().collect::<Vec<_>>(),
+            [1025.0, 1025.0]
+        );
+
+        // Errors and snapshots without any rate add nothing.
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("read failed".into()),
+        }));
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![interface("enp6s0", None, None)],
+            error: None,
+        }));
+        assert_eq!(app.network_history().iter().len(), 2);
+
+        // Hidden from the Overview, a sample is still kept but redraws nothing.
+        app.update(Action::SelectTab(Tab::Logs));
+        assert!(!app.update(Action::NetworkUpdated(snapshot)));
+        assert_eq!(app.network_history().iter().len(), 3);
+    }
+
+    #[test]
     fn aggregate_cpu_history_is_bounded_and_evicts_oldest_samples() {
         let mut app = App::default();
-        let sample_count = AGGREGATE_CPU_HISTORY_CAPACITY + 5;
+        let sample_count = METRIC_HISTORY_CAPACITY + 5;
 
         for sample in 0..sample_count {
             app.update(Action::SystemMetricsUpdated(SystemMetrics {
@@ -1003,7 +1432,7 @@ mod tests {
         }
 
         let history = app.aggregate_cpu_history().iter().collect::<Vec<_>>();
-        assert_eq!(history.len(), AGGREGATE_CPU_HISTORY_CAPACITY);
+        assert_eq!(history.len(), METRIC_HISTORY_CAPACITY);
         assert_eq!(history.first(), Some(&5.0));
         assert_eq!(history.last(), Some(&64.0));
     }

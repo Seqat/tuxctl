@@ -99,7 +99,7 @@ t.send("\x1b")
 t.send("3", 1.0)
 for key in ["j", "j", "k", "r"]:
     t.send(key, 0.3)
-t.send("/"); t.send("ssh"); t.send("\x1b"); t.send("\x1b")
+t.send("/"); t.send("ssh"); t.send("\x1b")
 check("services navigation, refresh, search", t.alive())
 
 t.send("4", 1.0)
@@ -112,6 +112,19 @@ t.send("5", 0.8)
 t.send("j"); out = t.send("\r", 0.4)
 check("network details open", t.alive() and len(out) > 0)
 t.send("\x1b")
+
+out = t.send("\x1b", 0.4)
+check("Esc with nothing to clear opens the main menu", b"About" in out and b"Exit" in out)
+out = t.send("\r", 0.4)
+check("menu Enter opens About", b"MIT" in out)
+t.send("\x1b", 0.3); t.send("\x1b", 0.3)
+check("Esc leaves About, then closes the menu", t.alive())
+
+out = t.send("-", 0.4)
+# Only changed cells are redrawn, so match the part of "500ms" that must change.
+check("'-' shortens the sampling interval", b"500m" in out)
+t.send("+", 0.4)
+check("'+' restores it", t.alive())
 
 t.send("?", 0.4); t.send("?", 0.4)
 check("help overlay toggle", t.alive())

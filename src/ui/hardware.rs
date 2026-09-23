@@ -11,7 +11,7 @@ use crate::{
     linux::{GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics},
 };
 
-use super::{format_bytes, hardware_cpu, hardware_network_summary, layout};
+use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network};
 
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
 const MAX_STORAGE_ROWS: u16 = 4;
@@ -34,7 +34,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let metrics = app.system_metrics();
     let width = usize::from(inner.width);
     let lower_desired = [
-        2_u16.saturating_add(
+        // Heading, usage, trend and up to two modules.
+        3_u16.saturating_add(
             inventory
                 .map(|inventory| inventory.memory_modules.len().min(2) as u16)
                 .unwrap_or(0),
@@ -66,9 +67,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let areas = vertical_areas(inner, heights, spacing);
 
     hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
-    render_ram(frame, inventory, metrics, areas[1]);
+    render_ram(frame, app, inventory, metrics, areas[1]);
     render_gpu(frame, inventory, areas[2]);
-    render_storage(frame, inventory, areas[3]);
+    render_storage(frame, inventory, metrics, areas[3]);
     hardware_network_summary::render(frame, app, inventory, areas[4]);
 }
 
@@ -150,6 +151,7 @@ fn vertical_areas(area: Rect, heights: [u16; 5], spacing: u16) -> [Rect; 5] {
 
 fn render_ram(
     frame: &mut Frame,
+    app: &App,
     inventory: Option<&HardwareInventory>,
     metrics: &SystemMetrics,
     area: Rect,
@@ -166,6 +168,18 @@ fn render_ram(
             |memory| usage_bar_line("Used  ", memory, width),
         );
         lines.push(Line::from(layout::truncate(&usage_line, width)));
+    }
+
+    // The trend gives way first: it is shown only when the modules fit too.
+    let module_rows = inventory.map_or(0, |inventory| inventory.memory_modules.len().min(2));
+    if usize::from(area.height) >= lines.len() + 1 + module_rows {
+        lines.push(Line::from(trend_line(
+            app.memory_history(),
+            app.cpu_history_interval(),
+            100.0,
+            None,
+            width,
+        )));
     }
 
     if let Some(inventory) = inventory {
@@ -185,6 +199,27 @@ fn render_ram(
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `Trend  ▂▃▅  60s`, optionally followed by a note such as the peak rate.
+pub(super) fn trend_line(
+    history: &crate::app::MetricHistory,
+    interval: std::time::Duration,
+    scale: f64,
+    note: Option<&str>,
+    width: usize,
+) -> String {
+    // As wide as the CPU line's `Util   12%  `, so the sparklines line up.
+    const LABEL: &str = "Trend       ";
+    let note = note.map(|note| format!("  {note}")).unwrap_or_default();
+    let room = width.saturating_sub(LABEL.len() + note.chars().count());
+    layout::truncate(
+        &format!(
+            "{LABEL}{}{note}",
+            hardware_cpu::history_line(history, interval, room, scale)
+        ),
+        width,
+    )
 }
 
 /// Formats `<label>N%  [bar]  used / total`, dropping the bar when it would be too narrow.
@@ -250,7 +285,12 @@ fn render_gpu(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Re
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_storage(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Rect) {
+fn render_storage(
+    frame: &mut Frame,
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    area: Rect,
+) {
     if area.height == 0 {
         return;
     }
@@ -267,15 +307,21 @@ fn render_storage(frame: &mut Frame, inventory: Option<&HardwareInventory>, area
                 let show_overflow = inventory.storage_devices.len() > remaining && remaining > 1;
                 let device_limit = remaining.saturating_sub(usize::from(show_overflow));
                 let mut counts = [0_usize; 5];
-                for device in inventory.storage_devices.iter().take(device_limit) {
-                    let (label, count_index) = storage_label(device.kind);
-                    let index = counts[count_index];
-                    counts[count_index] += 1;
-                    lines.push(Line::from(layout::truncate(
-                        &format_storage_device(label, index, device),
-                        width,
-                    )));
-                }
+                let rows: Vec<_> = inventory
+                    .storage_devices
+                    .iter()
+                    .take(device_limit)
+                    .map(|device| {
+                        let (label, count_index) = storage_label(device.kind);
+                        let index = counts[count_index];
+                        counts[count_index] += 1;
+                        (
+                            format_storage_device(label, index, device),
+                            disk_rates(metrics, &device.system_name),
+                        )
+                    })
+                    .collect();
+                lines.extend(storage_lines(&rows, width).into_iter().map(Line::from));
                 if show_overflow {
                     lines.push(Line::from(format!(
                         "… {} more devices",
@@ -344,6 +390,98 @@ fn format_storage_device(label: &str, index: usize, device: &StorageDevice) -> S
         .map(|bytes| format!("  {}", format_decimal_capacity(bytes)))
         .unwrap_or_default();
     format!("{label}{index}  {model}{capacity}")
+}
+
+/// Read/write rates of a storage device. `None` hides the rates entirely
+/// (no disk statistics at all); a device missing from them shows `--`.
+fn disk_rates(metrics: &SystemMetrics, name: &str) -> Option<(Option<f64>, Option<f64>)> {
+    if metrics.disks.is_empty() {
+        return None;
+    }
+    Some(
+        metrics
+            .disks
+            .iter()
+            .find(|disk| *disk.name == *name)
+            .map_or((None, None), |disk| {
+                (disk.read_bytes_per_sec, disk.write_bytes_per_sec)
+            }),
+    )
+}
+
+type DiskRates = Option<(Option<f64>, Option<f64>)>;
+
+/// Storage rows with their rates in a column right after the longest
+/// description, so the numbers stay next to the device they belong to on a
+/// wide panel. When the panel is narrow the models are truncated first, then
+/// the rates switch to a tight form, and they are left out when not even the
+/// device labels would remain.
+fn storage_lines(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
+    let plain = || {
+        rows.iter()
+            .map(|(description, _)| layout::truncate(description, width))
+            .collect()
+    };
+    if rows.iter().all(|(_, rates)| rates.is_none()) {
+        return plain();
+    }
+    let label_width = rows
+        .iter()
+        .map(|(description, _)| {
+            description
+                .split("  ")
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let description_width = rows
+        .iter()
+        .map(|(description, _)| description.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    type Format = fn(Option<f64>) -> String;
+    let full: (Format, &str, &str) = (network::format_rate, "  R ", "  W ");
+    let tight: (Format, &str, &str) = (hardware_network_summary::format_rate_tight, "  R", " W");
+    for (format, read_prefix, write_prefix) in [full, tight] {
+        let texts: Vec<Option<(String, String)>> = rows
+            .iter()
+            .map(|(_, rates)| rates.map(|(read, write)| (format(read), format(write))))
+            .collect();
+        let widest = |text: fn(&(String, String)) -> &String| {
+            texts
+                .iter()
+                .flatten()
+                .map(|pair| text(pair).chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let read_column = widest(|(read, _)| read);
+        let rates_width =
+            read_prefix.len() + read_column + write_prefix.len() + widest(|(_, write)| write);
+        let Some(room) = width.checked_sub(rates_width) else {
+            continue;
+        };
+        if room < label_width {
+            continue;
+        }
+        let column = description_width.min(room);
+        return rows
+            .iter()
+            .zip(texts)
+            .map(|((description, _), rates)| match rates {
+                Some((read, write)) => format!(
+                    "{:<column$}{read_prefix}{read:<read_column$}{write_prefix}{write}",
+                    layout::truncate(description, column),
+                ),
+                None => layout::truncate(description, width),
+            })
+            .collect();
+    }
+    plain()
 }
 
 fn format_binary_capacity(bytes: u64) -> String {
@@ -446,6 +584,180 @@ mod tests {
         };
 
         assert_eq!(format_memory_module(0, &module), "SLOT0  8 GiB");
+    }
+
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    fn two_disks() -> Vec<(String, DiskRates)> {
+        vec![
+            (
+                "NVMe0  WD Blue SN5100 1TB  1.0 TB".into(),
+                Some((Some(12.3 * MIB), Some(0.0))),
+            ),
+            (
+                "SATA0  Samsung SSD 870  2.0 TB".into(),
+                Some((Some(0.0), Some(512.0 * 1024.0))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn storage_rates_follow_the_longest_description_on_a_wide_panel() {
+        let lines = storage_lines(&two_disks(), 120);
+
+        assert_eq!(
+            lines,
+            [
+                "NVMe0  WD Blue SN5100 1TB  1.0 TB  R 12.3 MiB/s  W 0 B/s",
+                "SATA0  Samsung SSD 870  2.0 TB     R 0 B/s       W 512.0 KiB/s",
+            ],
+            "rates sit after the descriptions, with R and W aligned"
+        );
+    }
+
+    #[test]
+    fn narrow_storage_rows_truncate_models_then_tighten_then_drop_rates() {
+        let rows = two_disks();
+
+        let medium = storage_lines(&rows, 50);
+        assert!(
+            medium.iter().all(|line| line.chars().count() <= 50),
+            "{medium:?}"
+        );
+        assert!(medium[0].starts_with("NVMe0  WD Blue"), "{medium:?}");
+        assert!(medium[0].contains("…  R 12.3 MiB/s  W 0 B/s"), "{medium:?}");
+        let w = |line: &str| line.find("  W ").unwrap();
+        assert_eq!(w(&medium[0]), w(&medium[1]), "W stays aligned");
+
+        let narrow = storage_lines(&rows, 24);
+        assert!(
+            narrow.iter().all(|line| line.chars().count() <= 24),
+            "{narrow:?}"
+        );
+        assert!(narrow[0].starts_with("NVMe0"), "{narrow:?}");
+        assert!(narrow[0].ends_with("  R12M/s W0B/s"), "{narrow:?}");
+
+        let tiny = storage_lines(&rows, 8);
+        assert_eq!(tiny[0], layout::truncate(&rows[0].0, 8), "rates dropped");
+    }
+
+    #[test]
+    fn storage_rates_show_dashes_for_a_missing_disk_and_hide_without_statistics() {
+        let mut metrics = SystemMetrics {
+            disks: vec![crate::linux::DiskIo {
+                name: "sda".into(),
+                read_bytes_per_sec: Some(1024.0),
+                write_bytes_per_sec: None,
+            }],
+            ..SystemMetrics::default()
+        };
+
+        assert_eq!(disk_rates(&metrics, "sda"), Some((Some(1024.0), None)));
+        assert_eq!(disk_rates(&metrics, "nvme0n1"), Some((None, None)));
+        let missing = [("SATA0  disk".to_owned(), disk_rates(&metrics, "nvme0n1"))];
+        assert_eq!(storage_lines(&missing, 40), ["SATA0  disk  R --  W --"]);
+
+        metrics.disks.clear();
+        let hidden = [("SATA0  disk".to_owned(), disk_rates(&metrics, "sda"))];
+        assert_eq!(storage_lines(&hidden, 40), ["SATA0  disk"]);
+    }
+
+    #[test]
+    fn ram_and_network_trends_appear_when_there_is_room() {
+        use crate::action::Action;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::default();
+        for used in [1_u64, 2, 3] {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                memory: Some(crate::linux::ByteUsage {
+                    used: used << 30,
+                    total: 4 << 30,
+                }),
+                ..SystemMetrics::default()
+            }));
+        }
+        for rx in [0.0, 512.0, 2048.0] {
+            app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+                interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                    name: "enp6s0".into(),
+                    operstate: crate::linux::OperState::Up,
+                    mac_address: None,
+                    mtu: Some(1500),
+                    ipv4_addresses: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    rx_errors: 0,
+                    tx_errors: 0,
+                    rx_dropped: 0,
+                    tx_dropped: 0,
+                    rx_rate_bytes_per_sec: Some(rx),
+                    tx_rate_bytes_per_sec: Some(0.0),
+                }],
+                error: None,
+            }));
+        }
+        let rows = |height| {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+
+        let tall = rows(40);
+        let trends: Vec<&String> = tall.iter().filter(|row| row.contains("Trend ")).collect();
+        assert_eq!(trends.len(), 2, "{tall:#?}");
+        assert!(
+            trends[0].contains("▃▅▆"),
+            "RAM at 25/50/75 %: {}",
+            trends[0]
+        );
+        assert!(
+            trends[1].contains("▁▃█"),
+            "network scaled to its peak: {}",
+            trends[1]
+        );
+        assert!(trends[1].contains("peak 2.0 KiB/s"), "{}", trends[1]);
+
+        // The CPU and RAM sparklines start in the same column.
+        let column = |row: &String, marker: char| row.chars().position(|c| c == marker);
+        let cpu = tall.iter().find(|row| row.contains("Util")).unwrap();
+        assert_eq!(
+            column(cpu, '—'),
+            column(trends[0], '▃'),
+            "{cpu}\n{}",
+            trends[0]
+        );
+
+        // A trend never displaces the row it summarizes.
+        for height in 8..40 {
+            let panel = rows(height);
+            let at = |text: &str| panel.iter().position(|row| row.contains(text));
+            let trend_rows: Vec<usize> = panel
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains("Trend "))
+                .map(|(index, _)| index)
+                .collect();
+            for trend in trend_rows {
+                let owner = if at("NETWORK").is_some_and(|network| trend > network) {
+                    at("enp6s0")
+                } else {
+                    at("Used")
+                };
+                assert!(
+                    owner.is_some_and(|owner| owner < trend),
+                    "{height}: {panel:#?}"
+                );
+            }
+        }
     }
 
     #[test]

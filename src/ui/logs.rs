@@ -166,6 +166,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(mode_badge, mode_style),
         Span::raw(" "),
     ];
+    if let Some(view) = app.log_view_label() {
+        spans.push(Span::raw(format!("View: {view}   ")));
+    }
 
     if app.log_searching() {
         spans.push(Span::styled(
@@ -175,7 +178,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else if app.log_search_query().is_empty() {
-        if area.width >= 55 {
+        if area.width >= 72 {
+            spans.push(Span::raw(format!(
+                "{} entries   / search   f follow   {pause_hint}   v view   Enter details",
+                app.log_count()
+            )));
+        } else if area.width >= 55 {
             spans.push(Span::raw(format!(
                 "{} entries   / search   f follow   {pause_hint}   Enter details",
                 app.log_count()

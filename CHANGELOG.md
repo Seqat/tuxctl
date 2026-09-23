@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-23
+
+Tracking and interaction: pin processes, filter views, change the sampling
+interval while running, and see disk I/O and RAM/network trends. Also fixes
+a terminal escape injection from system data shown by `tuxctl`.
+
+### Added
+
+- `+` and `-` change the sampling interval while `tuxctl` runs, through the
+  same presets as `--interval` (`250ms` to `60s`). The current interval is
+  shown as `⟳ 1s [-] [+]` in the top-right corner, and the buttons can be
+  clicked. Running collectors switch without a restart; rates stay correct because they are computed from the actual time
+  between samples.
+- Overview storage rows show each disk's read and write throughput next to
+  the device, from one read of `/proc/diskstats` per sample. Partitions, loop, zram, device-mapper
+  and md devices are not listed; their I/O shows up on the physical disks.
+- Process pinning: `P` pins the selected process to the top of the Processes
+  list (up to 8), `Shift+↑`/`Shift+↓` (or `Alt`) or the `▲`/`▼` controls
+  on a pinned row reorder pinned processes.
+  Sorting applies below the pinned rows; during a search, non-matching pinned
+  rows stay visible but dimmed. Pins follow the process identity
+  `(PID, start time)`, so a reused PID never inherits one. A pinned process
+  that exits is shown as `exited` for 5 seconds, cannot be signaled, and is
+  then removed. The Overview System panel lists pinned processes with their
+  CPU and memory.
+- Overview shows RAM usage and network traffic trends next to the existing CPU
+  history: sparklines of the last 60 samples, the network one scaled to its
+  peak and counting only the interfaces the Overview lists. Like the CPU
+  history, they start over when the interval changes.
+- View filters on `v`: Processes hide kernel threads; Services show all
+  units, loaded units (hiding `not-found`), or failed units; Logs show a
+  minimum priority of notice, warning, or error. They combine with the search,
+  stay visible in the status line, and `Esc` clears the search first, then
+  the view.
+- A main menu on `Esc`, opened when there is no dialog, search, or view filter
+  to clear. It has an About page (version, license, source, minimum Rust
+  version) and Exit, and works with the keyboard and the mouse.
+
+### Changed
+
+- `Esc` with nothing to close or clear opens the main menu instead of doing
+  nothing. The menu starts on About, so an extra `Enter` does not quit.
+- The Overview CPU history starts over when the interval changes, so its time
+  span stays accurate.
+- The Help overlay lists every binding and is sized to its content.
+
+### Fixed
+
+- While typing a search on Processes, Services, or Logs, `↑`/`↓` and
+  `PageUp`/`PageDown` now move through the matches. Previously they were
+  ignored, so `Enter` opened whichever row happened to stay selected.
+- Processes whose name is not valid UTF-8 are listed and can be signaled.
+  Previously any user could hide a process from `tuxctl` by giving it such a
+  name.
+
+### Security
+
+- Control characters and bidirectional overrides in process names, command
+  lines, journal messages, unit descriptions, interface names, and other
+  system data are no longer sent to the terminal. Another local user could
+  otherwise embed escape sequences, for example to overwrite the clipboard
+  of whoever views the Processes or Logs screen (OSC 52) or to reset the
+  terminal. Affected cells now show `�`.
+
+### Internal
+
+- Collectors take their sampling period from the shared control primitive,
+  so it can change while they run.
+- `measure.py --check` derives the idle redraw limit from `--interval`; CI
+  and the performance workflow also measure at `250ms`. `smoke.py` covers the
+  main menu and the interval keys.
+
 ## [0.2.7] - 2026-09-23
 
 Performance, documentation, and release hardening before v0.3.0. No new keys
@@ -167,7 +239,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
 [0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5
 [0.2.2]: https://github.com/Seqat/tuxctl/compare/v0.2.1...v0.2.2

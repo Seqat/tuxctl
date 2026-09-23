@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 
 use crate::{
-    action::{Action, InputMode, MouseTarget, ProcessSortField, Tab},
+    action::{Action, InputMode, IntervalStep, MouseTarget, PinMove, ProcessSortField, Tab},
     ui::UiRegions,
 };
 
@@ -82,7 +82,7 @@ fn translate_event(
                 .target_at(mouse.column, mouse.row)
                 .map(action_for_mouse_target),
             MouseEventKind::Moved => {
-                let target = regions.target_at(mouse.column, mouse.row);
+                let target = regions.hover_target_at(mouse.column, mouse.row);
                 (target.as_ref() != hovered).then_some(Action::HoverMouseTarget(target))
             }
             MouseEventKind::ScrollUp if regions.process_scroll_at(mouse.column, mouse.row) => {
@@ -121,8 +121,11 @@ fn action_for_mouse_target(target: MouseTarget) -> Action {
         MouseTarget::Tab(tab) => Action::SelectTab(tab),
         MouseTarget::ProcessRow(identity) => Action::SelectProcess(identity),
         MouseTarget::ProcessSortHeader(field) => Action::SortProcesses(field),
+        MouseTarget::PinMove(identity, direction) => Action::MovePin(identity, direction),
         MouseTarget::ProcessSignalCancel => Action::CancelProcessSignal,
         MouseTarget::ProcessSignalConfirm => Action::ConfirmProcessSignal,
+        MouseTarget::MenuItem(item) => Action::ActivateMenuItem(item),
+        MouseTarget::IntervalStep(step) => Action::StepSamplingInterval(step),
         MouseTarget::ServiceRow(unit) => Action::SelectService(unit),
         MouseTarget::LogRow(id) => Action::SelectLog(id),
         MouseTarget::NetworkRow(name) => Action::SelectNetwork(name),
@@ -145,6 +148,11 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenProcessDetails),
             KeyCode::Backspace => Some(Action::BackspaceProcessSearch),
+            // Arrows move through the matches; letters (including j/k) stay query text.
+            KeyCode::Up => Some(Action::ProcessPrevious),
+            KeyCode::Down => Some(Action::ProcessNext),
+            KeyCode::PageUp => Some(Action::ProcessPreviousPage),
+            KeyCode::PageDown => Some(Action::ProcessNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -161,6 +169,10 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenServiceDetails),
             KeyCode::Backspace => Some(Action::BackspaceServiceSearch),
+            KeyCode::Up => Some(Action::ServicePrevious),
+            KeyCode::Down => Some(Action::ServiceNext),
+            KeyCode::PageUp => Some(Action::ServicePreviousPage),
+            KeyCode::PageDown => Some(Action::ServiceNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -177,6 +189,10 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenLogDetails),
             KeyCode::Backspace => Some(Action::BackspaceLogSearch),
+            KeyCode::Up => Some(Action::LogPrevious),
+            KeyCode::Down => Some(Action::LogNext),
+            KeyCode::PageUp => Some(Action::LogPreviousPage),
+            KeyCode::PageDown => Some(Action::LogNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -204,9 +220,21 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         };
     }
 
+    if input_mode == InputMode::Menu {
+        return match key.code {
+            KeyCode::Char('q') => Some(Action::Quit),
+            KeyCode::Esc => Some(Action::Escape),
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::MenuPrevious),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::MenuNext),
+            KeyCode::Enter => Some(Action::ActivateSelectedMenuItem),
+            _ => None,
+        };
+    }
+
     if matches!(
         input_mode,
         InputMode::Help
+            | InputMode::About
             | InputMode::ProcessDetail
             | InputMode::ServiceDetail
             | InputMode::LogDetail
@@ -239,6 +267,8 @@ fn global_tab_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
         KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
         KeyCode::Char('?') => Some(Action::ShowHelp),
+        KeyCode::Char('+') => Some(Action::StepSamplingInterval(IntervalStep::Longer)),
+        KeyCode::Char('-') => Some(Action::StepSamplingInterval(IntervalStep::Shorter)),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::BackTab => Some(Action::PreviousTab),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::PreviousTab),
@@ -260,6 +290,25 @@ fn process_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(
             Action::RequestProcessSignal(crate::linux::ProcessSignal::Kill),
         ),
+        // Shifted forms come before `p` (sort) and plain arrows (navigation).
+        KeyCode::Char('P') => Some(Action::TogglePin),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(Action::TogglePin)
+        }
+        KeyCode::Up
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            Some(Action::MoveSelectedPin(PinMove::Up))
+        }
+        KeyCode::Down
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            Some(Action::MoveSelectedPin(PinMove::Down))
+        }
         KeyCode::Up | KeyCode::Char('k') => Some(Action::ProcessPrevious),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ProcessNext),
         KeyCode::PageUp => Some(Action::ProcessPreviousPage),
@@ -272,6 +321,7 @@ fn process_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('m') => Some(Action::SortProcesses(ProcessSortField::Memory)),
         KeyCode::Char('p') => Some(Action::SortProcesses(ProcessSortField::Pid)),
         KeyCode::Char('n') => Some(Action::SortProcesses(ProcessSortField::Name)),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -287,6 +337,7 @@ fn service_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::BeginServiceSearch),
         KeyCode::Enter => Some(Action::OpenServiceDetails),
         KeyCode::Char('r') => Some(Action::RefreshServices),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -303,6 +354,7 @@ fn log_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Some(Action::OpenLogDetails),
         KeyCode::Char('f') => Some(Action::ToggleLogFollow),
         KeyCode::Char(' ') => Some(Action::ToggleLogPause),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -371,6 +423,7 @@ mod tests {
         ] {
             keys.push(KeyEvent::new(code, KeyModifiers::NONE));
             keys.push(KeyEvent::new(code, KeyModifiers::SHIFT));
+            keys.push(KeyEvent::new(code, KeyModifiers::ALT));
         }
         keys
     }
@@ -433,6 +486,11 @@ mod tests {
             "Space" => plain(KeyCode::Char(' ')),
             "Ctrl+C" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             "Shift+K" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT),
+            "Shift+P" => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT),
+            "Shift+↑" => KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            "Shift+↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            "Alt+↑" => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+            "Alt+↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
             single if single.chars().count() == 1 => {
                 plain(KeyCode::Char(single.chars().next().unwrap()))
             }
@@ -457,6 +515,7 @@ mod tests {
                         "Global Controls" | "Navigation & Common Actions" => &TAB_MODES,
                         "Processes" => &[InputMode::Normal],
                         "Signal Confirmation" => &[InputMode::ProcessSignalConfirm],
+                        "Main Menu" => &[InputMode::Menu],
                         "Services" => &[InputMode::Services],
                         "Logs" => &[InputMode::Logs],
                         other => panic!("unknown README controls section {other:?}"),
@@ -520,6 +579,32 @@ mod tests {
             translate_event(event, &regions, None),
             Some(Action::SelectTab(Tab::Services))
         );
+    }
+
+    #[test]
+    fn interval_button_clicks_step_the_interval() {
+        let regions = UiRegions::default().with_interval_buttons([
+            (IntervalStep::Shorter, Rect::new(100, 0, 3, 1)),
+            (IntervalStep::Longer, Rect::new(104, 0, 3, 1)),
+        ]);
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert_eq!(
+            translate_event(click(101), &regions, None),
+            Some(Action::StepSamplingInterval(IntervalStep::Shorter))
+        );
+        assert_eq!(
+            translate_event(click(106), &regions, None),
+            Some(Action::StepSamplingInterval(IntervalStep::Longer))
+        );
+        assert_eq!(translate_event(click(103), &regions, None), None);
     }
 
     #[test]
@@ -619,6 +704,55 @@ mod tests {
             translate_event(scroll, &regions, None),
             Some(Action::LogPrevious)
         );
+    }
+
+    #[test]
+    fn pin_control_clicks_move_the_pin_and_their_hover_is_the_row() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_time: 9001,
+        };
+        let regions =
+            UiRegions::from_process_rows([(identity, Rect::new(0, 5, 80, 1))], InputMode::Normal)
+                .with_pin_controls(Rect::new(76, 5, 2, 1), Rect::new(78, 5, 2, 1));
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let click = MouseEventKind::Down(MouseButton::Left);
+
+        assert_eq!(
+            translate_event(mouse(click, 77), &regions, None),
+            Some(Action::MovePin(identity, PinMove::Up))
+        );
+        assert_eq!(
+            translate_event(mouse(click, 78), &regions, None),
+            Some(Action::MovePin(identity, PinMove::Down))
+        );
+        assert_eq!(
+            translate_event(mouse(click, 75), &regions, None),
+            Some(Action::SelectProcess(identity))
+        );
+
+        // Row → ▲ → ▼ → row: one hover transition, then nothing.
+        let mut hovered = None;
+        let mut dispatched = 0;
+        for column in [10, 76, 77, 78, 79, 20] {
+            if let Some(Action::HoverMouseTarget(target)) = translate_event(
+                mouse(MouseEventKind::Moved, column),
+                &regions,
+                hovered.as_ref(),
+            ) {
+                hovered = target;
+                dispatched += 1;
+            }
+        }
+        assert_eq!(dispatched, 1);
+        assert_eq!(hovered, Some(MouseTarget::ProcessRow(identity)));
     }
 
     #[test]
@@ -725,6 +859,116 @@ mod tests {
         );
     }
 
+    const SEARCH_MODES: [(InputMode, [Action; 4]); 3] = [
+        (
+            InputMode::ProcessSearch,
+            [
+                Action::ProcessPrevious,
+                Action::ProcessNext,
+                Action::ProcessPreviousPage,
+                Action::ProcessNextPage,
+            ],
+        ),
+        (
+            InputMode::ServiceSearch,
+            [
+                Action::ServicePrevious,
+                Action::ServiceNext,
+                Action::ServicePreviousPage,
+                Action::ServiceNextPage,
+            ],
+        ),
+        (
+            InputMode::LogSearch,
+            [
+                Action::LogPrevious,
+                Action::LogNext,
+                Action::LogPreviousPage,
+                Action::LogNextPage,
+            ],
+        ),
+    ];
+
+    #[test]
+    fn search_modes_map_arrow_and_page_keys_to_navigation() {
+        for (mode, actions) in SEARCH_MODES {
+            let keys = [
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+            ];
+            for (code, action) in keys.into_iter().zip(actions) {
+                for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                    assert_eq!(
+                        translate_key_event(KeyEvent::new(code, modifiers), mode),
+                        Some(action.clone()),
+                        "{code:?} {modifiers:?} in {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_modes_keep_letters_as_query_text() {
+        for (mode, _) in SEARCH_MODES {
+            for character in ['j', 'k', 'J', 'K', 'q', '/', ' '] {
+                let action = translate_key_event(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    mode,
+                );
+                let expected = match mode {
+                    InputMode::ProcessSearch => Action::AppendProcessSearch(character),
+                    InputMode::ServiceSearch => Action::AppendServiceSearch(character),
+                    _ => Action::AppendLogSearch(character),
+                };
+                assert_eq!(action, Some(expected), "{character:?} in {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_modes_leave_home_and_end_unmapped() {
+        for (mode, _) in SEARCH_MODES {
+            for code in [KeyCode::Home, KeyCode::End] {
+                assert_eq!(
+                    translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), mode),
+                    None,
+                    "{code:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plus_and_minus_step_the_interval_on_tabs_and_are_text_in_search() {
+        let plus = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT);
+        let minus = KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE);
+        for mode in TAB_MODES {
+            assert_eq!(
+                translate_key_event(plus, mode),
+                Some(Action::StepSamplingInterval(IntervalStep::Longer))
+            );
+            assert_eq!(
+                translate_key_event(minus, mode),
+                Some(Action::StepSamplingInterval(IntervalStep::Shorter))
+            );
+        }
+        assert_eq!(
+            translate_key_event(minus, InputMode::ProcessSearch),
+            Some(Action::AppendProcessSearch('-'))
+        );
+        for mode in [
+            InputMode::Help,
+            InputMode::ProcessDetail,
+            InputMode::ProcessSignalConfirm,
+            InputMode::LogDetail,
+        ] {
+            assert_eq!(translate_key_event(plus, mode), None, "{mode:?}");
+        }
+    }
+
     #[test]
     fn service_keys_map_to_service_actions() {
         assert_eq!(
@@ -797,6 +1041,79 @@ mod tests {
                 Some(Action::SortProcesses(field))
             );
         }
+    }
+
+    #[test]
+    fn pin_keys_do_not_shadow_sorting_or_navigation() {
+        let key = |code, modifiers| {
+            translate_key_event(KeyEvent::new(code, modifiers), InputMode::Normal)
+        };
+
+        assert_eq!(
+            key(KeyCode::Char('P'), KeyModifiers::NONE),
+            Some(Action::TogglePin)
+        );
+        assert_eq!(
+            key(KeyCode::Char('P'), KeyModifiers::SHIFT),
+            Some(Action::TogglePin)
+        );
+        // Kitty keyboard protocol reports Shift+p as a lowercase key with SHIFT.
+        assert_eq!(
+            key(KeyCode::Char('p'), KeyModifiers::SHIFT),
+            Some(Action::TogglePin)
+        );
+        assert_eq!(
+            key(KeyCode::Char('p'), KeyModifiers::NONE),
+            Some(Action::SortProcesses(ProcessSortField::Pid))
+        );
+
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert_eq!(
+                key(KeyCode::Up, modifiers),
+                Some(Action::MoveSelectedPin(PinMove::Up))
+            );
+            assert_eq!(
+                key(KeyCode::Down, modifiers),
+                Some(Action::MoveSelectedPin(PinMove::Down))
+            );
+        }
+        assert_eq!(
+            key(KeyCode::Up, KeyModifiers::NONE),
+            Some(Action::ProcessPrevious)
+        );
+        assert_eq!(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            Some(Action::ProcessNext)
+        );
+
+        // While typing a search, P is query text and Shift+arrows navigate.
+        assert_eq!(
+            translate_key_event(
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                InputMode::ProcessSearch
+            ),
+            Some(Action::AppendProcessSearch('P'))
+        );
+        assert_eq!(
+            translate_key_event(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+                InputMode::ProcessSearch
+            ),
+            Some(Action::ProcessPrevious)
+        );
+    }
+
+    #[test]
+    fn v_cycles_the_view_on_filterable_screens_and_is_text_in_search() {
+        let v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        for mode in [InputMode::Normal, InputMode::Services, InputMode::Logs] {
+            assert_eq!(translate_key_event(v, mode), Some(Action::CycleViewFilter));
+        }
+        assert_eq!(translate_key_event(v, InputMode::Network), None);
+        assert_eq!(
+            translate_key_event(v, InputMode::LogSearch),
+            Some(Action::AppendLogSearch('v'))
+        );
     }
 
     #[test]
@@ -997,6 +1314,8 @@ mod tests {
             InputMode::LogSearch,
             InputMode::LogDetail,
             InputMode::NetworkDetail,
+            InputMode::Menu,
+            InputMode::About,
         ];
 
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1016,6 +1335,25 @@ mod tests {
                 "Ctrl+C failed in mode {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn menu_keys_navigate_select_and_quit() {
+        let key =
+            |code| translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), InputMode::Menu);
+        assert_eq!(key(KeyCode::Up), Some(Action::MenuPrevious));
+        assert_eq!(key(KeyCode::Char('k')), Some(Action::MenuPrevious));
+        assert_eq!(key(KeyCode::Down), Some(Action::MenuNext));
+        assert_eq!(key(KeyCode::Char('j')), Some(Action::MenuNext));
+        assert_eq!(key(KeyCode::Enter), Some(Action::ActivateSelectedMenuItem));
+        assert_eq!(key(KeyCode::Esc), Some(Action::Escape));
+        assert_eq!(key(KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(key(KeyCode::Char('2')), None, "tabs are blocked");
+
+        let about =
+            |code| translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), InputMode::About);
+        assert_eq!(about(KeyCode::Esc), Some(Action::Escape));
+        assert_eq!(about(KeyCode::Enter), None);
     }
 
     #[test]

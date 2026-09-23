@@ -13,6 +13,13 @@ pub enum Action {
     PreviousTab,
     ShowHelp,
     Escape,
+    MenuPrevious,
+    MenuNext,
+    /// Enter on the main menu.
+    ActivateSelectedMenuItem,
+    /// A click on a main menu item.
+    ActivateMenuItem(MenuItem),
+    StepSamplingInterval(IntervalStep),
     SystemMetricsUpdated(SystemMetrics),
     HardwareDiscovered(HardwareInventory),
     ProcessesUpdated(ProcessSnapshot),
@@ -34,6 +41,13 @@ pub enum Action {
     FocusProcessSignal(SignalConfirmButton),
     ExecuteFocusedProcessSignal,
     SortProcesses(ProcessSortField),
+    /// Pin or unpin the selected process.
+    TogglePin,
+    /// Cycle the active screen's view filter (`v`).
+    CycleViewFilter,
+    MoveSelectedPin(PinMove),
+    /// Move a specific pinned process (its ▲/▼ control was clicked).
+    MovePin(ProcessIdentity, PinMove),
     ServicesUpdated(ServiceSnapshot),
     ServicePrevious,
     ServiceNext,
@@ -71,10 +85,22 @@ pub enum Action {
     SelectNetwork(Arc<str>),
     OpenNetworkDetails,
     HoverMouseTarget(Option<MouseTarget>),
-    ProcessViewportChanged { start: usize, height: usize },
-    ServiceViewportChanged { start: usize, height: usize },
-    LogViewportChanged { start: usize, height: usize },
-    NetworkViewportChanged { start: usize, height: usize },
+    ProcessViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    ServiceViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    LogViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    NetworkViewportChanged {
+        start: usize,
+        height: usize,
+    },
     Resize,
     Tick(Instant),
 }
@@ -84,11 +110,48 @@ pub enum MouseTarget {
     Tab(Tab),
     ProcessRow(ProcessIdentity),
     ProcessSortHeader(ProcessSortField),
+    /// The ▲/▼ control of a pinned row. Hovering it counts as hovering the row.
+    PinMove(ProcessIdentity, PinMove),
     ProcessSignalCancel,
     ProcessSignalConfirm,
+    MenuItem(MenuItem),
+    /// The `[-]`/`[+]` buttons next to the sampling interval.
+    IntervalStep(IntervalStep),
     ServiceRow(Arc<str>),
     LogRow(u64),
     NetworkRow(Arc<str>),
+}
+
+/// Entries of the main menu opened by `Esc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    About,
+    Exit,
+}
+
+impl MenuItem {
+    pub const ALL: [Self; 2] = [Self::About, Self::Exit];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::About => "About",
+            Self::Exit => "Exit",
+        }
+    }
+}
+
+/// Direction in which a pinned process moves within the pinned section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMove {
+    Up,
+    Down,
+}
+
+/// Direction of a `+`/`-` step through the sampling presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalStep {
+    Longer,
+    Shorter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -157,6 +220,8 @@ pub enum InputMode {
     Network,
     NetworkDetail,
     Help,
+    Menu,
+    About,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

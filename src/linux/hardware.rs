@@ -424,13 +424,27 @@ fn storage_kind(name: &str, vendor: Option<&str>, canonical: Option<&Path>) -> O
     if is_letters_after(name, "vd") || is_letters_after(name, "xvd") {
         return Some(StorageKind::Virtio);
     }
-    if name
-        .strip_prefix("mmcblk")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
-    {
+    if is_mmc_disk(name) {
         return Some(StorageKind::Mmc);
     }
     None
+}
+
+/// Whole-disk block device names shown as storage (NVMe namespaces, SATA/SCSI,
+/// virtio/Xen and MMC disks). Partitions, loop, ram, zram, device-mapper, md
+/// and optical devices are not. The disk I/O sampler uses the same rule, so
+/// its rates line up with the storage inventory.
+pub(super) fn is_whole_disk(name: &str) -> bool {
+    is_nvme_disk(name)
+        || is_letters_after(name, "sd")
+        || is_letters_after(name, "vd")
+        || is_letters_after(name, "xvd")
+        || is_mmc_disk(name)
+}
+
+fn is_mmc_disk(name: &str) -> bool {
+    name.strip_prefix("mmcblk")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn is_nvme_disk(name: &str) -> bool {
@@ -632,6 +646,35 @@ mod tests {
 
         assert_eq!(information.model.as_deref(), Some("NVIDIA GeForce Example"));
         assert_eq!(information.vram_bytes, Some(16 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn whole_disk_names_match_the_storage_classification() {
+        for name in [
+            "nvme0n1", "nvme12n3", "sda", "sdab", "vda", "xvdb", "mmcblk0",
+        ] {
+            assert!(is_whole_disk(name), "{name}");
+            assert!(storage_kind(name, None, None).is_some(), "{name}");
+        }
+        for name in [
+            "nvme0n1p1",
+            "nvme0",
+            "sda1",
+            "sr0",
+            "loop0",
+            "ram0",
+            "zram0",
+            "dm-0",
+            "md127",
+            "mmcblk0p1",
+            "mmcblk0boot0",
+            "nbd0",
+            "",
+            "sd",
+        ] {
+            assert!(!is_whole_disk(name), "{name}");
+            assert!(storage_kind(name, None, None).is_none(), "{name}");
+        }
     }
 
     #[test]

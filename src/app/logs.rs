@@ -1,6 +1,38 @@
-//! Logs screen: journal batches, search, follow/pause and selection.
+//! Logs screen: journal batches, search, priority view, follow/pause and selection.
 
 use super::*;
+
+/// Minimum journal priority shown, cycled with `v`. Entries without a
+/// priority are only shown under `All`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LogView {
+    All,
+    Notice,
+    Warning,
+    Error,
+}
+
+impl LogView {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Notice,
+            Self::Notice => Self::Warning,
+            Self::Warning => Self::Error,
+            Self::Error => Self::All,
+        }
+    }
+
+    /// Syslog priorities run from 0 (emerg) to 7 (debug); lower is more severe.
+    fn allows(self, entry: &JournalEntry) -> bool {
+        let threshold = match self {
+            Self::All => return true,
+            Self::Notice => 5,
+            Self::Warning => 4,
+            Self::Error => 3,
+        };
+        entry.priority.is_some_and(|priority| priority <= threshold)
+    }
+}
 
 impl App {
     pub fn log_count(&self) -> usize {
@@ -53,6 +85,22 @@ impl App {
 
     pub fn log_dropped(&self) -> usize {
         self.log_dropped
+    }
+
+    /// Status text of an active priority filter.
+    pub fn log_view_label(&self) -> Option<&'static str> {
+        match self.log_view {
+            LogView::All => None,
+            LogView::Notice => Some("notice+"),
+            LogView::Warning => Some("warning+"),
+            LogView::Error => Some("error+"),
+        }
+    }
+
+    pub(super) fn cycle_log_view(&mut self) -> bool {
+        self.log_view = self.log_view.next();
+        self.rebuild_log_filter();
+        true
     }
 
     pub fn log_error(&self) -> Option<&str> {
@@ -130,11 +178,12 @@ impl App {
 
     fn rebuild_log_indices(&mut self) {
         let query = self.log_search_query.to_lowercase();
+        let view = self.log_view;
         self.filtered_logs = self
             .logs
             .iter()
             .enumerate()
-            .filter(|(_, entry)| log_matches(entry, &query))
+            .filter(|(_, entry)| view.allows(entry) && log_matches(entry, &query))
             .map(|(index, _)| index)
             .collect();
     }
@@ -277,6 +326,43 @@ fn log_matches(entry: &JournalEntry, query: &str) -> bool {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    #[test]
+    fn the_priority_view_raises_the_minimum_severity_step_by_step() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Logs));
+        let mut unknown = log_entry(9, "app", 6, "no priority");
+        unknown.priority = None;
+        app.update(Action::LogsUpdated(log_batch(vec![
+            log_entry(1, "kernel", 7, "debug"),
+            log_entry(2, "kernel", 6, "info"),
+            log_entry(3, "kernel", 5, "notice"),
+            log_entry(4, "kernel", 4, "warning"),
+            log_entry(5, "kernel", 3, "error"),
+            log_entry(6, "kernel", 0, "emerg"),
+            unknown,
+        ])));
+        assert_eq!(visible_log_ids(&app).len(), 7);
+
+        for (label, ids) in [
+            ("notice+", vec![3, 4, 5, 6]),
+            ("warning+", vec![4, 5, 6]),
+            ("error+", vec![5, 6]),
+        ] {
+            app.update(Action::CycleViewFilter);
+            assert_eq!(app.log_view_label(), Some(label));
+            assert_eq!(visible_log_ids(&app), ids, "{label}");
+        }
+        assert_eq!(
+            app.selected_log().map(|entry| entry.id),
+            Some(6),
+            "follow keeps the newest"
+        );
+
+        app.update(Action::CycleViewFilter);
+        assert_eq!(app.log_view_label(), None);
+        assert_eq!(visible_log_ids(&app).len(), 7);
+    }
 
     #[test]
     fn logs_follow_latest_entry_until_manual_navigation() {

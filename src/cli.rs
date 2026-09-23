@@ -2,21 +2,11 @@
 
 use std::time::Duration;
 
-use crate::about;
+use crate::{
+    about,
+    app::{DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS},
+};
 
-/// Accepted `--interval` values. Shorter intervals are out of scope: the main
-/// loop picks up snapshots on a 250 ms tick and /proc sampling gets noisy.
-pub const SAMPLING_PRESETS: [(&str, Duration); 8] = [
-    ("250ms", Duration::from_millis(250)),
-    ("500ms", Duration::from_millis(500)),
-    ("1s", Duration::from_secs(1)),
-    ("2s", Duration::from_secs(2)),
-    ("5s", Duration::from_secs(5)),
-    ("10s", Duration::from_secs(10)),
-    ("30s", Duration::from_secs(30)),
-    ("60s", Duration::from_secs(60)),
-];
-pub const DEFAULT_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
 pub const USAGE: &str = "Usage: tuxctl [--interval <DURATION>]  (see --help)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +74,7 @@ Options:
       --interval <DURATION>  Sampling interval for CPU, memory and network (default: 1s)
                              One of: {presets}
                              Processes refresh at most once per second, services every 5s.
+                             Press + / - inside {name} to change it while running.
   -h, --help                 Print help
   -V, --version              Print version
 

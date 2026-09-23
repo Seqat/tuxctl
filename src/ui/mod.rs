@@ -3,9 +3,11 @@ mod hardware_cpu;
 mod hardware_network_summary;
 mod layout;
 mod logs;
+mod menu;
 mod network;
 mod overview;
 mod processes;
+mod sanitize;
 mod services;
 mod status;
 
@@ -14,13 +16,13 @@ use std::sync::Arc;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::{
-    action::{InputMode, MouseTarget, ProcessSortField, Tab},
+    action::{InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
     linux::ByteUsage,
 };
@@ -43,6 +45,8 @@ pub struct UiRegions {
     network_viewport: Option<(usize, usize)>,
     process_signal_cancel: Option<Rect>,
     process_signal_confirm: Option<Rect>,
+    menu_items: Vec<(MenuItem, Rect)>,
+    interval_buttons: Vec<(IntervalStep, Rect)>,
     input_mode: InputMode,
 }
 
@@ -56,6 +60,9 @@ struct TabRegion {
 struct ProcessRowRegion {
     identity: crate::linux::ProcessIdentity,
     area: Rect,
+    /// ▲/▼ controls inside `area`, only on pinned rows that can move that way.
+    pin_up: Option<Rect>,
+    pin_down: Option<Rect>,
 }
 
 #[derive(Debug)]
@@ -103,6 +110,7 @@ impl UiRegions {
 
     fn suppress_background_interaction(&mut self) {
         self.tabs.clear();
+        self.interval_buttons.clear();
         self.process_rows.clear();
         self.process_headers.clear();
         self.process_scroll_area = None;
@@ -115,6 +123,13 @@ impl UiRegions {
     }
 
     pub fn target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        if let Some((item, _)) = self
+            .menu_items
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+        {
+            return Some(MouseTarget::MenuItem(*item));
+        }
         if self
             .process_signal_cancel
             .is_some_and(|area| contains(area, column, row))
@@ -133,10 +148,31 @@ impl UiRegions {
             .find(|region| contains(region.area, column, row))
             .map(|region| MouseTarget::Tab(region.tab))
             .or_else(|| {
+                self.interval_buttons
+                    .iter()
+                    .find(|(_, area)| contains(*area, column, row))
+                    .map(|(step, _)| MouseTarget::IntervalStep(*step))
+            })
+            .or_else(|| {
                 self.process_headers
                     .iter()
                     .find(|region| contains(region.area, column, row))
                     .map(|region| MouseTarget::ProcessSortHeader(region.field))
+            })
+            .or_else(|| {
+                // Pin controls sit inside their row, so they are checked first.
+                self.process_rows.iter().find_map(|region| {
+                    let hit = |control: Option<Rect>| {
+                        control.is_some_and(|area| contains(area, column, row))
+                    };
+                    if hit(region.pin_up) {
+                        Some(MouseTarget::PinMove(region.identity, PinMove::Up))
+                    } else if hit(region.pin_down) {
+                        Some(MouseTarget::PinMove(region.identity, PinMove::Down))
+                    } else {
+                        None
+                    }
+                })
             })
             .or_else(|| {
                 self.process_rows
@@ -162,6 +198,15 @@ impl UiRegions {
                     .find(|region| contains(region.area, column, row))
                     .map(|region| MouseTarget::NetworkRow(region.name.clone()))
             })
+    }
+
+    /// Like [`Self::target_at`], but a pin control reports its row: moving
+    /// between a row and its controls is not a hover change and redraws nothing.
+    pub fn hover_target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        match self.target_at(column, row) {
+            Some(MouseTarget::PinMove(identity, _)) => Some(MouseTarget::ProcessRow(identity)),
+            other => other,
+        }
     }
 
     pub fn process_viewport(&self) -> Option<(usize, usize)> {
@@ -221,7 +266,12 @@ impl UiRegions {
     ) -> Self {
         let process_rows: Vec<_> = rows
             .into_iter()
-            .map(|(identity, area)| ProcessRowRegion { identity, area })
+            .map(|(identity, area)| ProcessRowRegion {
+                identity,
+                area,
+                pin_up: None,
+                pin_down: None,
+            })
             .collect();
         let process_scroll_area = process_rows.first().map(|region| region.area);
 
@@ -232,6 +282,25 @@ impl UiRegions {
             input_mode,
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_interval_buttons(
+        mut self,
+        buttons: impl IntoIterator<Item = (IntervalStep, Rect)>,
+    ) -> Self {
+        self.interval_buttons = buttons.into_iter().collect();
+        self
+    }
+
+    /// Adds ▲/▼ controls to the first process row.
+    #[cfg(test)]
+    pub(crate) fn with_pin_controls(mut self, up: Rect, down: Rect) -> Self {
+        if let Some(row) = self.process_rows.first_mut() {
+            row.pin_up = Some(up);
+            row.pin_down = Some(down);
+        }
+        self
     }
 
     #[cfg(test)]
@@ -324,7 +393,16 @@ impl UiRegions {
     }
 }
 
+/// Renders one frame from cached state and returns its mouse hit regions.
 pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
+    let regions = render_frame(frame, app);
+    // Untrusted text (process names, journal messages, …) is rendered as-is
+    // above; strip control characters before the frame reaches the terminal.
+    sanitize::sanitize_buffer(frame.buffer_mut());
+    regions
+}
+
+fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     let area = frame.area();
     frame.render_widget(Clear, area);
     if area.width == 0 || area.height == 0 {
@@ -335,16 +413,10 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         return UiRegions::default();
     }
 
-    let mut outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
-    if let Some(marker) = stale_marker(app, area.width) {
-        outer = outer.title_top(
-            Line::from(marker)
-                .right_aligned()
-                .style(Style::default().fg(Color::Yellow)),
-        );
-    }
+    let outer = Block::default().borders(Borders::ALL).title(TITLE);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    let interval_buttons = render_top_right(frame, app, area);
 
     let screen = layout::screen(inner);
     let tab_areas = layout::tab_areas(screen.tabs);
@@ -359,14 +431,11 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     let content_render = render_content(frame, app, screen.content);
 
     let mut regions = UiRegions::from_tabs(tab_areas);
+    regions.interval_buttons = interval_buttons;
     regions.input_mode = app.input_mode();
     match content_render {
         ContentRender::Processes(process_render) => {
-            regions.process_rows = process_render
-                .rows
-                .into_iter()
-                .map(|(identity, area)| ProcessRowRegion { identity, area })
-                .collect();
+            regions.process_rows = process_render.rows;
             regions.process_headers = process_render
                 .headers
                 .into_iter()
@@ -428,6 +497,15 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
         regions.process_signal_cancel = Some(cancel_rect);
         regions.process_signal_confirm = Some(confirm_rect);
     }
+    if let Some(selected) = app.menu_selection() {
+        let items = menu::render_menu(frame, selected, app.hovered(), area);
+        regions.suppress_background_interaction();
+        regions.menu_items = items;
+    }
+    if app.about_visible() {
+        menu::render_about(frame, area);
+        regions.suppress_background_interaction();
+    }
     if app.help_visible() {
         render_help(frame, area);
         regions.suppress_background_interaction();
@@ -438,20 +516,82 @@ pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
     regions
 }
 
-/// Names the collectors behind this screen whose data stopped updating, falling
-/// back to a bare marker when the names would crowd the title.
-fn stale_marker(app: &App, width: u16) -> Option<String> {
+const TITLE: &str = " tuxctl ";
+/// The `[-]` and `[+]` buttons after the interval, each followed by a space.
+const INTERVAL_BUTTONS: [(IntervalStep, &str); 2] = [
+    (IntervalStep::Shorter, "[-]"),
+    (IntervalStep::Longer, "[+]"),
+];
+
+/// Draws the right end of the top border: the stale marker (collectors behind
+/// this screen that stopped updating), the sampling interval and its `[-]`/`[+]`
+/// buttons. Space is given up in that order: stale names become a bare marker,
+/// then the buttons go. Returns the drawn buttons for hit testing.
+fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalStep, Rect)> {
+    // Keep both corners and a gap after the title free.
+    let room = usize::from(area.width).saturating_sub(TITLE.len() + 3);
     let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
-    if names.is_empty() {
-        return None;
-    }
-    let detailed = format!(" stale: {} ", names.join(", "));
-    let room = usize::from(width).saturating_sub(" tuxctl ".len() + 4);
-    Some(if detailed.chars().count() <= room {
-        detailed
+    let stale_options = if names.is_empty() {
+        vec![None]
     } else {
-        " stale ".to_owned()
-    })
+        vec![
+            Some(format!(" stale: {} ", names.join(", "))),
+            Some(" stale ".to_owned()),
+        ]
+    };
+    let interval = format!(" ⟳ {} ", app.sampling_interval_label());
+    let buttons_width = INTERVAL_BUTTONS
+        .iter()
+        .map(|(_, label)| label.len() + 1)
+        .sum::<usize>();
+    let width_of = |stale: &Option<String>, buttons: bool| {
+        stale.as_deref().map_or(0, |stale| stale.chars().count())
+            + interval.chars().count()
+            + if buttons { buttons_width } else { 0 }
+    };
+    let Some((stale, buttons)) = [true, false]
+        .into_iter()
+        .flat_map(|buttons| stale_options.iter().map(move |stale| (stale, buttons)))
+        .find(|(stale, buttons)| width_of(stale, *buttons) <= room)
+    else {
+        return Vec::new();
+    };
+
+    let width = width_of(stale, buttons) as u16;
+    let mut x = area.right().saturating_sub(1 + width);
+    let mut spans = Vec::with_capacity(4);
+    if let Some(stale) = stale {
+        spans.push(Span::styled(
+            stale.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled(
+        interval.clone(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let corner = Rect::new(x, area.y, width, 1);
+    // Blank the border under the whole corner, including the gaps between buttons.
+    frame.render_widget(Clear, corner);
+    frame.render_widget(Paragraph::new(Line::from(spans)), corner);
+    if !buttons {
+        return Vec::new();
+    }
+    x = x.saturating_add(width - buttons_width as u16);
+    INTERVAL_BUTTONS
+        .iter()
+        .map(|&(step, label)| {
+            let button = Rect::new(x, area.y, label.len() as u16, 1);
+            let style = if app.hovered() == Some(&MouseTarget::IntervalStep(step)) {
+                Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            frame.render_widget(Paragraph::new(label).style(style), button);
+            x = x.saturating_add(button.width + 1);
+            (step, button)
+        })
+        .collect()
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -607,51 +747,57 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
     }
 }
 
+/// Width of the Help popup; every line must fit inside its borders.
+const HELP_WIDTH: u16 = 64;
+
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = layout::centered_rect(area, 64, 21);
+    let lines = help_lines();
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = layout::centered_rect(area, HELP_WIDTH, height);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from("General:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  1-5                 Select tab"),
-            Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
-            Line::from("  ?                   Toggle help"),
-            Line::from("  Esc                 Close popup / cancel search"),
-            Line::from("  q / Ctrl+C          Quit application"),
-            Line::from(""),
-            Line::from("Navigation:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
-            Line::from("  Home / End          Jump to top / bottom"),
-            Line::from("  /                   Search / filter current view"),
-            Line::from("  Enter               Open item details"),
-            Line::from(""),
-            Line::from("Screen Controls:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
-            Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
-            Line::from("  Services            r refresh system services"),
-            Line::from("  Logs                f follow, Space toggle pause"),
-            Line::from(""),
-            Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(" Help ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Help ")),
         popup,
     );
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let heading = |text: &'static str| {
+        Line::from(text).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    vec![
+        heading("General:"),
+        Line::from("  1-5                 Select tab"),
+        Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
+        Line::from("  ?                   Toggle help"),
+        Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
+        Line::from("  Esc                 Close popup / clear search, view / menu"),
+        Line::from("  q / Ctrl+C          Quit application"),
+        Line::from(""),
+        heading("Navigation:"),
+        Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
+        Line::from("  Home / End          Jump to top / bottom"),
+        Line::from("  /                   Search / filter (↑/↓ move while typing)"),
+        Line::from("  Enter               Open item details"),
+        Line::from(""),
+        heading("Screen Controls:"),
+        Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
+        Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+        Line::from("  Pins                P pin / unpin, Shift+↑/↓ move (or ▲/▼)"),
+        Line::from("  Views               v kernel threads, failed units, priority"),
+        Line::from("  Services            r refresh system services"),
+        Line::from("  Logs                f follow, Space toggle pause"),
+        Line::from(""),
+        Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
+    ]
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -863,6 +1009,8 @@ mod tests {
             process_rows: vec![ProcessRowRegion {
                 identity,
                 area: target_area,
+                pin_up: Some(Rect::new(10, 6, 2, 1)),
+                pin_down: Some(Rect::new(12, 6, 2, 1)),
             }],
             process_headers: vec![ProcessHeaderRegion {
                 field: ProcessSortField::Cpu,
@@ -890,6 +1038,8 @@ mod tests {
             network_viewport: Some((6, 10)),
             process_signal_cancel: None,
             process_signal_confirm: None,
+            menu_items: Vec::new(),
+            interval_buttons: vec![(IntervalStep::Longer, target_area)],
             input_mode: InputMode::ProcessSignalConfirm,
         };
 
@@ -910,6 +1060,7 @@ mod tests {
         assert_eq!(regions.log_viewport(), Some((5, 9)));
         assert_eq!(regions.network_viewport(), Some((6, 10)));
         assert_eq!(regions.target_at(2, 6), None);
+        assert_eq!(regions.target_at(10, 6), None, "pin controls are gone too");
 
         let cancel = Rect::new(10, 12, 12, 1);
         let confirm = Rect::new(26, 12, 15, 1);
@@ -975,6 +1126,118 @@ mod tests {
         app
     }
 
+    /// Text controlled by other local users, with escape sequences a terminal
+    /// would act on: clipboard write (OSC 52), full reset, 8-bit CSI, bidi.
+    const HOSTILE: &str = "ev\u{1b}]52;c;cm0gLXJmIH4K\u{7}il\u{1b}c\u{9b}2J\t\r\u{202E}x";
+
+    fn hostile_app() -> App {
+        let mut app = App::default();
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: vec![crate::linux::ProcessInfo {
+                pid: 1234,
+                name: HOSTILE.into(),
+                cpu_percent: Some(5.0),
+                memory_bytes: 4096,
+                command: Some(HOSTILE.into()),
+                state: "R (running)".into(),
+                parent_pid: 1,
+                state_code: 'R',
+                start_time: 100,
+                kernel_thread: false,
+            }],
+            error: None,
+        }));
+        app.update(Action::ServicesUpdated(crate::linux::ServiceSnapshot {
+            services: vec![crate::linux::ServiceInfo {
+                unit: format!("{HOSTILE}.service"),
+                load_state: "loaded".into(),
+                active_state: "active".into(),
+                sub_state: "running".into(),
+                description: HOSTILE.into(),
+            }],
+            error: None,
+            completed_refresh_generation: 0,
+        }));
+        app.update(Action::LogsUpdated(crate::linux::JournalBatch {
+            entries: vec![crate::linux::JournalEntry {
+                id: 1,
+                timestamp_micros: Some(1_000_000),
+                local_time: None,
+                source: HOSTILE.into(),
+                priority: Some(3),
+                message: format!("{HOSTILE}\nsecond {HOSTILE}"),
+            }],
+            dropped: 0,
+            error: None,
+        }));
+        app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+            interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                name: HOSTILE.into(),
+                operstate: crate::linux::OperState::Up,
+                mac_address: Some(HOSTILE.into()),
+                mtu: Some(1500),
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: 0,
+                tx_packets: 0,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                rx_rate_bytes_per_sec: None,
+                tx_rate_bytes_per_sec: None,
+            }],
+            error: None,
+        }));
+        app
+    }
+
+    #[test]
+    fn hostile_strings_never_reach_the_terminal_buffer() {
+        let overlays: [(Tab, Option<Action>); 10] = [
+            (Tab::Overview, None),
+            (Tab::Processes, None),
+            (Tab::Processes, Some(Action::OpenProcessDetails)),
+            (
+                Tab::Processes,
+                Some(Action::RequestProcessSignal(
+                    crate::linux::ProcessSignal::Kill,
+                )),
+            ),
+            (Tab::Services, None),
+            (Tab::Services, Some(Action::OpenServiceDetails)),
+            (Tab::Logs, None),
+            (Tab::Logs, Some(Action::OpenLogDetails)),
+            (Tab::Network, None),
+            (Tab::Network, Some(Action::OpenNetworkDetails)),
+        ];
+        for (width, height) in [(120, 40), (40, 15)] {
+            for (tab, open) in overlays.clone() {
+                let mut app = hostile_app();
+                app.update(Action::SelectTab(tab));
+                if let Some(open) = open.clone() {
+                    assert!(app.update(open.clone()), "{open:?} did not open");
+                }
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                rendered_regions(&mut terminal, &app);
+
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    !sanitize::has_unsafe_symbol(buffer),
+                    "{tab:?} {open:?} at {width}x{height} leaks a control character"
+                );
+                if width == 120 && tab != Tab::Overview {
+                    assert!(
+                        buffer_text(&terminal).contains("ev"),
+                        "{tab:?} {open:?}: the hostile text was not rendered at all"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn stale_marker_is_shown_in_the_frame_without_hiding_search_state() {
         let mut app = App::default().with_collector_periods(
@@ -1002,6 +1265,87 @@ mod tests {
             "three names fall back to a bare marker"
         );
         assert!(text.contains(" tuxctl "));
+    }
+
+    /// The top border row as text.
+    fn top_row(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_interval_and_its_buttons_sit_in_the_top_right_corner() {
+        let app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+        let top = top_row(&terminal);
+
+        assert!(top.starts_with("┌ tuxctl ─"), "{top}");
+        assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
+        assert_eq!(regions.interval_buttons.len(), 2);
+        for (step, area) in &regions.interval_buttons {
+            assert_eq!(area.y, 0);
+            for x in area.x..area.right() {
+                assert_eq!(
+                    regions.target_at(x, 0),
+                    Some(MouseTarget::IntervalStep(*step))
+                );
+            }
+            // The gap after each button is not part of it.
+            assert_eq!(regions.target_at(area.right(), 0), None);
+        }
+        let label = |step| {
+            regions
+                .interval_buttons
+                .iter()
+                .find(|(s, _)| *s == step)
+                .map(|(_, area)| {
+                    (area.x..area.right())
+                        .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                        .collect::<String>()
+                })
+        };
+        assert_eq!(label(IntervalStep::Shorter).as_deref(), Some("[-]"));
+        assert_eq!(label(IntervalStep::Longer).as_deref(), Some("[+]"));
+    }
+
+    #[test]
+    fn the_top_right_corner_gives_up_space_without_touching_the_title() {
+        let mut app = App::default().with_collector_periods(
+            crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(1)),
+        );
+        for _ in 0..7 {
+            app.update(Action::StepSamplingInterval(IntervalStep::Shorter));
+        }
+        let start = std::time::Instant::now();
+        app.update(Action::Tick(start));
+        app.update(Action::Tick(start + std::time::Duration::from_secs(10)));
+
+        for width in [40_u16, 30, 24, 20] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
+            let regions = rendered_regions(&mut terminal, &app);
+            if width < layout::MIN_TERMINAL_WIDTH {
+                continue;
+            }
+            let top = top_row(&terminal);
+            assert!(top.starts_with("┌ tuxctl ─"), "{width}: {top}");
+            assert!(top.ends_with('┐'), "{width}: {top}");
+            assert!(top.contains(" stale "), "{width}: {top}");
+            assert!(top.contains("250ms"), "{width}: {top}");
+            assert_eq!(regions.interval_buttons.is_empty(), !top.contains("[+]"));
+        }
+    }
+
+    #[test]
+    fn a_modal_disables_the_interval_buttons() {
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.interval_buttons.is_empty());
     }
 
     fn overview_sweep_app(cpu_count: u32) -> App {
@@ -1731,6 +2075,212 @@ mod tests {
 
         assert_eq!(regions.service_viewport(), Some((0, 19)));
         assert_eq!(regions.service_scroll_area.unwrap().y, 4);
+    }
+
+    fn pinned_processes_app(pins: &[u32]) -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: (1..=20)
+                .map(|pid| crate::linux::ProcessInfo {
+                    pid,
+                    name: format!("proc{pid}"),
+                    cpu_percent: Some(f64::from(pid)),
+                    memory_bytes: 1 << 30,
+                    command: None,
+                    state: "S (sleeping)".into(),
+                    parent_pid: 1,
+                    state_code: 'S',
+                    start_time: u64::from(pid),
+                    kernel_thread: false,
+                })
+                .collect(),
+            error: None,
+        }));
+        for &pid in pins {
+            app.update(Action::SelectProcess(pinned(pid)));
+            app.update(Action::TogglePin);
+        }
+        app
+    }
+
+    fn pinned(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_time: u64::from(pid),
+        }
+    }
+
+    #[test]
+    fn pin_controls_move_their_row_and_hover_as_the_row() {
+        let app = pinned_processes_app(&[3, 5, 7]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+        let row = |pid| {
+            regions
+                .process_rows
+                .iter()
+                .find(|region| region.identity == pinned(pid))
+                .unwrap()
+        };
+
+        // First pin: down only; middle: both; last: up only; unpinned: none.
+        assert!(row(3).pin_up.is_none() && row(3).pin_down.is_some());
+        assert!(row(5).pin_up.is_some() && row(5).pin_down.is_some());
+        assert!(row(7).pin_up.is_some() && row(7).pin_down.is_none());
+        assert!(row(20).pin_up.is_none() && row(20).pin_down.is_none());
+
+        let up = row(5).pin_up.unwrap();
+        let down = row(5).pin_down.unwrap();
+        assert!(contains(row(5).area, up.x, up.y) && contains(row(5).area, down.x, down.y));
+        assert_eq!(
+            regions.target_at(up.x, up.y),
+            Some(MouseTarget::PinMove(pinned(5), PinMove::Up))
+        );
+        assert_eq!(
+            regions.target_at(down.x + 1, down.y),
+            Some(MouseTarget::PinMove(pinned(5), PinMove::Down))
+        );
+        assert_eq!(
+            regions.target_at(up.x - 1, up.y),
+            Some(MouseTarget::ProcessRow(pinned(5))),
+            "one cell left of the control is the row"
+        );
+        // Hovering a control is hovering its row: no extra hover transitions.
+        for x in [up.x, down.x, row(5).area.x] {
+            assert_eq!(
+                regions.hover_target_at(x, up.y),
+                Some(MouseTarget::ProcessRow(pinned(5)))
+            );
+        }
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(up.x, up.y)].symbol(), "▲");
+        assert_eq!(buffer[(down.x, down.y)].symbol(), "▼");
+        assert_eq!(
+            rows_text(&terminal, &regions).matches(['▲', '▼']).count(),
+            4
+        );
+    }
+
+    /// Text of the process table body (without the sortable header).
+    fn rows_text(terminal: &Terminal<TestBackend>, regions: &UiRegions) -> String {
+        let buffer = terminal.backend().buffer();
+        regions
+            .process_rows
+            .iter()
+            .flat_map(|region| {
+                (region.area.x..region.area.right()).map(move |x| (x, region.area.y))
+            })
+            .map(|position| buffer[position].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn pin_controls_need_two_pins_and_room() {
+        for (pins, width) in [(&[3_u32][..], 100), (&[3, 5][..], 60)] {
+            let app = pinned_processes_app(pins);
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let regions = rendered_regions(&mut terminal, &app);
+
+            assert!(
+                regions
+                    .process_rows
+                    .iter()
+                    .all(|region| region.pin_up.is_none() && region.pin_down.is_none()),
+                "{pins:?} at {width} columns"
+            );
+            assert!(!rows_text(&terminal, &regions).contains(['▲', '▼']));
+        }
+    }
+
+    #[test]
+    fn a_modal_removes_pin_controls() {
+        let mut app = pinned_processes_app(&[3, 5]);
+        app.update(Action::RequestProcessSignal(
+            crate::linux::ProcessSignal::Term,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.process_rows.is_empty());
+    }
+
+    #[test]
+    fn menu_items_are_hit_from_their_rendered_rows_and_hide_the_background() {
+        let mut app = populated_app(Tab::Processes);
+        app.update(Action::Escape);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.tabs.is_empty() && regions.process_rows.is_empty());
+        assert_eq!(regions.menu_items.len(), 2);
+        for (item, area) in &regions.menu_items {
+            assert_eq!(
+                regions.target_at(area.x, area.y),
+                Some(MouseTarget::MenuItem(*item))
+            );
+            assert_eq!(regions.target_at(area.x, area.y + 5), None);
+        }
+        let text = buffer_text(&terminal);
+        assert!(text.contains("About") && text.contains("Exit"));
+    }
+
+    #[test]
+    fn menu_and_about_render_at_every_size() {
+        let mut app = App::default();
+        app.update(Action::Escape);
+        let mut about = App::default();
+        about.update(Action::Escape);
+        about.update(Action::ActivateSelectedMenuItem);
+        for (width, height) in [(40, 15), (40, 5), (1, 1), (200, 60)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+            rendered_regions(&mut terminal, &about);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        rendered_regions(&mut terminal, &about);
+        let text = buffer_text(&terminal);
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(env!("CARGO_PKG_RUST_VERSION")));
+    }
+
+    #[test]
+    fn help_lists_every_binding_and_every_line_fits() {
+        let lines = help_lines();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        for line in &text {
+            assert!(
+                line.chars().count() <= usize::from(HELP_WIDTH - 2),
+                "{line:?} is cut off"
+            );
+        }
+        let all = text.join("\n");
+        for binding in [
+            "+ / -",
+            "Esc",
+            "menu",
+            "↑/↓ move while typing",
+            "P pin",
+            "Shift+↑/↓",
+            "▲/▼",
+            "v kernel threads",
+            "Ctrl+C",
+            "Space",
+        ] {
+            assert!(all.contains(binding), "Help does not mention {binding:?}");
+        }
+
+        // Complete, including the closing hint, once the terminal is tall enough.
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        let mut terminal = Terminal::new(TestBackend::new(80, lines.len() as u16 + 4)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        assert!(buffer_text(&terminal).contains("Esc closes"));
+        for (width, height) in [(40, 15), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+        }
     }
 
     #[test]

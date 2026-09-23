@@ -45,6 +45,16 @@ pub(super) fn status_line(
     Line::from(spans)
 }
 
+/// Appends an active view filter to the persistent status text; like a
+/// search, it is interaction state and must stay visible.
+pub(super) fn with_view(persistent: String, view: Option<&str>) -> String {
+    match view {
+        Some(view) if persistent.is_empty() => format!("View: {view}"),
+        Some(view) => format!("{persistent}   View: {view}"),
+        None => persistent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +95,17 @@ mod tests {
             text(&status_line("12 services".into(), None, &hints, 20)),
             " 12 services"
         );
+    }
+
+    #[test]
+    fn an_active_view_stays_visible_next_to_a_notice() {
+        let persistent = with_view("Filter: \"ssh\"".into(), Some("no kernel threads"));
+        let line = status_line(persistent, Some(Span::raw("Sent SIGTERM")), &[], 120);
+        assert_eq!(
+            text(&line),
+            " Filter: \"ssh\"   View: no kernel threads   Sent SIGTERM"
+        );
+        assert_eq!(with_view("12 services".into(), None), "12 services");
     }
 
     #[test]

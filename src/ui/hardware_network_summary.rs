@@ -6,17 +6,21 @@ use ratatui::{
 };
 
 use crate::{
-    app::App,
+    app::{is_overview_interface, is_physical_interface, App},
     linux::{HardwareInventory, NetworkInterfaceInfo, OperState},
 };
 
-use super::{hardware::section_heading, layout, network};
+use super::{
+    hardware::{section_heading, trend_line},
+    layout, network,
+};
 
 const MAX_NETWORK_INTERFACES: usize = 3;
 
 pub(super) fn desired_height(app: &App, inventory: Option<&HardwareInventory>) -> u16 {
     let network_count = overview_network_interfaces(app.networks(), inventory).len();
-    1_u16
+    // Heading, interfaces, an overflow line and the trend.
+    2_u16
         .saturating_add(u16::try_from(network_count.min(MAX_NETWORK_INTERFACES)).unwrap_or(3))
         .saturating_add(u16::from(network_count > MAX_NETWORK_INTERFACES))
 }
@@ -70,6 +74,20 @@ pub(super) fn render(
                 interfaces.len() - interface_limit
             )));
         }
+        // Interfaces come first; the trend only uses a row left over.
+        if lines.len() < usize::from(area.height) {
+            let history = app.network_history();
+            let peak = history.iter().fold(0.0_f64, f64::max);
+            let note = (history.iter().len() > 0)
+                .then(|| format!("peak {}", network::format_rate(Some(peak))));
+            lines.push(Line::from(trend_line(
+                history,
+                app.cpu_history_interval(),
+                peak.max(1.0),
+                note.as_deref(),
+                width,
+            )));
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -78,49 +96,12 @@ fn overview_network_interfaces<'a>(
     interfaces: &'a [NetworkInterfaceInfo],
     inventory: Option<&HardwareInventory>,
 ) -> Vec<&'a NetworkInterfaceInfo> {
-    let is_physical = |name: &str| {
-        inventory.is_some_and(|inventory| {
-            inventory
-                .network_devices
-                .iter()
-                .any(|device| device.interface_name == name)
-        })
-    };
     let mut relevant = interfaces
         .iter()
-        .filter(|interface| is_physical(&interface.name) || !is_noisy_network_name(&interface.name))
+        .filter(|interface| is_overview_interface(&interface.name, inventory))
         .collect::<Vec<_>>();
-    relevant.sort_by_key(|interface| !is_physical(&interface.name));
+    relevant.sort_by_key(|interface| !is_physical_interface(&interface.name, inventory));
     relevant
-}
-
-fn is_noisy_network_name(name: &str) -> bool {
-    name == "lo"
-        || [
-            "docker",
-            "veth",
-            "br-",
-            "virbr",
-            "cni",
-            "flannel",
-            "cali",
-            "kube",
-            "vboxnet",
-            "vmnet",
-            "tun",
-            "tap",
-            "wg",
-            "tailscale",
-            "sit",
-            "ip6tnl",
-            "gre",
-            "gretap",
-            "erspan",
-            "geneve",
-            "vxlan",
-        ]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
 }
 
 fn network_summary_line(
@@ -205,7 +186,7 @@ fn network_traffic(interface: &NetworkInterfaceInfo) -> Option<(String, String)>
     ))
 }
 
-fn format_rate_tight(rate: Option<f64>) -> String {
+pub(super) fn format_rate_tight(rate: Option<f64>) -> String {
     const UNITS: [&str; 5] = ["B/s", "K/s", "M/s", "G/s", "T/s"];
     let Some(mut value) = rate else {
         return "--".into();
