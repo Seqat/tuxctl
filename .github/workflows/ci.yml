@@ -52,8 +52,8 @@ jobs:
         run: scripts/smoke.py target/release/tuxctl
       - run: cargo build --release --locked --features redraw-counter --target-dir target/counter
       - name: Measure (short)
-        # Report-only until the guards are calibrated on hosted runners.
-        continue-on-error: true
+        # Fails only on structural guards (redraw caps, liveness, catastrophe
+        # limits); CPU and RSS are reported in the summary and artifact.
         run: >
           scripts/measure.py target/counter/release/tuxctl
           --label "${GITHUB_SHA::7}" --secs 8 --json measure.json --check
