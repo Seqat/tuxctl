@@ -4,6 +4,9 @@ mod journal;
 mod latest_snapshot;
 mod localtime;
 mod network;
+// Static musl builds cannot dlopen the (glibc) NVIDIA library.
+#[cfg(not(target_env = "musl"))]
+mod nvml;
 mod process;
 mod rate;
 mod service;

@@ -33,8 +33,11 @@ const MAX_ACTIONS_PER_TURN: usize = 16;
 
 fn main() -> io::Result<()> {
     // Arguments are handled before the terminal is touched.
-    let interval = match cli::parse(std::env::args().skip(1)) {
-        Ok(cli::Command::Run { interval }) => interval,
+    let (interval, nvidia_temperature) = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::Run {
+            interval,
+            nvidia_temperature,
+        }) => (interval, nvidia_temperature),
         Ok(cli::Command::Help) => {
             print!("{}", cli::help_text());
             return Ok(());
@@ -63,7 +66,7 @@ fn main() -> io::Result<()> {
     let mut terminal = TerminalSession::new()?;
     let mut app = App::default().with_collector_periods(periods);
     let mut events = EventHandler::new(TICK_RATE);
-    let metrics = match linux::SystemMetricsCollector::start(periods.metrics) {
+    let metrics = match linux::SystemMetricsCollector::start(periods.metrics, nvidia_temperature) {
         Ok(metrics) => metrics,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };

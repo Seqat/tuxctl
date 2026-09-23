@@ -15,8 +15,15 @@ use super::{
     hardware::is_whole_disk,
     latest_snapshot::{self, LatestReceiver},
     rate::CounterSample,
-    temperature::{NoNvidia, SysfsRoots, Temperature, TemperatureSampler},
+    temperature::{SysfsRoots, Temperature, TemperatureSampler},
 };
+
+/// NVIDIA temperatures come from NVML where it can be loaded; static musl
+/// builds know NVIDIA GPUs but cannot read them.
+#[cfg(not(target_env = "musl"))]
+type Nvidia = super::nvml::NvmlReader;
+#[cfg(target_env = "musl")]
+type Nvidia = super::temperature::NoNvidia;
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
@@ -109,7 +116,9 @@ pub struct SystemMetricsCollector {
 }
 
 impl SystemMetricsCollector {
-    pub fn start(refresh_rate: Duration) -> io::Result<Self> {
+    /// `nvidia_temperature` loads NVML for NVIDIA GPUs of the proprietary
+    /// driver; it is never set on builds without NVML (see `cli`).
+    pub fn start(refresh_rate: Duration, nvidia_temperature: bool) -> io::Result<Self> {
         let (metrics_tx, receiver) = latest_snapshot::channel();
         let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
@@ -117,7 +126,7 @@ impl SystemMetricsCollector {
             .name("system-metrics".into())
             .spawn(move || {
                 let identity = collect_system_identity();
-                let mut sampler = SystemMetricsSampler::new(identity);
+                let mut sampler = SystemMetricsSampler::new(identity, nvidia_temperature);
 
                 run_periodic(
                     &worker_control,
@@ -168,17 +177,21 @@ struct SystemMetricsSampler {
     previous_cpu: Option<CpuSample>,
     system_identity: SystemIdentity,
     disks: DiskIoSampler,
-    temperatures: TemperatureSampler<NoNvidia>,
+    temperatures: TemperatureSampler<Nvidia>,
 }
 
 impl SystemMetricsSampler {
     /// Created on the worker thread: temperature discovery runs here.
-    fn new(system_identity: SystemIdentity) -> Self {
+    fn new(system_identity: SystemIdentity, nvidia_temperature: bool) -> Self {
         Self {
             previous_cpu: None,
             system_identity,
             disks: DiskIoSampler::default(),
-            temperatures: TemperatureSampler::new(SysfsRoots::default(), NoNvidia, Instant::now()),
+            temperatures: TemperatureSampler::new(
+                SysfsRoots::default(),
+                nvidia_temperature.then(Nvidia::default),
+                Instant::now(),
+            ),
         }
     }
 

@@ -70,3 +70,18 @@ fn a_valid_interval_does_not_prevent_version() {
     assert_eq!(output.status.code(), Some(0));
     assert!(text(&output.stdout).starts_with("tuxctl "));
 }
+
+#[test]
+fn nvidia_temperature_is_parsed_before_help_and_version() {
+    let output = run(&["--nvidia-temperature", "--version"]);
+    if cfg!(target_env = "musl") {
+        // A static build cannot load NVML and says so instead of starting.
+        assert_eq!(output.status.code(), Some(2));
+        let error = text(&output.stderr);
+        assert!(error.contains("needs a glibc build"), "{error}");
+        assert!(error.contains("Usage: tuxctl"), "{error}");
+    } else {
+        assert_eq!(output.status.code(), Some(0));
+        assert!(text(&output.stdout).starts_with("tuxctl "));
+    }
+}

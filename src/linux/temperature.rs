@@ -56,9 +56,11 @@ pub(super) trait NvidiaSource {
 }
 
 /// For builds without NVML: NVIDIA GPUs are known but have no temperature.
+#[cfg(any(test, target_env = "musl"))]
 #[derive(Debug, Default)]
 pub(super) struct NoNvidia;
 
+#[cfg(any(test, target_env = "musl"))]
 impl NvidiaSource for NoNvidia {
     fn read(&mut self, bus_ids: &[&str], _keep_open: bool, _now: Instant) -> Vec<Option<i64>> {
         vec![None; bus_ids.len()]
@@ -128,11 +130,12 @@ pub(super) struct TemperatureSampler<N> {
     last_discovery: Instant,
     rediscover: bool,
     buffer: String,
-    nvidia: N,
+    /// `None`: NVIDIA temperatures are off; NVIDIA GPUs get no entry.
+    nvidia: Option<N>,
 }
 
 impl<N: NvidiaSource> TemperatureSampler<N> {
-    pub(super) fn new(roots: SysfsRoots, nvidia: N, now: Instant) -> Self {
+    pub(super) fn new(roots: SysfsRoots, nvidia: Option<N>, now: Instant) -> Self {
         let mut sampler = Self {
             roots,
             sensors: Vec::new(),
@@ -167,7 +170,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
     }
 
     fn discover(&mut self, now: Instant) {
-        self.sensors = discover(&self.roots);
+        self.sensors = discover(&self.roots, self.nvidia.is_some());
         self.worked = vec![false; self.sensors.len()];
         self.readings = self
             .sensors
@@ -226,9 +229,10 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
                 }
             };
         }
-        if nvidia.is_empty() {
+        // Only discovered while NVIDIA temperatures are on.
+        let Some(source) = self.nvidia.as_mut().filter(|_| !nvidia.is_empty()) else {
             return;
-        }
+        };
 
         for &(index, ..) in &nvidia {
             self.readings[index].celsius = None;
@@ -239,7 +243,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
         let keep_open = nvidia.iter().all(|&(.., keep_open)| keep_open);
         let all_awake = nvidia.iter().all(|&(_, _, awake, _)| awake);
         if !keep_open && !all_awake {
-            self.nvidia.release();
+            source.release();
             return;
         }
         let awake: Vec<_> = nvidia.iter().filter(|&&(_, _, awake, _)| awake).collect();
@@ -247,7 +251,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             return;
         }
         let bus_ids: Vec<&str> = awake.iter().map(|&&(_, bus_id, ..)| bus_id).collect();
-        let values = self.nvidia.read(&bus_ids, keep_open, now);
+        let values = source.read(&bus_ids, keep_open, now);
         for (&&(index, ..), value) in awake.iter().zip(values) {
             self.readings[index].celsius = value.and_then(valid_celsius);
         }
@@ -338,7 +342,7 @@ struct Gpu {
     driver: Option<String>,
 }
 
-fn discover(roots: &SysfsRoots) -> Vec<Sensor> {
+fn discover(roots: &SysfsRoots, nvidia: bool) -> Vec<Sensor> {
     let hwmons = read_hwmons(&roots.hwmon);
     let mut sensors = cpu_sensors(&hwmons);
     if sensors.is_empty() {
@@ -356,7 +360,7 @@ fn discover(roots: &SysfsRoots) -> Vec<Sensor> {
     }
     for gpu in gpus
         .iter()
-        .filter(|gpu| gpu.driver.as_deref() == Some("nvidia"))
+        .filter(|gpu| nvidia && gpu.driver.as_deref() == Some("nvidia"))
     {
         if let Some(bus_id) = gpu.path.file_name().and_then(|name| name.to_str()) {
             let proc_power = fs::read_to_string(roots.nvidia_proc.join(bus_id).join("power")).ok();
@@ -810,7 +814,7 @@ mod tests {
         }
 
         fn sampler(&self) -> TemperatureSampler<NoNvidia> {
-            TemperatureSampler::new(self.roots(), NoNvidia, Instant::now())
+            TemperatureSampler::new(self.roots(), Some(NoNvidia), Instant::now())
         }
     }
 
@@ -1210,7 +1214,7 @@ mod tests {
         tree.gpu(1, &gpu, "nvidia");
         tree.power(&gpu, "auto", "active");
         let policy = |tree: &Tree| {
-            discover(&tree.roots())
+            discover(&tree.roots(), true)
                 .into_iter()
                 .find_map(|sensor| match sensor.source {
                     Source::Nvidia {
@@ -1242,7 +1246,7 @@ mod tests {
         let tree = Tree::new("cadence");
         let hwmon = tree.hwmon(0, "coretemp", None, &[(1, Some("Package id 0"), 40_000)]);
         let start = Instant::now();
-        let mut sampler = TemperatureSampler::new(tree.roots(), NoNvidia, start);
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
         (0..samples)
             .map(|index| {
                 let offset = if index % 2 == 0 { jitter } else { -jitter };
@@ -1279,7 +1283,7 @@ mod tests {
         let tree = Tree::new("carry");
         let hwmon = tree.hwmon(0, "coretemp", None, &[(1, Some("Package id 0"), 40_000)]);
         let start = Instant::now();
-        let mut sampler = TemperatureSampler::new(tree.roots(), NoNvidia, start);
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
         let mut sample = |millis: u64, value: i64| {
             tree.write(&hwmon.join("temp1_input"), &value.to_string());
             sampler.sample(at(start, millis))[0].celsius
@@ -1303,7 +1307,7 @@ mod tests {
         tree.disk("nvme0n1", &device);
         let hwmon = tree.hwmon(0, "nvme", Some(&device), &[(1, Some("Composite"), 40_000)]);
         let start = Instant::now();
-        let mut sampler = TemperatureSampler::new(tree.roots(), NoNvidia, start);
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
         assert_eq!(sampler.sample(start)[0].celsius, Some(40));
 
         // The driver re-registers its hwmon under a new number.
@@ -1340,7 +1344,7 @@ mod tests {
         tree.power(&gpu, "auto", "active");
         let hwmon = tree.hwmon(0, "amdgpu", Some(&gpu), &[(1, Some("edge"), 50_000)]);
         let start = Instant::now();
-        let mut sampler = TemperatureSampler::new(tree.roots(), NoNvidia, start);
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
         assert_eq!(sampler.sample(start)[0].celsius, Some(50));
 
         // Suspended: amdgpu refuses reads (EPERM); here the file is gone.
@@ -1394,11 +1398,21 @@ mod tests {
         tree.gpu(0, &gpu, "amdgpu");
         tree.hwmon(0, "amdgpu", Some(&gpu), &[(1, Some("edge"), 50_000)]);
         let fake = FakeNvidia::default();
-        let mut sampler = TemperatureSampler::new(tree.roots(), fake.clone(), Instant::now());
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), Instant::now());
 
         sampler.sample(Instant::now());
         assert!(fake.calls.borrow().is_empty());
         assert_eq!(*fake.releases.borrow(), 0);
+    }
+
+    #[test]
+    fn nvidia_gpus_get_no_entry_while_nvidia_temperatures_are_off() {
+        let (tree, _) = nvidia_tree("nvidia-off", "on", "active");
+        let mut sampler: TemperatureSampler<FakeNvidia> =
+            TemperatureSampler::new(tree.roots(), None, Instant::now());
+
+        assert!(values(&mut sampler).is_empty());
+        assert!(discover(&tree.roots(), false).is_empty());
     }
 
     #[test]
@@ -1408,7 +1422,7 @@ mod tests {
             value: Some(52),
             ..FakeNvidia::default()
         };
-        let mut sampler = TemperatureSampler::new(tree.roots(), fake.clone(), Instant::now());
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), Instant::now());
 
         assert_eq!(values(&mut sampler), [(device_key(&gpu), Some(52))]);
         assert_eq!(
@@ -1425,7 +1439,7 @@ mod tests {
             ..FakeNvidia::default()
         };
         let start = Instant::now();
-        let mut sampler = TemperatureSampler::new(tree.roots(), fake.clone(), start);
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
 
         assert_eq!(sampler.sample(start)[0].celsius, Some(48));
         assert_eq!(
@@ -1451,14 +1465,14 @@ mod tests {
     #[test]
     fn nvml_values_are_validated_and_unavailable_nvml_shows_a_known_sensor() {
         let (tree, gpu) = nvidia_tree("nvidia-values", "on", "active");
-        let mut unavailable = TemperatureSampler::new(tree.roots(), NoNvidia, Instant::now());
+        let mut unavailable = TemperatureSampler::new(tree.roots(), Some(NoNvidia), Instant::now());
         assert_eq!(values(&mut unavailable), [(device_key(&gpu), None)]);
 
         let implausible = FakeNvidia {
             value: Some(4_000),
             ..FakeNvidia::default()
         };
-        let mut sampler = TemperatureSampler::new(tree.roots(), implausible, Instant::now());
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(implausible), Instant::now());
         assert_eq!(values(&mut sampler), [(device_key(&gpu), None)]);
     }
 }
