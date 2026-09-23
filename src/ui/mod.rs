@@ -21,7 +21,7 @@ use ratatui::{
 };
 
 use crate::{
-    action::{InputMode, MouseTarget, ProcessSortField, Tab},
+    action::{InputMode, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
     linux::ByteUsage,
 };
@@ -57,6 +57,9 @@ struct TabRegion {
 struct ProcessRowRegion {
     identity: crate::linux::ProcessIdentity,
     area: Rect,
+    /// ▲/▼ controls inside `area`, only on pinned rows that can move that way.
+    pin_up: Option<Rect>,
+    pin_down: Option<Rect>,
 }
 
 #[derive(Debug)]
@@ -140,6 +143,21 @@ impl UiRegions {
                     .map(|region| MouseTarget::ProcessSortHeader(region.field))
             })
             .or_else(|| {
+                // Pin controls sit inside their row, so they are checked first.
+                self.process_rows.iter().find_map(|region| {
+                    let hit = |control: Option<Rect>| {
+                        control.is_some_and(|area| contains(area, column, row))
+                    };
+                    if hit(region.pin_up) {
+                        Some(MouseTarget::PinMove(region.identity, PinMove::Up))
+                    } else if hit(region.pin_down) {
+                        Some(MouseTarget::PinMove(region.identity, PinMove::Down))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| {
                 self.process_rows
                     .iter()
                     .find(|region| contains(region.area, column, row))
@@ -163,6 +181,15 @@ impl UiRegions {
                     .find(|region| contains(region.area, column, row))
                     .map(|region| MouseTarget::NetworkRow(region.name.clone()))
             })
+    }
+
+    /// Like [`Self::target_at`], but a pin control reports its row: moving
+    /// between a row and its controls is not a hover change and redraws nothing.
+    pub fn hover_target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        match self.target_at(column, row) {
+            Some(MouseTarget::PinMove(identity, _)) => Some(MouseTarget::ProcessRow(identity)),
+            other => other,
+        }
     }
 
     pub fn process_viewport(&self) -> Option<(usize, usize)> {
@@ -222,7 +249,12 @@ impl UiRegions {
     ) -> Self {
         let process_rows: Vec<_> = rows
             .into_iter()
-            .map(|(identity, area)| ProcessRowRegion { identity, area })
+            .map(|(identity, area)| ProcessRowRegion {
+                identity,
+                area,
+                pin_up: None,
+                pin_down: None,
+            })
             .collect();
         let process_scroll_area = process_rows.first().map(|region| region.area);
 
@@ -233,6 +265,16 @@ impl UiRegions {
             input_mode,
             ..Self::default()
         }
+    }
+
+    /// Adds ▲/▼ controls to the first process row.
+    #[cfg(test)]
+    pub(crate) fn with_pin_controls(mut self, up: Rect, down: Rect) -> Self {
+        if let Some(row) = self.process_rows.first_mut() {
+            row.pin_up = Some(up);
+            row.pin_down = Some(down);
+        }
+        self
     }
 
     #[cfg(test)]
@@ -380,11 +422,7 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     regions.input_mode = app.input_mode();
     match content_render {
         ContentRender::Processes(process_render) => {
-            regions.process_rows = process_render
-                .rows
-                .into_iter()
-                .map(|(identity, area)| ProcessRowRegion { identity, area })
-                .collect();
+            regions.process_rows = process_render.rows;
             regions.process_headers = process_render
                 .headers
                 .into_iter()
@@ -889,6 +927,8 @@ mod tests {
             process_rows: vec![ProcessRowRegion {
                 identity,
                 area: target_area,
+                pin_up: Some(Rect::new(10, 6, 2, 1)),
+                pin_down: Some(Rect::new(12, 6, 2, 1)),
             }],
             process_headers: vec![ProcessHeaderRegion {
                 field: ProcessSortField::Cpu,
@@ -936,6 +976,7 @@ mod tests {
         assert_eq!(regions.log_viewport(), Some((5, 9)));
         assert_eq!(regions.network_viewport(), Some((6, 10)));
         assert_eq!(regions.target_at(2, 6), None);
+        assert_eq!(regions.target_at(10, 6), None, "pin controls are gone too");
 
         let cancel = Rect::new(10, 12, 12, 1);
         let confirm = Rect::new(26, 12, 15, 1);
@@ -1869,6 +1910,135 @@ mod tests {
 
         assert_eq!(regions.service_viewport(), Some((0, 19)));
         assert_eq!(regions.service_scroll_area.unwrap().y, 4);
+    }
+
+    fn pinned_processes_app(pins: &[u32]) -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: (1..=20)
+                .map(|pid| crate::linux::ProcessInfo {
+                    pid,
+                    name: format!("proc{pid}"),
+                    cpu_percent: Some(f64::from(pid)),
+                    memory_bytes: 1 << 30,
+                    command: None,
+                    state: "S (sleeping)".into(),
+                    parent_pid: 1,
+                    state_code: 'S',
+                    start_time: u64::from(pid),
+                    kernel_thread: false,
+                })
+                .collect(),
+            error: None,
+        }));
+        for &pid in pins {
+            app.update(Action::SelectProcess(pinned(pid)));
+            app.update(Action::TogglePin);
+        }
+        app
+    }
+
+    fn pinned(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_time: u64::from(pid),
+        }
+    }
+
+    #[test]
+    fn pin_controls_move_their_row_and_hover_as_the_row() {
+        let app = pinned_processes_app(&[3, 5, 7]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+        let row = |pid| {
+            regions
+                .process_rows
+                .iter()
+                .find(|region| region.identity == pinned(pid))
+                .unwrap()
+        };
+
+        // First pin: down only; middle: both; last: up only; unpinned: none.
+        assert!(row(3).pin_up.is_none() && row(3).pin_down.is_some());
+        assert!(row(5).pin_up.is_some() && row(5).pin_down.is_some());
+        assert!(row(7).pin_up.is_some() && row(7).pin_down.is_none());
+        assert!(row(20).pin_up.is_none() && row(20).pin_down.is_none());
+
+        let up = row(5).pin_up.unwrap();
+        let down = row(5).pin_down.unwrap();
+        assert!(contains(row(5).area, up.x, up.y) && contains(row(5).area, down.x, down.y));
+        assert_eq!(
+            regions.target_at(up.x, up.y),
+            Some(MouseTarget::PinMove(pinned(5), PinMove::Up))
+        );
+        assert_eq!(
+            regions.target_at(down.x + 1, down.y),
+            Some(MouseTarget::PinMove(pinned(5), PinMove::Down))
+        );
+        assert_eq!(
+            regions.target_at(up.x - 1, up.y),
+            Some(MouseTarget::ProcessRow(pinned(5))),
+            "one cell left of the control is the row"
+        );
+        // Hovering a control is hovering its row: no extra hover transitions.
+        for x in [up.x, down.x, row(5).area.x] {
+            assert_eq!(
+                regions.hover_target_at(x, up.y),
+                Some(MouseTarget::ProcessRow(pinned(5)))
+            );
+        }
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(up.x, up.y)].symbol(), "▲");
+        assert_eq!(buffer[(down.x, down.y)].symbol(), "▼");
+        assert_eq!(
+            rows_text(&terminal, &regions).matches(['▲', '▼']).count(),
+            4
+        );
+    }
+
+    /// Text of the process table body (without the sortable header).
+    fn rows_text(terminal: &Terminal<TestBackend>, regions: &UiRegions) -> String {
+        let buffer = terminal.backend().buffer();
+        regions
+            .process_rows
+            .iter()
+            .flat_map(|region| {
+                (region.area.x..region.area.right()).map(move |x| (x, region.area.y))
+            })
+            .map(|position| buffer[position].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn pin_controls_need_two_pins_and_room() {
+        for (pins, width) in [(&[3_u32][..], 100), (&[3, 5][..], 60)] {
+            let app = pinned_processes_app(pins);
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let regions = rendered_regions(&mut terminal, &app);
+
+            assert!(
+                regions
+                    .process_rows
+                    .iter()
+                    .all(|region| region.pin_up.is_none() && region.pin_down.is_none()),
+                "{pins:?} at {width} columns"
+            );
+            assert!(!rows_text(&terminal, &regions).contains(['▲', '▼']));
+        }
+    }
+
+    #[test]
+    fn a_modal_removes_pin_controls() {
+        let mut app = pinned_processes_app(&[3, 5]);
+        app.update(Action::RequestProcessSignal(
+            crate::linux::ProcessSignal::Term,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.process_rows.is_empty());
     }
 
     #[test]

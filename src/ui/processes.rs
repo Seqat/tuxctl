@@ -10,13 +10,13 @@ use crate::{
     action::{MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton},
     app::calculate_scroll,
     app::{App, ProcessSignalConfirmation},
-    linux::{ProcessIdentity, ProcessInfo, ProcessSignal, SystemMetrics},
+    linux::{ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
-use super::{format_bytes, hardware::utilization_bar, layout, status};
+use super::{format_bytes, hardware::utilization_bar, layout, status, ProcessRowRegion};
 
-pub struct ProcessRender {
-    pub rows: Vec<(ProcessIdentity, Rect)>,
+pub(super) struct ProcessRender {
+    pub rows: Vec<ProcessRowRegion>,
     pub headers: Vec<(ProcessSortField, Rect)>,
     pub scroll_area: Rect,
     pub start: usize,
@@ -26,6 +26,10 @@ pub struct ProcessRender {
 const COLUMN_SPACING: u16 = 1;
 /// Shown before the PID of a pinned process.
 const PIN_MARKER: &str = "*";
+/// Row width needed for the ▲/▼ controls to fit after the MEMORY value.
+const PIN_CONTROLS_MIN_WIDTH: u16 = 70;
+/// Each control is two cells wide, at the right edge of the row.
+const PIN_CONTROL_WIDTH: u16 = 2;
 const COLUMN_WIDTHS: [Constraint; 4] = [
     Constraint::Length(10),
     Constraint::Percentage(45),
@@ -67,19 +71,32 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
     let section_end =
         (pinned_rows > 0 && pinned_rows < app.process_count()).then(|| pinned_rows - 1);
     let mut hit_rows = Vec::with_capacity(end.saturating_sub(start));
+    let controls = row_area.width >= PIN_CONTROLS_MIN_WIDTH && pinned_rows > 1;
     let rows = (start..end).filter_map(|index| {
         let row = app.process_row_at(index)?;
         let process = row.process;
         let offset = u16::try_from(index.saturating_sub(start)).ok()?;
-        hit_rows.push((
-            process.identity(),
+        let area = Rect::new(
+            row_area.x,
+            row_area.y.saturating_add(offset),
+            row_area.width,
+            1,
+        );
+        let control = |slot: u16| {
             Rect::new(
-                row_area.x,
-                row_area.y.saturating_add(offset),
-                row_area.width,
+                area.right().saturating_sub(PIN_CONTROL_WIDTH * slot),
+                area.y,
+                PIN_CONTROL_WIDTH,
                 1,
-            ),
-        ));
+            )
+        };
+        let movable = controls && row.pinned;
+        hit_rows.push(ProcessRowRegion {
+            identity: process.identity(),
+            area,
+            pin_up: (movable && index > 0).then(|| control(2)),
+            pin_down: (movable && index + 1 < pinned_rows).then(|| control(1)),
+        });
 
         let is_selected = selected == Some(process.identity());
         let mut style = if is_selected {
@@ -133,6 +150,16 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         .column_spacing(COLUMN_SPACING)
         .flex(Flex::Start);
     frame.render_widget(table, table_area);
+    for region in &hit_rows {
+        for (control, glyph) in [(region.pin_up, "▲"), (region.pin_down, "▼")] {
+            if let Some(area) = control {
+                frame.render_widget(
+                    Paragraph::new(glyph).style(Style::default().fg(Color::Cyan)),
+                    area,
+                );
+            }
+        }
+    }
 
     let header_area = Rect::new(
         table_area.x,
@@ -512,7 +539,10 @@ fn format_cpu(percent: Option<f64>) -> String {
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
-    use crate::{action::Action, linux::ByteUsage};
+    use crate::{
+        action::Action,
+        linux::{ByteUsage, ProcessIdentity},
+    };
 
     use super::*;
 
@@ -654,7 +684,7 @@ mod tests {
         assert!(rendered
             .rows
             .iter()
-            .all(|(_, area)| area.height == 1 && area.y >= rows.y));
+            .all(|region| region.area.height == 1 && region.area.y >= rows.y));
     }
 
     #[test]

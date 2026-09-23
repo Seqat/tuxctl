@@ -344,6 +344,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 - **Selection:** Click rows in Processes, Services, Logs, or Network.
 - **Scrolling:** Use the mouse wheel over list/table areas.
 - **Process sorting:** Click `PID`, `NAME`, `CPU`, or `MEMORY` headers.
+- **Pinned processes:** Click `▲` / `▼` at the end of a pinned row to move it (shown when there are at least two pins and the terminal is wide enough).
 - **Confirmation dialogs:** Click `Cancel` or the confirmation action.
 
 ---

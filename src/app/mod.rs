@@ -413,6 +413,7 @@ impl App {
             Action::SortProcesses(field) => self.sort_processes(field),
             Action::TogglePin => self.toggle_selected_pin(),
             Action::MoveSelectedPin(direction) => self.move_selected_pin(direction),
+            Action::MovePin(identity, direction) => self.move_pin(identity, direction),
             Action::ServicePrevious => self.move_service_selection(-1),
             Action::ServiceNext => self.move_service_selection(1),
             Action::ServicePreviousPage => {

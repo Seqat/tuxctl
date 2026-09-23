@@ -82,7 +82,7 @@ fn translate_event(
                 .target_at(mouse.column, mouse.row)
                 .map(action_for_mouse_target),
             MouseEventKind::Moved => {
-                let target = regions.target_at(mouse.column, mouse.row);
+                let target = regions.hover_target_at(mouse.column, mouse.row);
                 (target.as_ref() != hovered).then_some(Action::HoverMouseTarget(target))
             }
             MouseEventKind::ScrollUp if regions.process_scroll_at(mouse.column, mouse.row) => {
@@ -121,6 +121,7 @@ fn action_for_mouse_target(target: MouseTarget) -> Action {
         MouseTarget::Tab(tab) => Action::SelectTab(tab),
         MouseTarget::ProcessRow(identity) => Action::SelectProcess(identity),
         MouseTarget::ProcessSortHeader(field) => Action::SortProcesses(field),
+        MouseTarget::PinMove(identity, direction) => Action::MovePin(identity, direction),
         MouseTarget::ProcessSignalCancel => Action::CancelProcessSignal,
         MouseTarget::ProcessSignalConfirm => Action::ConfirmProcessSignal,
         MouseTarget::ServiceRow(unit) => Action::SelectService(unit),
@@ -659,6 +660,55 @@ mod tests {
             translate_event(scroll, &regions, None),
             Some(Action::LogPrevious)
         );
+    }
+
+    #[test]
+    fn pin_control_clicks_move_the_pin_and_their_hover_is_the_row() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_time: 9001,
+        };
+        let regions =
+            UiRegions::from_process_rows([(identity, Rect::new(0, 5, 80, 1))], InputMode::Normal)
+                .with_pin_controls(Rect::new(76, 5, 2, 1), Rect::new(78, 5, 2, 1));
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let click = MouseEventKind::Down(MouseButton::Left);
+
+        assert_eq!(
+            translate_event(mouse(click, 77), &regions, None),
+            Some(Action::MovePin(identity, PinMove::Up))
+        );
+        assert_eq!(
+            translate_event(mouse(click, 78), &regions, None),
+            Some(Action::MovePin(identity, PinMove::Down))
+        );
+        assert_eq!(
+            translate_event(mouse(click, 75), &regions, None),
+            Some(Action::SelectProcess(identity))
+        );
+
+        // Row → ▲ → ▼ → row: one hover transition, then nothing.
+        let mut hovered = None;
+        let mut dispatched = 0;
+        for column in [10, 76, 77, 78, 79, 20] {
+            if let Some(Action::HoverMouseTarget(target)) = translate_event(
+                mouse(MouseEventKind::Moved, column),
+                &regions,
+                hovered.as_ref(),
+            ) {
+                hovered = target;
+                dispatched += 1;
+            }
+        }
+        assert_eq!(dispatched, 1);
+        assert_eq!(hovered, Some(MouseTarget::ProcessRow(identity)));
     }
 
     #[test]

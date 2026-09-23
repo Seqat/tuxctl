@@ -38,6 +38,8 @@ pub enum Action {
     /// Pin or unpin the selected process.
     TogglePin,
     MoveSelectedPin(PinMove),
+    /// Move a specific pinned process (its ▲/▼ control was clicked).
+    MovePin(ProcessIdentity, PinMove),
     ServicesUpdated(ServiceSnapshot),
     ServicePrevious,
     ServiceNext,
@@ -100,6 +102,8 @@ pub enum MouseTarget {
     Tab(Tab),
     ProcessRow(ProcessIdentity),
     ProcessSortHeader(ProcessSortField),
+    /// The ▲/▼ control of a pinned row. Hovering it counts as hovering the row.
+    PinMove(ProcessIdentity, PinMove),
     ProcessSignalCancel,
     ProcessSignalConfirm,
     ServiceRow(Arc<str>),
