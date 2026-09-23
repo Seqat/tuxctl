@@ -634,7 +634,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             ),
             Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
             Line::from("  Home / End          Jump to top / bottom"),
-            Line::from("  /                   Search / filter current view"),
+            Line::from("  /                   Search / filter (↑/↓ move while typing)"),
             Line::from("  Enter               Open item details"),
             Line::from(""),
             Line::from("Screen Controls:").style(

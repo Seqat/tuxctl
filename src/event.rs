@@ -145,6 +145,11 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenProcessDetails),
             KeyCode::Backspace => Some(Action::BackspaceProcessSearch),
+            // Arrows move through the matches; letters (including j/k) stay query text.
+            KeyCode::Up => Some(Action::ProcessPrevious),
+            KeyCode::Down => Some(Action::ProcessNext),
+            KeyCode::PageUp => Some(Action::ProcessPreviousPage),
+            KeyCode::PageDown => Some(Action::ProcessNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -161,6 +166,10 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenServiceDetails),
             KeyCode::Backspace => Some(Action::BackspaceServiceSearch),
+            KeyCode::Up => Some(Action::ServicePrevious),
+            KeyCode::Down => Some(Action::ServiceNext),
+            KeyCode::PageUp => Some(Action::ServicePreviousPage),
+            KeyCode::PageDown => Some(Action::ServiceNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -177,6 +186,10 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
             KeyCode::Esc => Some(Action::Escape),
             KeyCode::Enter => Some(Action::OpenLogDetails),
             KeyCode::Backspace => Some(Action::BackspaceLogSearch),
+            KeyCode::Up => Some(Action::LogPrevious),
+            KeyCode::Down => Some(Action::LogNext),
+            KeyCode::PageUp => Some(Action::LogPreviousPage),
+            KeyCode::PageDown => Some(Action::LogNextPage),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -723,6 +736,88 @@ mod tests {
             translate_key_event(key, InputMode::ProcessSearch),
             Some(Action::AppendProcessSearch('q'))
         );
+    }
+
+    const SEARCH_MODES: [(InputMode, [Action; 4]); 3] = [
+        (
+            InputMode::ProcessSearch,
+            [
+                Action::ProcessPrevious,
+                Action::ProcessNext,
+                Action::ProcessPreviousPage,
+                Action::ProcessNextPage,
+            ],
+        ),
+        (
+            InputMode::ServiceSearch,
+            [
+                Action::ServicePrevious,
+                Action::ServiceNext,
+                Action::ServicePreviousPage,
+                Action::ServiceNextPage,
+            ],
+        ),
+        (
+            InputMode::LogSearch,
+            [
+                Action::LogPrevious,
+                Action::LogNext,
+                Action::LogPreviousPage,
+                Action::LogNextPage,
+            ],
+        ),
+    ];
+
+    #[test]
+    fn search_modes_map_arrow_and_page_keys_to_navigation() {
+        for (mode, actions) in SEARCH_MODES {
+            let keys = [
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+            ];
+            for (code, action) in keys.into_iter().zip(actions) {
+                for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                    assert_eq!(
+                        translate_key_event(KeyEvent::new(code, modifiers), mode),
+                        Some(action.clone()),
+                        "{code:?} {modifiers:?} in {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_modes_keep_letters_as_query_text() {
+        for (mode, _) in SEARCH_MODES {
+            for character in ['j', 'k', 'J', 'K', 'q', '/', ' '] {
+                let action = translate_key_event(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    mode,
+                );
+                let expected = match mode {
+                    InputMode::ProcessSearch => Action::AppendProcessSearch(character),
+                    InputMode::ServiceSearch => Action::AppendServiceSearch(character),
+                    _ => Action::AppendLogSearch(character),
+                };
+                assert_eq!(action, Some(expected), "{character:?} in {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_modes_leave_home_and_end_unmapped() {
+        for (mode, _) in SEARCH_MODES {
+            for code in [KeyCode::Home, KeyCode::End] {
+                assert_eq!(
+                    translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), mode),
+                    None,
+                    "{code:?} in {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

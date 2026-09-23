@@ -699,6 +699,97 @@ mod tests {
         }
     }
 
+    /// Arrow keys during search move through the matches, the query stays
+    /// active, and Enter opens the row the user moved to.
+    #[test]
+    fn navigating_during_search_chooses_the_row_enter_opens() {
+        let mut app = App::default();
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "sshd"),
+            process(2, "bash"),
+            process(3, "ssh-agent"),
+        ])));
+        app.update(Action::ServicesUpdated(services(vec![
+            service("sshd.service", "active", "OpenSSH"),
+            service("dbus.service", "active", "D-Bus"),
+            service("ssh-agent.service", "active", "Agent"),
+        ])));
+        app.update(Action::LogsUpdated(log_batch(vec![
+            log_entry(1, "sshd", 6, "ssh accepted"),
+            log_entry(2, "kernel", 6, "boot"),
+            log_entry(3, "sshd", 6, "ssh closed"),
+        ])));
+
+        let cases = [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                Action::AppendProcessSearch('s'),
+                Action::ProcessNext,
+                Action::OpenProcessDetails,
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                Action::AppendServiceSearch('s'),
+                Action::ServiceNext,
+                Action::OpenServiceDetails,
+            ),
+            // Following logs select the newest match, so the move is upwards.
+            (
+                Tab::Logs,
+                Action::BeginLogSearch,
+                Action::AppendLogSearch('s'),
+                Action::LogPrevious,
+                Action::OpenLogDetails,
+            ),
+        ];
+        let selected = |app: &App, tab: Tab| match tab {
+            Tab::Processes => app.selected_process().map(|p| p.name.clone()),
+            Tab::Services => app.selected_service().map(|s| s.unit.clone()),
+            _ => app.selected_log().map(|entry| entry.id.to_string()),
+        };
+        for (tab, begin, append, step, open) in cases {
+            app.update(Action::SelectTab(tab));
+            app.update(begin);
+            app.update(append.clone());
+            app.update(append);
+            let searching = app.input_mode();
+            let before = selected(&app, tab);
+
+            assert!(app.update(step), "{tab:?} moved");
+            let chosen = selected(&app, tab);
+            assert_ne!(chosen, before, "{tab:?}");
+            assert_eq!(app.input_mode(), searching, "{tab:?} search stays active");
+
+            assert!(app.update(open), "{tab:?} opens details");
+            assert_eq!(selected(&app, tab), chosen, "{tab:?}");
+            app.update(Action::Escape);
+        }
+        assert_eq!(app.process_search_query(), "ss");
+    }
+
+    #[test]
+    fn navigating_an_empty_search_result_is_a_no_op() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![process(
+            1, "init",
+        )])));
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('z'));
+
+        for action in [
+            Action::ProcessNext,
+            Action::ProcessPrevious,
+            Action::ProcessNextPage,
+            Action::ProcessPreviousPage,
+        ] {
+            assert!(!app.update(action));
+        }
+        assert!(!app.update(Action::OpenProcessDetails));
+    }
+
     #[test]
     fn escape_closes_exactly_one_overlay_per_press() {
         for kind in OVERLAYS {

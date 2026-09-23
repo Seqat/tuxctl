@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- While typing a search on Processes, Services, or Logs, `↑`/`↓` and
+  `PageUp`/`PageDown` now move through the matches. Previously they were
+  ignored, so `Enter` opened whichever row happened to stay selected.
+
 ## [0.2.7] - 2026-09-23
 
 Performance, documentation, and release hardening before v0.3.0. No new keys

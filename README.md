@@ -297,7 +297,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `↓` / `j` | Move selection down |
 | `PageUp` / `PageDown` | Move selection by page |
 | `Home` / `End` | Jump to first / last item |
-| `/` | Begin search / filter |
+| `/` | Begin search / filter; `↑` / `↓` and `PageUp` / `PageDown` move through the matches while typing |
 | `Enter` | Open detailed inspection |
 
 ### Processes
