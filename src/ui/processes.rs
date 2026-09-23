@@ -531,7 +531,7 @@ pub fn render_detail(frame: &mut Frame, process: Option<&ProcessInfo>, area: Rec
     );
 }
 
-fn format_cpu(percent: Option<f64>) -> String {
+pub(super) fn format_cpu(percent: Option<f64>) -> String {
     percent
         .map(|percent| format!("{percent:.1}%"))
         .unwrap_or_else(|| "N/A".into())

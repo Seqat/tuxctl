@@ -221,6 +221,9 @@ impl App {
         if self.process_error.is_none() && self.processes == snapshot.processes {
             return false;
         }
+        // Overview lists pinned processes, so their values changing is visible there.
+        let overview_pins_changed =
+            overview_visible && self.pinned_values_changed(&snapshot.processes);
 
         if !processes_visible {
             // Filtering and sorting are only needed to show the table, so hidden
@@ -236,7 +239,9 @@ impl App {
             self.process_summary = summary;
             self.process_error = None;
             self.close_confirmation_for_exited_process();
-            return overview_summary_changed || (overview_visible && was_stale);
+            return overview_summary_changed
+                || overview_pins_changed
+                || (overview_visible && was_stale);
         }
 
         let previous_index = self.selected_process_index().unwrap_or(0);
@@ -671,7 +676,46 @@ impl App {
         }
         // Exited rows refer to pins by position, so the rows must be rebuilt.
         self.rebuild_process_filter();
-        self.active_tab == Tab::Processes
+        matches!(self.active_tab, Tab::Processes | Tab::Overview)
+    }
+
+    /// Pinned processes in the user's order, independent of the Processes
+    /// table (which is not rebuilt while that tab is hidden).
+    pub fn pinned_processes(&self) -> impl Iterator<Item = ProcessRowView<'_>> + '_ {
+        self.pinned.iter().filter_map(|pin| {
+            let (process, exited) = match &pin.exited {
+                Some(exited) => (&exited.last_seen, true),
+                None => (
+                    self.processes
+                        .iter()
+                        .find(|process| process.identity() == pin.identity)?,
+                    false,
+                ),
+            };
+            Some(ProcessRowView {
+                process,
+                pinned: true,
+                dimmed: false,
+                exited,
+            })
+        })
+    }
+
+    /// Whether a running pinned process shows different CPU or memory values
+    /// in `next`, or is missing from it (it exited).
+    fn pinned_values_changed(&self, next: &[ProcessInfo]) -> bool {
+        self.pinned
+            .iter()
+            .filter(|pin| pin.exited.is_none())
+            .any(|pin| {
+                let shown = |processes: &[ProcessInfo]| {
+                    processes
+                        .iter()
+                        .find(|process| process.identity() == pin.identity)
+                        .map(|process| (process.cpu_percent, process.memory_bytes))
+                };
+                shown(&self.processes) != shown(next)
+            })
     }
 
     pub(super) fn toggle_selected_pin(&mut self) -> bool {
@@ -1563,16 +1607,23 @@ mod tests {
 
     #[test]
     fn exited_pins_dropped_on_another_tab_do_not_redraw_it() {
-        let mut app = processes_app(3);
-        pin(&mut app, 2);
-        app.update(Action::SelectTab(Tab::Overview));
-        app.update(Action::ProcessesUpdated(processes(vec![process(1, "p1")])));
+        // Logs shows no pins; Overview lists them, so it does redraw.
+        for (tab, redraws) in [(Tab::Logs, false), (Tab::Overview, true)] {
+            let mut app = processes_app(3);
+            pin(&mut app, 2);
+            app.update(Action::SelectTab(tab));
+            app.update(Action::ProcessesUpdated(processes(vec![process(1, "p1")])));
 
-        let start = Instant::now();
-        app.update(Action::Tick(start));
-        assert!(!app.update(Action::Tick(start + EXITED_PIN_LINGER)));
-        app.update(Action::SelectTab(Tab::Processes));
-        assert_eq!(visible_pids(&app), vec![1]);
+            let start = Instant::now();
+            app.update(Action::Tick(start));
+            assert_eq!(
+                app.update(Action::Tick(start + EXITED_PIN_LINGER)),
+                redraws,
+                "{tab:?}"
+            );
+            app.update(Action::SelectTab(Tab::Processes));
+            assert_eq!(visible_pids(&app), vec![1]);
+        }
     }
 
     #[test]
@@ -1800,6 +1851,61 @@ mod tests {
         assert!(app.update(Action::CycleViewFilter));
         assert_eq!(app.process_view_label(), None);
         assert_eq!(visible_pids(&app), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn pinned_processes_are_available_while_the_processes_tab_is_hidden() {
+        let mut app = processes_app(4);
+        pin(&mut app, 3);
+        pin(&mut app, 1);
+        app.update(Action::SelectTab(Tab::Overview));
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(3, "p3"),
+            process(4, "p4"),
+        ])));
+
+        let pinned: Vec<_> = app
+            .pinned_processes()
+            .map(|row| (row.process.pid, row.exited))
+            .collect();
+        assert_eq!(pinned, [(3, false), (1, true)]);
+        assert_eq!(app.process_count(), 0, "the table itself stays deferred");
+    }
+
+    #[test]
+    fn pinned_value_changes_redraw_the_overview_only() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+        app.update(Action::SelectTab(Tab::Overview));
+        let with_cpu = |cpu| {
+            processes(
+                cpu_ranked(3)
+                    .into_iter()
+                    .map(|mut p| {
+                        if p.pid == 2 {
+                            p.cpu_percent = Some(cpu);
+                        }
+                        p
+                    })
+                    .collect(),
+            )
+        };
+        app.update(Action::ProcessesUpdated(with_cpu(2.0)));
+
+        assert!(
+            app.update(Action::ProcessesUpdated(with_cpu(40.0))),
+            "pinned value changed"
+        );
+        let mut unpinned_only = cpu_ranked(3);
+        unpinned_only[0].cpu_percent = Some(77.0);
+        unpinned_only[1].cpu_percent = Some(40.0);
+        assert!(
+            !app.update(Action::ProcessesUpdated(processes(unpinned_only))),
+            "an unpinned change with the same summary is not shown on Overview"
+        );
+
+        app.update(Action::SelectTab(Tab::Logs));
+        assert!(!app.update(Action::ProcessesUpdated(with_cpu(90.0))));
     }
 
     #[test]

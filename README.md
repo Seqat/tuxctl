@@ -35,6 +35,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Uptime.
   - Process, running-process, and zombie counts.
   - Root filesystem usage.
+  - Pinned processes (pin them with `P` on the Processes tab) with live CPU and memory.
 - Live CPU monitoring:
   - Aggregate CPU utilization.
   - Bounded CPU utilization history.

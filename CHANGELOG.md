@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows stay visible but dimmed. Pins follow the process identity
   `(PID, start time)`, so a reused PID never inherits one. A pinned process
   that exits is shown as `exited` for 5 seconds, cannot be signaled, and is
-  then removed.
+  then removed. The Overview System panel lists pinned processes with their
+  CPU and memory.
 - View filters on `v`: Processes hide kernel threads; Services show all
   units, loaded units (hiding `not-found`), or failed units; Logs show a
   minimum priority of notice, warning, or error. They combine with the search,
