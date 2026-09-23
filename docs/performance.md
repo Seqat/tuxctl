@@ -34,6 +34,30 @@ within the larger of twice that band and a floor of 0.15 CPU percentage
 points, 0.3 redraws/s, or 256 KiB. After minute 5, RSS should grow by at most
 128 KiB over a 15-minute run.
 
+## v0.3.0
+
+Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.45 MB.
+Median of three runs, alternated with three runs of the v0.2.7 musl binary
+in the same session (in brackets).
+
+| Scenario | CPU % | Redraws/s | RSS |
+| --- | --- | --- | --- |
+| Overview, idle | 0.60 (0.60) | 1.10 (1.00) | 2.3 MiB |
+| Processes, idle | 0.75 (0.70) | 2.00 (2.00) | 2.4 MiB |
+| Logs, idle | 0.60 (0.55) | 0.00 (0.00) | 2.5 MiB |
+| Logs, 200 journal messages/s | 0.87 (0.87) | 3.87 (3.87) | 2.8 MiB |
+| Mouse hover at 240 Hz | 1.39 (1.29) | 13.54 (13.43) | 2.8 MiB |
+
+- Every difference is within the noise band: the v0.2.7 hover runs alone
+  spread by 0.20 points.
+- Startup RSS: 2.3 MiB (v0.2.7: 2.2–2.3 MiB). After 15 minutes on Overview:
+  2.3 MiB, unchanged since minute 5.
+- Time to the first frame: 2 ms. Input latency during the log storm: 0.9 ms
+  (0.75 ms).
+- The v0.2.7 figures below came from an earlier session and read about
+  0.05–0.1 points lower on some scenarios than v0.2.7 measured again here;
+  compare versions only within one session.
+
 ## v0.2.7
 
 Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.39 MB.

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-23
+
+Tracking and interaction: pin processes, filter views, change the sampling
+interval while running, and see disk I/O and RAM/network trends. Also fixes
+a terminal escape injection from system data shown by `tuxctl`.
+
 ### Added
 
 - `+` and `-` change the sampling interval while `tuxctl` runs, through the
@@ -233,7 +239,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
 [0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5
 [0.2.2]: https://github.com/Seqat/tuxctl/compare/v0.2.1...v0.2.2
