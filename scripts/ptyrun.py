@@ -114,6 +114,16 @@ class Tui:
                 return int(line.split()[1])
         return 0
 
+    def anon_huge_kib(self):
+        """Transparent huge pages in RSS; with THP=always one can add 2 MiB."""
+        try:
+            for line in open(f"/proc/{self.pid}/smaps_rollup"):
+                if line.startswith("AnonHugePages"):
+                    return int(line.split()[1])
+        except OSError:
+            pass
+        return 0
+
     def session_processes(self):
         """(pid, comm) of other processes in tuxctl's session.
 

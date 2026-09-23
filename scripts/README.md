@@ -46,6 +46,9 @@ Compare them locally against `docs/performance.md`.
   of an idle process are coarse: at 0.5 % over 20 s, one tick is 10 % of the
   reading.
 - Logs idle redraws depend on how much the host journal is writing.
+- With transparent huge pages set to `always`, a run can occasionally show
+  about 2 MiB more RSS; the JSON output records `AnonHugePages` so such runs
+  can be recognized.
 - The first minutes include warm-up (command cache, hardware discovery); judge
   memory growth from minute 5.
 - The redraw counter writes one small file per render; the effect is negligible

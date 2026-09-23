@@ -31,7 +31,7 @@ def main():
     extra = argv[split + 1 :]
 
     tui = Tui([args.binary, *extra], settle=3.0)
-    samples = [(0.0, tui.rss_kib())]
+    samples = [(0.0, tui.rss_kib(), tui.anon_huge_kib())]
     print(f"startup: {samples[0][1]} kB", flush=True)
     elapsed = 0.0
     while elapsed < args.minutes * 60:
@@ -39,11 +39,11 @@ def main():
         elapsed += args.every
         if not tui.alive():
             sys.exit(f"tuxctl exited after {elapsed / 60:.1f} min")
-        samples.append((elapsed / 60, tui.rss_kib()))
+        samples.append((elapsed / 60, tui.rss_kib(), tui.anon_huge_kib()))
         print(f"{round(elapsed / 60, 2):g} min: {samples[-1][1]} kB", flush=True)
     tui.quit()
 
-    baseline = next((rss for minute, rss in samples if minute >= args.after), samples[-1][1])
+    baseline = next((rss for minute, rss, _ in samples if minute >= args.after), samples[-1][1])
     growth = samples[-1][1] - baseline
     print(f"growth since minute {args.after:g}: {growth} kB")
 
@@ -51,7 +51,10 @@ def main():
         with open(args.json, "w") as out:
             json.dump({
                 "args": extra,
-                "samples": [{"minute": round(minute, 3), "rss_kib": rss} for minute, rss in samples],
+                "samples": [
+                    {"minute": round(minute, 3), "rss_kib": rss, "anon_huge_kib": huge}
+                    for minute, rss, huge in samples
+                ],
                 "growth_after_minute": args.after,
                 "growth_kib": growth,
             }, out, indent=2)

@@ -120,7 +120,11 @@ def main():
             })
             return True
 
-        metrics = {"startup_rss_kib": tui.rss_kib(), "first_frame_ms": tui.first_frame_ms}
+        metrics = {
+            "startup_rss_kib": tui.rss_kib(),
+            "startup_anon_huge_kib": tui.anon_huge_kib(),
+            "first_frame_ms": tui.first_frame_ms,
+        }
 
         def storm_for(seconds):
             with LogStorm(STORM_RATE):
@@ -168,6 +172,7 @@ def main():
             metrics["storm_latency_missed"] = len(samples) - len(answered)
 
         phases()
+        metrics["final_anon_huge_kib"] = tui.anon_huge_kib() if tui.alive() else None
         metrics["exit_code"] = tui.quit()
 
     guards = []
