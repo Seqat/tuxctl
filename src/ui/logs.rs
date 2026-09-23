@@ -178,7 +178,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else if app.log_search_query().is_empty() {
-        if area.width >= 55 {
+        if area.width >= 72 {
+            spans.push(Span::raw(format!(
+                "{} entries   / search   f follow   {pause_hint}   v view   Enter details",
+                app.log_count()
+            )));
+        } else if area.width >= 55 {
             spans.push(Span::raw(format!(
                 "{} entries   / search   f follow   {pause_hint}   Enter details",
                 app.log_count()

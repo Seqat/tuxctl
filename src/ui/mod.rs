@@ -687,54 +687,57 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
     }
 }
 
+/// Width of the Help popup; every line must fit inside its borders.
+const HELP_WIDTH: u16 = 64;
+
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = layout::centered_rect(area, 64, 24);
+    let lines = help_lines();
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = layout::centered_rect(area, HELP_WIDTH, height);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from("General:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  1-5                 Select tab"),
-            Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
-            Line::from("  ?                   Toggle help"),
-            Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
-            Line::from("  Esc                 Close popup / clear search, view / menu"),
-            Line::from("  q / Ctrl+C          Quit application"),
-            Line::from(""),
-            Line::from("Navigation:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
-            Line::from("  Home / End          Jump to top / bottom"),
-            Line::from("  /                   Search / filter (↑/↓ move while typing)"),
-            Line::from("  Enter               Open item details"),
-            Line::from(""),
-            Line::from("Screen Controls:").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
-            Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
-            Line::from("  Pins                P pin / unpin, Shift+↑/↓ move pinned"),
-            Line::from("  Views               v kernel threads, failed units, log level"),
-            Line::from("  Services            r refresh system services"),
-            Line::from("  Logs                f follow, Space toggle pause"),
-            Line::from(""),
-            Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(" Help ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Help ")),
         popup,
     );
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let heading = |text: &'static str| {
+        Line::from(text).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    vec![
+        heading("General:"),
+        Line::from("  1-5                 Select tab"),
+        Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
+        Line::from("  ?                   Toggle help"),
+        Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
+        Line::from("  Esc                 Close popup / clear search, view / menu"),
+        Line::from("  q / Ctrl+C          Quit application"),
+        Line::from(""),
+        heading("Navigation:"),
+        Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
+        Line::from("  Home / End          Jump to top / bottom"),
+        Line::from("  /                   Search / filter (↑/↓ move while typing)"),
+        Line::from("  Enter               Open item details"),
+        Line::from(""),
+        heading("Screen Controls:"),
+        Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
+        Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+        Line::from("  Pins                P pin / unpin, Shift+↑/↓ move (or ▲/▼)"),
+        Line::from("  Views               v kernel threads, failed units, priority"),
+        Line::from("  Services            r refresh system services"),
+        Line::from("  Logs                f follow, Space toggle pause"),
+        Line::from(""),
+        Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
+    ]
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -2098,6 +2101,44 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(text.contains(env!("CARGO_PKG_RUST_VERSION")));
+    }
+
+    #[test]
+    fn help_lists_every_binding_and_every_line_fits() {
+        let lines = help_lines();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        for line in &text {
+            assert!(
+                line.chars().count() <= usize::from(HELP_WIDTH - 2),
+                "{line:?} is cut off"
+            );
+        }
+        let all = text.join("\n");
+        for binding in [
+            "+ / -",
+            "Esc",
+            "menu",
+            "↑/↓ move while typing",
+            "P pin",
+            "Shift+↑/↓",
+            "▲/▼",
+            "v kernel threads",
+            "Ctrl+C",
+            "Space",
+        ] {
+            assert!(all.contains(binding), "Help does not mention {binding:?}");
+        }
+
+        // Complete, including the closing hint, once the terminal is tall enough.
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        let mut terminal = Terminal::new(TestBackend::new(80, lines.len() as u16 + 4)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        assert!(buffer_text(&terminal).contains("Esc closes"));
+        for (width, height) in [(40, 15), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+        }
     }
 
     #[test]
