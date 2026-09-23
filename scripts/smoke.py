@@ -121,7 +121,8 @@ t.send("\x1b", 0.3); t.send("\x1b", 0.3)
 check("Esc leaves About, then closes the menu", t.alive())
 
 out = t.send("-", 0.4)
-check("'-' shortens the sampling interval", b"500ms" in out)
+# Only changed cells are redrawn, so match the part of "500ms" that must change.
+check("'-' shortens the sampling interval", b"500m" in out)
 t.send("+", 0.4)
 check("'+' restores it", t.alive())
 
