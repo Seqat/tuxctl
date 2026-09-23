@@ -25,11 +25,32 @@ struct ExitedPin {
     since: Option<Instant>,
 }
 
+/// Which processes the table lists, cycled with `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessView {
+    All,
+    HideKernelThreads,
+}
+
+impl ProcessView {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::HideKernelThreads,
+            Self::HideKernelThreads => Self::All,
+        }
+    }
+
+    fn allows(self, process: &ProcessInfo) -> bool {
+        self != Self::HideKernelThreads || !process.kernel_thread
+    }
+}
+
 /// One row of the Processes table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProcessRow {
     /// Index into `processes`. `dimmed` marks a pinned process that does not
-    /// match the search; it stays listed but is never a fallback selection.
+    /// match the search or view filter; it stays listed but is never a
+    /// fallback selection.
     Live { index: usize, dimmed: bool },
     /// Index into `pinned` of a pinned process that has exited.
     Exited { pin: usize },
@@ -154,6 +175,11 @@ impl App {
 
     pub fn process_sort(&self) -> ProcessSort {
         self.process_sort
+    }
+
+    /// Status text of an active view filter.
+    pub fn process_view_label(&self) -> Option<&'static str> {
+        (self.process_view == ProcessView::HideKernelThreads).then_some("no kernel threads")
     }
 
     pub fn process_signal_confirmation(&self) -> Option<&ProcessSignalConfirmation> {
@@ -303,13 +329,14 @@ impl App {
         let keys = &self.process_keys;
         let processes = &self.processes;
         let pinned = &self.pinned;
+        let view = self.process_view;
         // One pass: live pinned processes go to their slot (at most
         // MAX_PINNED_PROCESSES identity comparisons each), the rest are filtered.
         let mut pinned_rows = [None; MAX_PINNED_PROCESSES];
         let mut rows = std::mem::take(&mut self.filtered_processes);
         rows.clear();
         for (index, (process, keys)) in processes.iter().zip(keys).enumerate() {
-            let matches = process_matches(process, keys, &query);
+            let matches = view.allows(process) && process_matches(process, keys, &query);
             let identity = process.identity();
             if let Some(slot) = pinned.iter().position(|pin| pin.identity == identity) {
                 if let Some(row) = pinned_rows.get_mut(slot) {
@@ -547,6 +574,13 @@ impl App {
                 ));
             }
         }
+        true
+    }
+
+    pub(super) fn cycle_process_view(&mut self) -> bool {
+        self.process_view = self.process_view.next();
+        self.rebuild_process_filter();
+        self.leave_dimmed_selection();
         true
     }
 
@@ -1736,6 +1770,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
         assert_eq!(sent_to, Some(2));
         assert_eq!(app.process_action_message(), Some("Sent SIGTERM to p2 (2)"));
+    }
+
+    #[test]
+    fn the_view_filter_hides_kernel_threads_but_only_dims_a_pinned_one() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        let kthread = |pid, name| ProcessInfo {
+            kernel_thread: true,
+            ..process(pid, name)
+        };
+        app.update(Action::ProcessesUpdated(processes(vec![
+            kthread(1, "kworker/0:1"),
+            process(2, "bash"),
+            kthread(3, "ksoftirqd/0"),
+        ])));
+        pin(&mut app, 3);
+
+        assert!(app.update(Action::CycleViewFilter));
+        assert_eq!(app.process_view_label(), Some("no kernel threads"));
+        assert_eq!(visible_pids(&app), vec![3, 2]);
+        assert!(app.process_row_at(0).unwrap().dimmed);
+        assert_eq!(
+            app.selected_process().map(|p| p.pid),
+            Some(2),
+            "the selection leaves the dimmed pin"
+        );
+
+        assert!(app.update(Action::CycleViewFilter));
+        assert_eq!(app.process_view_label(), None);
+        assert_eq!(visible_pids(&app), vec![3, 1, 2]);
     }
 
     #[test]

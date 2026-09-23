@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(PID, start time)`, so a reused PID never inherits one. A pinned process
   that exits is shown as `exited` for 5 seconds, cannot be signaled, and is
   then removed.
+- View filters on `v`: Processes hide kernel threads; Services show all
+  units, loaded units (hiding `not-found`), or failed units; Logs show a
+  minimum priority of notice, warning, or error. They combine with the search,
+  stay visible in the status line, and `Esc` clears the search first, then
+  the view.
 
 ### Changed
 

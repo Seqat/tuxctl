@@ -37,6 +37,8 @@ pub enum Action {
     SortProcesses(ProcessSortField),
     /// Pin or unpin the selected process.
     TogglePin,
+    /// Cycle the active screen's view filter (`v`).
+    CycleViewFilter,
     MoveSelectedPin(PinMove),
     /// Move a specific pinned process (its ▲/▼ control was clicked).
     MovePin(ProcessIdentity, PinMove),

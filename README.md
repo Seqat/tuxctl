@@ -62,6 +62,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Name (`n`)
 - Case-insensitive search (`/`).
 - Pinning (`P`): keep up to 8 processes at the top of the list, in your own order.
+- Kernel-thread filter (`v`).
 - Detailed process inspection (`Enter`).
 - Safe process signaling:
   - SIGTERM with `t`.
@@ -87,6 +88,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - `○ inactive`
   - `◌ activating`
 - Case-insensitive search (`/`).
+- View filter (`v`): hide `not-found` units or show only failed ones.
 - On-demand refresh (`r`).
 - Services are collected only while the tab is visible and refreshed each time it is opened.
 - Read-only service inspection (`Enter`).
@@ -101,6 +103,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 - Pause/resume (`Space`).
 - Severity-based styling for errors, warnings, informational messages, and debug output.
 - Search/filter mode (`/`).
+- Minimum-priority view (`v`): notice, warning, or error and above.
 - Detailed multiline message viewer (`Enter`).
 - Journal ingestion is scheduled so sustained log traffic does not monopolize terminal input handling.
 
@@ -287,7 +290,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
 | `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the title) |
-| `Esc` | Dismiss dialog / clear active search |
+| `Esc` | Dismiss dialog / clear the search, then the view filter |
 | `q` | Quit |
 | `Ctrl+C` | Quit globally |
 
@@ -314,6 +317,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
 | `P` / `Shift+P` | Pin / unpin the selected process (up to 8) |
 | `Shift+↑` / `Shift+↓` | Move the selected pinned process up / down (`Alt+↑` / `Alt+↓` also work) |
+| `v` | Hide / show kernel threads |
 
 Repeated sort commands toggle the sort direction. Pinned processes stay at the top in the order you give them, marked with `*`; sorting applies to the rows below them. While a search is active, pinned processes that do not match stay visible but dimmed. A pinned process that exits is shown as `exited` for a few seconds and then removed; it can never be signaled.
 
@@ -330,6 +334,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 | Key | Action |
 | --- | --- |
 | `r` | Request an immediate service refresh |
+| `v` | Cycle the view: all units → loaded units (hide `not-found`) → failed units |
 
 ### Logs
 
@@ -337,6 +342,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 | --- | --- |
 | `f` | Toggle follow mode |
 | `Space` | Pause / resume |
+| `v` | Cycle the minimum priority: all → notice → warning → error |
 
 ### Mouse Controls
 

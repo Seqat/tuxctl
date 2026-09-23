@@ -166,6 +166,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(mode_badge, mode_style),
         Span::raw(" "),
     ];
+    if let Some(view) = app.log_view_label() {
+        spans.push(Span::raw(format!("View: {view}   ")));
+    }
 
     if app.log_searching() {
         spans.push(Span::styled(

@@ -33,7 +33,9 @@ mod test_support;
 
 use health::CollectorHealth;
 pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
-use processes::{PinnedProcess, ProcessKeys, ProcessRow};
+use logs::LogView;
+use processes::{PinnedProcess, ProcessKeys, ProcessRow, ProcessView};
+use services::ServiceView;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
@@ -127,6 +129,7 @@ pub struct App {
     process_searching: bool,
     process_error: Option<String>,
     process_sort: ProcessSort,
+    process_view: ProcessView,
     process_action_message: Option<String>,
     services: Vec<ServiceInfo>,
     filtered_services: Vec<usize>,
@@ -135,6 +138,7 @@ pub struct App {
     service_view_height: usize,
     service_search_query: String,
     service_searching: bool,
+    service_view: ServiceView,
     service_error: Option<String>,
     service_refresh_generation: ServiceRefreshGeneration,
     service_refresh_requested: Option<ServiceRefreshGeneration>,
@@ -146,6 +150,7 @@ pub struct App {
     log_view_height: usize,
     log_search_query: String,
     log_searching: bool,
+    log_view: LogView,
     log_following: bool,
     log_paused: bool,
     log_dropped: usize,
@@ -185,6 +190,7 @@ impl Default for App {
             process_searching: false,
             process_error: None,
             process_sort: ProcessSort::default(),
+            process_view: ProcessView::All,
             process_action_message: None,
             services: Vec::new(),
             filtered_services: Vec::new(),
@@ -193,6 +199,7 @@ impl Default for App {
             service_view_height: 0,
             service_search_query: String::new(),
             service_searching: false,
+            service_view: ServiceView::All,
             service_error: None,
             service_refresh_generation: 0,
             service_refresh_requested: None,
@@ -204,6 +211,7 @@ impl Default for App {
             log_view_height: 0,
             log_search_query: String::new(),
             log_searching: false,
+            log_view: LogView::All,
             log_following: true,
             log_paused: false,
             log_dropped: 0,
@@ -412,6 +420,12 @@ impl App {
             Action::RequestProcessSignal(signal) => self.request_process_signal(signal),
             Action::SortProcesses(field) => self.sort_processes(field),
             Action::TogglePin => self.toggle_selected_pin(),
+            Action::CycleViewFilter => match self.active_tab {
+                Tab::Processes => self.cycle_process_view(),
+                Tab::Services => self.cycle_service_view(),
+                Tab::Logs => self.cycle_log_view(),
+                Tab::Overview | Tab::Network => false,
+            },
             Action::MoveSelectedPin(direction) => self.move_selected_pin(direction),
             Action::MovePin(identity, direction) => self.move_pin(identity, direction),
             Action::ServicePrevious => self.move_service_selection(-1),
@@ -511,6 +525,11 @@ impl App {
                     self.rebuild_process_filter();
                     true
                 }
+                Tab::Processes if self.process_view != ProcessView::All => {
+                    self.process_view = ProcessView::All;
+                    self.rebuild_process_filter();
+                    true
+                }
                 Tab::Services
                     if self.service_searching || !self.service_search_query.is_empty() =>
                 {
@@ -519,9 +538,19 @@ impl App {
                     self.rebuild_service_filter();
                     true
                 }
+                Tab::Services if self.service_view != ServiceView::All => {
+                    self.service_view = ServiceView::All;
+                    self.rebuild_service_filter();
+                    true
+                }
                 Tab::Logs if self.log_searching || !self.log_search_query.is_empty() => {
                     self.log_searching = false;
                     self.log_search_query.clear();
+                    self.rebuild_log_filter();
+                    true
+                }
+                Tab::Logs if self.log_view != LogView::All => {
+                    self.log_view = LogView::All;
                     self.rebuild_log_filter();
                     true
                 }
@@ -806,6 +835,62 @@ mod tests {
             assert!(!app.update(action));
         }
         assert!(!app.update(Action::OpenProcessDetails));
+    }
+
+    #[test]
+    fn escape_clears_the_search_then_the_view_filter() {
+        let cases = [
+            (
+                Tab::Processes,
+                Action::BeginProcessSearch,
+                Action::AppendProcessSearch('i'),
+            ),
+            (
+                Tab::Services,
+                Action::BeginServiceSearch,
+                Action::AppendServiceSearch('s'),
+            ),
+            (
+                Tab::Logs,
+                Action::BeginLogSearch,
+                Action::AppendLogSearch('b'),
+            ),
+        ];
+        for (tab, begin, append) in cases {
+            let mut app = app_with_overlay(OverlayKind::Help);
+            app.update(Action::Escape);
+            app.update(Action::SelectTab(tab));
+            assert!(app.update(Action::CycleViewFilter), "{tab:?}");
+            app.update(begin);
+            app.update(append);
+            let view = |app: &App| match tab {
+                Tab::Processes => app.process_view_label(),
+                Tab::Services => app.service_view_label(),
+                _ => app.log_view_label(),
+            };
+            assert!(view(&app).is_some(), "{tab:?}");
+
+            assert!(app.update(Action::Escape), "{tab:?} clears the search");
+            assert!(view(&app).is_some(), "{tab:?} keeps the view");
+            assert!(app.update(Action::Escape), "{tab:?} clears the view");
+            assert!(view(&app).is_none(), "{tab:?}");
+            assert!(!app.update(Action::Escape), "{tab:?} has nothing left");
+        }
+    }
+
+    #[test]
+    fn view_filters_cycle_only_on_their_screen() {
+        let mut app = App::default();
+        for tab in [Tab::Overview, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            assert!(!app.update(Action::CycleViewFilter), "{tab:?}");
+        }
+        app.update(Action::SelectTab(Tab::Services));
+        app.update(Action::ShowHelp);
+        assert!(
+            !app.update(Action::CycleViewFilter),
+            "blocked by an overlay"
+        );
     }
 
     #[test]

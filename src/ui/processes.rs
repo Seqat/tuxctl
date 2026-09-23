@@ -319,12 +319,14 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
                 if sort.descending { "▼" } else { "▲" }
             ),
             &[
+                "/ search   Enter details   P pin   v view   t term   K kill",
                 "/ search   Enter details   P pin   t term   K kill",
                 "/ search   Enter details   t term   K kill",
                 "/ find   Enter view",
             ],
         )
     };
+    let persistent = status::with_view(persistent, app.process_view_label());
     let notice = app
         .process_action_message()
         .map(|message| Span::raw(message.to_owned()))

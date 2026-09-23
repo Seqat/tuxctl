@@ -156,11 +156,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         (
             format!("{} services", app.service_count()),
             &[
+                "/ search   Enter details   v view   r refresh",
                 "/ search   Enter details   r refresh",
                 "/ search   r refresh",
             ],
         )
     };
+    let persistent = status::with_view(persistent, app.service_view_label());
     let notice = if app.service_refreshing() {
         Some(Span::raw("Refreshing system services…"))
     } else {

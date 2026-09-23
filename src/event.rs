@@ -307,6 +307,7 @@ fn process_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('m') => Some(Action::SortProcesses(ProcessSortField::Memory)),
         KeyCode::Char('p') => Some(Action::SortProcesses(ProcessSortField::Pid)),
         KeyCode::Char('n') => Some(Action::SortProcesses(ProcessSortField::Name)),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -322,6 +323,7 @@ fn service_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::BeginServiceSearch),
         KeyCode::Enter => Some(Action::OpenServiceDetails),
         KeyCode::Char('r') => Some(Action::RefreshServices),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -338,6 +340,7 @@ fn log_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Some(Action::OpenLogDetails),
         KeyCode::Char('f') => Some(Action::ToggleLogFollow),
         KeyCode::Char(' ') => Some(Action::ToggleLogPause),
+        KeyCode::Char('v') => Some(Action::CycleViewFilter),
         _ => None,
     }
 }
@@ -1056,6 +1059,19 @@ mod tests {
                 InputMode::ProcessSearch
             ),
             Some(Action::ProcessPrevious)
+        );
+    }
+
+    #[test]
+    fn v_cycles_the_view_on_filterable_screens_and_is_text_in_search() {
+        let v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        for mode in [InputMode::Normal, InputMode::Services, InputMode::Logs] {
+            assert_eq!(translate_key_event(v, mode), Some(Action::CycleViewFilter));
+        }
+        assert_eq!(translate_key_event(v, InputMode::Network), None);
+        assert_eq!(
+            translate_key_event(v, InputMode::LogSearch),
+            Some(Action::AppendLogSearch('v'))
         );
     }
 

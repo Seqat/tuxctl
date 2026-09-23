@@ -670,7 +670,7 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = layout::centered_rect(area, 64, 23);
+    let popup = layout::centered_rect(area, 64, 24);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
@@ -687,7 +687,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
             Line::from("  ?                   Toggle help"),
             Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
-            Line::from("  Esc                 Close popup / cancel search"),
+            Line::from("  Esc                 Close popup / clear search, then view"),
             Line::from("  q / Ctrl+C          Quit application"),
             Line::from(""),
             Line::from("Navigation:").style(
@@ -708,6 +708,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
             Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
             Line::from("  Pins                P pin / unpin, Shift+↑/↓ move pinned"),
+            Line::from("  Views               v kernel threads, failed units, log level"),
             Line::from("  Services            r refresh system services"),
             Line::from("  Logs                f follow, Space toggle pause"),
             Line::from(""),

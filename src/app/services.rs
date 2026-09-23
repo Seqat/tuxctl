@@ -1,6 +1,34 @@
-//! Services screen: snapshot handling, search, selection and refresh requests.
+//! Services screen: snapshot handling, search, view filter, selection and
+//! refresh requests.
 
 use super::*;
+
+/// Which units the table lists, cycled with `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServiceView {
+    All,
+    /// Hides units systemd does not have a unit file for (`not-found`).
+    Loaded,
+    Failed,
+}
+
+impl ServiceView {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Loaded,
+            Self::Loaded => Self::Failed,
+            Self::Failed => Self::All,
+        }
+    }
+
+    fn allows(self, service: &ServiceInfo) -> bool {
+        match self {
+            Self::All => true,
+            Self::Loaded => service.load_state != "not-found",
+            Self::Failed => service.active_state == "failed",
+        }
+    }
+}
 
 impl App {
     pub fn service_count(&self) -> usize {
@@ -43,6 +71,21 @@ impl App {
 
     pub fn service_detail_visible(&self) -> bool {
         self.overlay == Some(Overlay::ServiceDetail)
+    }
+
+    /// Status text of an active view filter.
+    pub fn service_view_label(&self) -> Option<&'static str> {
+        match self.service_view {
+            ServiceView::All => None,
+            ServiceView::Loaded => Some("loaded units"),
+            ServiceView::Failed => Some("failed units"),
+        }
+    }
+
+    pub(super) fn cycle_service_view(&mut self) -> bool {
+        self.service_view = self.service_view.next();
+        self.rebuild_service_filter();
+        true
     }
 
     pub fn service_error(&self) -> Option<&str> {
@@ -136,12 +179,13 @@ impl App {
         let previous_index = self.selected_service_index().unwrap_or(0);
         let previous_selection = self.selected_service.clone();
         let query = self.service_search_query.to_lowercase();
+        let view = self.service_view;
 
         self.filtered_services = self
             .services
             .iter()
             .enumerate()
-            .filter(|(_, service)| service_matches(service, &query))
+            .filter(|(_, service)| view.allows(service) && service_matches(service, &query))
             .map(|(index, _)| index)
             .collect();
 
@@ -257,6 +301,40 @@ fn service_matches(service: &ServiceInfo, query: &str) -> bool {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    #[test]
+    fn the_view_filter_cycles_through_loaded_and_failed_units() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Services));
+        let not_found = ServiceInfo {
+            load_state: "not-found".into(),
+            ..service("gone.service", "inactive", "Gone")
+        };
+        app.update(Action::ServicesUpdated(services(vec![
+            service("broken.service", "failed", "Broken"),
+            not_found,
+            service("sshd.service", "active", "OpenSSH"),
+        ])));
+        assert_eq!(visible_units(&app).len(), 3);
+
+        app.update(Action::CycleViewFilter);
+        assert_eq!(app.service_view_label(), Some("loaded units"));
+        assert_eq!(visible_units(&app), ["broken.service", "sshd.service"]);
+
+        app.update(Action::CycleViewFilter);
+        assert_eq!(app.service_view_label(), Some("failed units"));
+        assert_eq!(visible_units(&app), ["broken.service"]);
+
+        // The view and a search combine.
+        app.update(Action::BeginServiceSearch);
+        app.update(Action::AppendServiceSearch('x'));
+        assert!(visible_units(&app).is_empty());
+        app.update(Action::Escape);
+
+        app.update(Action::CycleViewFilter);
+        assert_eq!(app.service_view_label(), None);
+        assert_eq!(visible_units(&app).len(), 3);
+    }
 
     #[test]
     fn service_filter_is_case_insensitive_across_unit_and_description() {
