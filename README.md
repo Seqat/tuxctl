@@ -1,5 +1,10 @@
 # tuxctl
 
+[![CI](https://github.com/Seqat/tuxctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Seqat/tuxctl/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Seqat/tuxctl)](https://github.com/Seqat/tuxctl/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+
 `tuxctl` is a lightweight, responsive, Linux-native control-center TUI written in Rust with [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm).
 
 It provides real-time system monitoring, process management, systemd service inspection, journal logs, hardware information, and network interface statistics in a restrained, terminal-native interface.
@@ -7,6 +12,18 @@ It provides real-time system monitoring, process management, systemd service ins
 <p align="center">
   <img src="docs/screenshots/overview.png" alt="tuxctl Overview dashboard">
 </p>
+
+## Quick Start
+
+Static binaries for x86_64 and aarch64 Linux are attached to every [release](https://github.com/Seqat/tuxctl/releases/latest):
+
+```sh
+curl -LO https://github.com/Seqat/tuxctl/releases/latest/download/tuxctl-$(uname -m)-unknown-linux-musl.tar.gz
+tar xzf tuxctl-$(uname -m)-unknown-linux-musl.tar.gz
+./tuxctl-$(uname -m)-unknown-linux-musl/tuxctl
+```
+
+Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.2.7 --locked`. See [Installation](#installation) for checksums and other options.
 
 ## Features
 
@@ -190,19 +207,35 @@ It provides real-time system monitoring, process management, systemd service ins
 
 ## Installation
 
+### Prebuilt Binaries
+
+Each [release](https://github.com/Seqat/tuxctl/releases/latest) has statically linked (musl) binaries for `x86_64` and `aarch64`. They do not depend on the system C library, so they run on any Linux distribution. Download one, verify it against `SHA256SUMS`, and install it:
+
+```sh
+arch=$(uname -m)   # x86_64 or aarch64
+base=https://github.com/Seqat/tuxctl/releases/latest/download
+curl -LO "$base/tuxctl-$arch-unknown-linux-musl.tar.gz" -LO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf "tuxctl-$arch-unknown-linux-musl.tar.gz"
+install -Dm755 "tuxctl-$arch-unknown-linux-musl/tuxctl" ~/.local/bin/tuxctl
+```
+
+`~/.local/bin` must be on your `PATH`.
+
 ### Install from Source
 
-Clone the repository:
+Install a tagged version directly with Cargo:
+
+```sh
+cargo install --git https://github.com/Seqat/tuxctl --tag v0.2.7 --locked
+```
+
+Or from a clone of the repository:
 
 ```sh
 git clone https://github.com/Seqat/tuxctl.git
 cd tuxctl
-```
-
-Install the optimized binary through Cargo:
-
-```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 Then run:
@@ -216,18 +249,7 @@ tuxctl
 Build an optimized binary without installing it:
 
 ```sh
-cargo build --release
-```
-
-The resulting executable is located at:
-
-```text
-./target/release/tuxctl
-```
-
-Run it with:
-
-```sh
+cargo build --release --locked
 ./target/release/tuxctl
 ```
 
@@ -322,9 +344,38 @@ Repeated sort commands toggle the sort direction.
 
 ---
 
+## Performance
+
+Measured on an AMD Ryzen 5 7500F with the v0.2.7 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
+
+| Scenario | CPU | Redraws/s |
+| --- | --- | --- |
+| Overview, idle | 0.60 % | 1.2 |
+| Processes, idle | 0.65 % | 2.0 |
+| Logs, idle | 0.55 % | 0.0 |
+| Logs, 200 journal messages/s | 0.80 % | 3.9 |
+| Mouse hover at 240 Hz | 1.29 % | 13.4 |
+
+RSS is about 2.2 MiB at startup and 2.3 MiB after 15 minutes, with no growth after warm-up; the binary is 1.4 MB. Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
+
+---
+
 ## Design & Reliability
 
 `tuxctl` is designed around a small, bounded, event-driven architecture.
+
+```text
+/proc, /sys, systemctl, journalctl
+        │   background collectors
+        ▼
+bounded snapshots (latest value only)
+        │
+        ▼
+App state ◀── keyboard and mouse actions
+        │
+        ▼
+render from cached state ──▶ hit regions for the mouse
+```
 
 - Linux collection happens outside rendering.
 - Render paths consume cached state rather than performing blocking `/proc`, `/sys`, `systemctl`, or `journalctl` work.
@@ -338,8 +389,9 @@ Repeated sort commands toggle the sort direction.
 - If a collector stops delivering data, the frame title shows a `stale` marker for the affected screen instead of presenting frozen data as live.
 - Mouse hover updates are semantic and redraw-coalesced rather than rendering on every raw mouse movement.
 - Inactive screens can update cached state without forcing unnecessary redraws.
-- Terminal restoration remains owned by the main UI lifecycle.
+- Terminal restoration remains owned by the main UI lifecycle. SIGTERM, SIGHUP, and SIGINT quit through the same path as `q`, so the terminal is restored before `tuxctl` exits.
 - Process signals use pidfds and fail closed if safe delivery cannot be guaranteed.
+- Every push and pull request runs the unit tests, a pseudo-terminal smoke test of the release binary, and the redraw-rate guards on GitHub Actions.
 
 ---
 
