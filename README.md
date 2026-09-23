@@ -378,6 +378,7 @@ render from cached state ──▶ hit regions for the mouse
 ```
 
 - Linux collection happens outside rendering.
+- Process names, command lines, journal messages, and other system data are treated as untrusted: control characters and bidirectional overrides are removed before anything reaches the terminal, so escape sequences planted by other users cannot act on it.
 - Render paths consume cached state rather than performing blocking `/proc`, `/sys`, `systemctl`, or `journalctl` work.
 - Periodic system, process, service, and network snapshots use bounded newest-state semantics.
 - CPU history and log storage are bounded.

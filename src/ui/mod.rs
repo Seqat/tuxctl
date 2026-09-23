@@ -6,6 +6,7 @@ mod logs;
 mod network;
 mod overview;
 mod processes;
+mod sanitize;
 mod services;
 mod status;
 
@@ -324,7 +325,16 @@ impl UiRegions {
     }
 }
 
+/// Renders one frame from cached state and returns its mouse hit regions.
 pub fn render(frame: &mut Frame, app: &App) -> UiRegions {
+    let regions = render_frame(frame, app);
+    // Untrusted text (process names, journal messages, …) is rendered as-is
+    // above; strip control characters before the frame reaches the terminal.
+    sanitize::sanitize_buffer(frame.buffer_mut());
+    regions
+}
+
+fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     let area = frame.area();
     frame.render_widget(Clear, area);
     if area.width == 0 || area.height == 0 {
@@ -973,6 +983,118 @@ mod tests {
         }));
         app.update(Action::SelectTab(tab));
         app
+    }
+
+    /// Text controlled by other local users, with escape sequences a terminal
+    /// would act on: clipboard write (OSC 52), full reset, 8-bit CSI, bidi.
+    const HOSTILE: &str = "ev\u{1b}]52;c;cm0gLXJmIH4K\u{7}il\u{1b}c\u{9b}2J\t\r\u{202E}x";
+
+    fn hostile_app() -> App {
+        let mut app = App::default();
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: vec![crate::linux::ProcessInfo {
+                pid: 1234,
+                name: HOSTILE.into(),
+                cpu_percent: Some(5.0),
+                memory_bytes: 4096,
+                command: Some(HOSTILE.into()),
+                state: "R (running)".into(),
+                parent_pid: 1,
+                state_code: 'R',
+                start_time: 100,
+                kernel_thread: false,
+            }],
+            error: None,
+        }));
+        app.update(Action::ServicesUpdated(crate::linux::ServiceSnapshot {
+            services: vec![crate::linux::ServiceInfo {
+                unit: format!("{HOSTILE}.service"),
+                load_state: "loaded".into(),
+                active_state: "active".into(),
+                sub_state: "running".into(),
+                description: HOSTILE.into(),
+            }],
+            error: None,
+            completed_refresh_generation: 0,
+        }));
+        app.update(Action::LogsUpdated(crate::linux::JournalBatch {
+            entries: vec![crate::linux::JournalEntry {
+                id: 1,
+                timestamp_micros: Some(1_000_000),
+                local_time: None,
+                source: HOSTILE.into(),
+                priority: Some(3),
+                message: format!("{HOSTILE}\nsecond {HOSTILE}"),
+            }],
+            dropped: 0,
+            error: None,
+        }));
+        app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+            interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                name: HOSTILE.into(),
+                operstate: crate::linux::OperState::Up,
+                mac_address: Some(HOSTILE.into()),
+                mtu: Some(1500),
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: 0,
+                tx_packets: 0,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                rx_rate_bytes_per_sec: None,
+                tx_rate_bytes_per_sec: None,
+            }],
+            error: None,
+        }));
+        app
+    }
+
+    #[test]
+    fn hostile_strings_never_reach_the_terminal_buffer() {
+        let overlays: [(Tab, Option<Action>); 10] = [
+            (Tab::Overview, None),
+            (Tab::Processes, None),
+            (Tab::Processes, Some(Action::OpenProcessDetails)),
+            (
+                Tab::Processes,
+                Some(Action::RequestProcessSignal(
+                    crate::linux::ProcessSignal::Kill,
+                )),
+            ),
+            (Tab::Services, None),
+            (Tab::Services, Some(Action::OpenServiceDetails)),
+            (Tab::Logs, None),
+            (Tab::Logs, Some(Action::OpenLogDetails)),
+            (Tab::Network, None),
+            (Tab::Network, Some(Action::OpenNetworkDetails)),
+        ];
+        for (width, height) in [(120, 40), (40, 15)] {
+            for (tab, open) in overlays.clone() {
+                let mut app = hostile_app();
+                app.update(Action::SelectTab(tab));
+                if let Some(open) = open.clone() {
+                    assert!(app.update(open.clone()), "{open:?} did not open");
+                }
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                rendered_regions(&mut terminal, &app);
+
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    !sanitize::has_unsafe_symbol(buffer),
+                    "{tab:?} {open:?} at {width}x{height} leaks a control character"
+                );
+                if width == 120 && tab != Tab::Overview {
+                    assert!(
+                        buffer_text(&terminal).contains("ev"),
+                        "{tab:?} {open:?}: the hostile text was not rendered at all"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

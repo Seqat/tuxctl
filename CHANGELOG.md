@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - While typing a search on Processes, Services, or Logs, `↑`/`↓` and
   `PageUp`/`PageDown` now move through the matches. Previously they were
   ignored, so `Enter` opened whichever row happened to stay selected.
+- Processes whose name is not valid UTF-8 are listed and can be signaled.
+  Previously any user could hide a process from `tuxctl` by giving it such a
+  name.
+
+### Security
+
+- Control characters and bidirectional overrides in process names, command
+  lines, journal messages, unit descriptions, interface names, and other
+  system data are no longer sent to the terminal. Another local user could
+  otherwise embed escape sequences, for example to overwrite the clipboard
+  of whoever views the Processes or Logs screen (OSC 52) or to reset the
+  terminal. Affected cells now show `�`.
 
 ## [0.2.7] - 2026-09-23
 

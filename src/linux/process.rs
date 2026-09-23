@@ -125,7 +125,7 @@ where
     let pidfd = open_pidfd(pid).map_err(map_signal_error)?;
 
     let stat_path = proc_dir.join(identity.pid.to_string()).join("stat");
-    let stat_contents = match fs::read_to_string(&stat_path) {
+    let stat_contents = match read_stat(&stat_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(ProcessSignalError::ProcessNotFound);
@@ -413,8 +413,15 @@ struct RawProcess {
     kernel_thread: bool,
 }
 
+/// Reads `/proc/<pid>/stat`. The `comm` field is whatever bytes the process
+/// set (`prctl(PR_SET_NAME)`), not necessarily UTF-8; a strict read would drop
+/// such a process from the list and make it unsignalable.
+fn read_stat(path: &Path) -> io::Result<String> {
+    fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_process(path: &Path, expected_pid: u32, page_size: u64) -> Option<RawProcess> {
-    let contents = fs::read_to_string(path.join("stat")).ok()?;
+    let contents = read_stat(&path.join("stat")).ok()?;
     let process = parse_process_stat(&contents, page_size)?;
     if process.pid != expected_pid {
         return None;
@@ -620,6 +627,53 @@ mod tests {
             .find(|process| process.pid == pid)
             .expect("process collected")
             .command
+    }
+
+    fn write_raw_process_stat(proc_dir: &Path, pid: u32, name: &[u8], start_time: u64) {
+        let pid_dir = proc_dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        let mut stat = format!("{pid} (").into_bytes();
+        stat.extend_from_slice(name);
+        stat.extend_from_slice(
+            format!(
+                ") S 1 {pid} {pid} 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 {start_time} 1000 200"
+            )
+            .as_bytes(),
+        );
+        fs::write(pid_dir.join("stat"), stat).unwrap();
+    }
+
+    #[test]
+    fn processes_with_non_utf8_names_are_listed_and_signalable() {
+        let proc_dir = temp_proc_dir("non_utf8_comm");
+        let _cleanup = TempDir(proc_dir.clone());
+        // Any user can set such a name with prctl(PR_SET_NAME).
+        write_raw_process_stat(&proc_dir, 31, b"hid\xffden)\xc3", 700);
+        write_process_stat(&proc_dir, 32, "visible", 701);
+
+        let snapshot = ProcessSampler::default().collect_at(&proc_dir);
+        let hidden = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid == 31)
+            .expect("a non-UTF-8 name must not hide the process");
+        assert_eq!(hidden.name, "hid\u{fffd}den)\u{fffd}");
+        assert_eq!(hidden.start_time, 700);
+        assert_eq!(snapshot.summary().total, 2);
+
+        let mut sent = None;
+        let result = verify_and_send_signal_at(
+            &proc_dir,
+            hidden.identity(),
+            ProcessSignal::Term,
+            Ok,
+            |pid, signal| {
+                sent = Some((*pid, signal));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(sent, Some((31, libc::SIGTERM)));
     }
 
     #[test]
