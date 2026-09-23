@@ -44,6 +44,18 @@ pub struct Temperature {
     pub crit: Option<i16>,
 }
 
+impl Temperature {
+    /// True when the driver provides a limit and the value reaches it.
+    pub fn at_limit(&self) -> bool {
+        self.celsius.is_some_and(|celsius| {
+            [self.max, self.crit]
+                .into_iter()
+                .flatten()
+                .any(|limit| celsius >= limit)
+        })
+    }
+}
+
 /// Reads NVIDIA GPU temperatures (NVML). A seam so the sampler's decisions
 /// can be tested without the library or the hardware.
 pub(super) trait NvidiaSource {
@@ -1474,5 +1486,20 @@ mod tests {
         };
         let mut sampler = TemperatureSampler::new(tree.roots(), Some(implausible), Instant::now());
         assert_eq!(values(&mut sampler), [(device_key(&gpu), None)]);
+    }
+
+    #[test]
+    fn at_limit_needs_a_driver_limit() {
+        let temperature = |celsius, max, crit| Temperature {
+            key: TemperatureKey::CpuPackage(0),
+            celsius,
+            max,
+            crit,
+        };
+        assert!(!temperature(Some(99), None, None).at_limit());
+        assert!(!temperature(Some(79), Some(80), None).at_limit());
+        assert!(temperature(Some(80), Some(80), None).at_limit());
+        assert!(temperature(Some(90), None, Some(90)).at_limit());
+        assert!(!temperature(None, Some(80), Some(90)).at_limit());
     }
 }

@@ -833,6 +833,8 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
+    use std::path::Path;
+
     use super::*;
     use crate::action::Action;
     use crate::linux::{
@@ -1411,6 +1413,39 @@ mod tests {
         assert!(regions.interval_buttons.is_empty());
     }
 
+    /// One of each kind: a CPU package, a GPU at its limit, an asleep disk
+    /// sensor (`–`) and a NIC.
+    fn sweep_temperatures() -> Vec<crate::linux::Temperature> {
+        use crate::linux::{Temperature, TemperatureKey};
+        let device = |path: &str| TemperatureKey::Device(Path::new(path).into());
+        vec![
+            Temperature {
+                key: TemperatureKey::CpuPackage(0),
+                celsius: Some(54),
+                max: None,
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/gpu"),
+                celsius: Some(100),
+                max: Some(95),
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/disk"),
+                celsius: None,
+                max: Some(80),
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/nic"),
+                celsius: Some(47),
+                max: None,
+                crit: None,
+            },
+        ]
+    }
+
     fn overview_sweep_app(cpu_count: u32) -> App {
         let mut app = App::default();
         app.update(Action::SystemMetricsUpdated(SystemMetrics {
@@ -1429,6 +1464,7 @@ mod tests {
                 used: 50 << 30,
                 total: 100 << 30,
             }),
+            temperatures: sweep_temperatures(),
             ..SystemMetrics::default()
         }));
         let module = crate::linux::MemoryModule {
@@ -1450,19 +1486,19 @@ mod tests {
                     model: "Test Graphics".into(),
                     kind: None,
                     vram_bytes: None,
-                    device_path: None,
+                    device_path: Some(Path::new("/sys/devices/gpu").into()),
                 }],
                 storage_devices: vec![crate::linux::StorageDevice {
                     system_name: "nvme0n1".into(),
                     kind: crate::linux::StorageKind::Nvme,
                     model: Some("Test Disk".into()),
                     capacity_bytes: Some(1_000_000_000_000),
-                    device_path: None,
+                    device_path: Some(Path::new("/sys/devices/disk").into()),
                 }],
                 network_devices: vec![crate::linux::NetworkDevice {
                     interface_name: "eth0".into(),
                     model: None,
-                    device_path: None,
+                    device_path: Some(Path::new("/sys/devices/nic").into()),
                 }],
             },
         ));
@@ -1585,6 +1621,63 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_shows_component_temperatures() {
+        let app = overview_sweep_app(12);
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        let rows = hardware_panel_rows(&terminal);
+        let row = |text: &str| {
+            rows.iter()
+                .find(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {rows:#?}"))
+                .clone()
+        };
+
+        assert!(row("Test Processor").contains("Test Processor  54°C"));
+        assert!(row("Test Graphics").contains("Test Graphics  100°C"));
+        assert!(row("Test Disk").contains("1 TB  –"), "{}", row("Test Disk"));
+        assert!(row("eth0").contains("47°C"));
+
+        // The GPU is at its driver limit; nothing else is highlighted.
+        let buffer = terminal.backend().buffer();
+        let style_of = |text: &str| {
+            let (y, line) = buffer
+                .content()
+                .chunks(160)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .enumerate()
+                .find(|(_, line)| line.contains(text))
+                .unwrap();
+            let x = line[..line.find(text).unwrap()].chars().count();
+            buffer[(x as u16, y as u16)].fg
+        };
+        assert_eq!(style_of("100°C"), theme::WARNING);
+        assert_ne!(style_of("54°C"), theme::WARNING);
+    }
+
+    #[test]
+    fn hardware_panel_with_temperatures_survives_tiny_areas() {
+        let app = overview_sweep_app(12);
+        for width in 0..=60 {
+            for height in 0..=40 {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width.max(1), height.max(1))).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = Rect::new(
+                            0,
+                            0,
+                            width.min(frame.area().width),
+                            height.min(frame.area().height),
+                        );
+                        hardware::render(frame, &app, area);
+                    })
+                    .unwrap();
             }
         }
     }

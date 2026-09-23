@@ -7,11 +7,11 @@ use ratatui::{
 
 use crate::{
     app::{is_overview_interface, is_physical_interface, App},
-    linux::{HardwareInventory, NetworkInterfaceInfo, OperState},
+    linux::{HardwareInventory, NetworkInterfaceInfo, OperState, Temperature},
 };
 
 use super::{
-    hardware::{section_heading, trend_line},
+    hardware::{device_temperature, section_heading, temperature_span, trend_line},
     layout, network,
 };
 
@@ -59,14 +59,17 @@ pub(super) fn render(
             .min(MAX_NETWORK_INTERFACES)
             .min(remaining.saturating_sub(usize::from(show_overflow)));
         lines.extend(interfaces.iter().take(interface_limit).map(|interface| {
-            let model = inventory.and_then(|inventory| {
+            let device = inventory.and_then(|inventory| {
                 inventory
                     .network_devices
                     .iter()
                     .find(|device| device.interface_name == interface.name)
-                    .and_then(|device| device.model.as_deref())
             });
-            network_summary_line(interface, model, width)
+            let model = device.and_then(|device| device.model.as_deref());
+            let temperature = device.and_then(|device| {
+                device_temperature(app.system_metrics(), device.device_path.as_ref())
+            });
+            network_summary_line(interface, model, temperature, width)
         }));
         if show_overflow {
             lines.push(Line::from(format!(
@@ -107,22 +110,31 @@ fn overview_network_interfaces<'a>(
 fn network_summary_line(
     interface: &NetworkInterfaceInfo,
     model: Option<&str>,
+    temperature: Option<&Temperature>,
     width: usize,
 ) -> Line<'static> {
-    let (prefix, state, suffix) = network_summary_parts(interface, model, width);
+    let (prefix, state, suffix, temperature) =
+        network_summary_parts(interface, model, temperature, width);
     let (_, state_style) = network::state_display(interface.operstate);
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(prefix),
         Span::styled(state, state_style),
         Span::raw(suffix),
-    ])
+    ];
+    if let Some(temperature) = temperature {
+        spans.extend([Span::raw("  "), temperature]);
+    }
+    Line::from(spans)
 }
 
+/// Name, state, traffic and temperature, fitted in that order of priority;
+/// the model takes whatever room is left.
 fn network_summary_parts(
     interface: &NetworkInterfaceInfo,
     model: Option<&str>,
+    temperature: Option<&Temperature>,
     width: usize,
-) -> (String, String, String) {
+) -> (String, String, String, Option<Span<'static>>) {
     let (state_text, _) = network::state_display(interface.operstate);
     let state = layout::truncate(state_text, width);
     let separator_width = usize::from(width > state.chars().count()) * 2;
@@ -156,9 +168,16 @@ fn network_summary_parts(
         }
     });
     let suffix = traffic.unwrap_or_default();
+    let occupied = prefix.chars().count() + state.chars().count() + suffix.chars().count();
+    let temperature = temperature
+        .map(temperature_span)
+        .filter(|span| occupied + 2 + span.content.chars().count() <= width);
+    let occupied = occupied
+        + temperature
+            .as_ref()
+            .map_or(0, |span| 2 + span.content.chars().count());
 
     if let Some(model) = model {
-        let occupied = prefix.chars().count() + state.chars().count() + suffix.chars().count();
         let model_width = width.saturating_sub(occupied + 2);
         if model_width >= 4 {
             prefix.push_str(&layout::truncate(model, model_width));
@@ -166,7 +185,7 @@ fn network_summary_parts(
         }
     }
 
-    (prefix, state, suffix)
+    (prefix, state, suffix, temperature)
 }
 
 fn network_traffic(interface: &NetworkInterfaceInfo) -> Option<(String, String)> {
@@ -243,20 +262,20 @@ mod tests {
     #[test]
     fn network_summary_handles_models_rates_and_down_interfaces() {
         let up = test_interface("enp8s0", OperState::Up);
-        let with_model = network_summary_parts(&up, Some("Realtek RTL8125 2.5GbE"), 100);
+        let with_model = network_summary_parts(&up, Some("Realtek RTL8125 2.5GbE"), None, 100);
         let with_model = format!("{}{}{}", with_model.0, with_model.1, with_model.2);
         assert!(with_model.contains("enp8s0  Realtek RTL8125 2.5GbE  ● up"));
         assert!(with_model.contains("RX 1.2 MiB/s"));
         assert!(with_model.contains("TX 84.2 KiB/s"));
 
-        let without_model = network_summary_parts(&up, None, 100);
+        let without_model = network_summary_parts(&up, None, None, 100);
         let without_model = format!("{}{}{}", without_model.0, without_model.1, without_model.2);
         assert!(without_model.starts_with("enp8s0  ● up"));
 
         let mut down = test_interface("wlp5s0", OperState::Down);
         down.rx_rate_bytes_per_sec = Some(0.0);
         down.tx_rate_bytes_per_sec = None;
-        let down = network_summary_parts(&down, Some("Intel Wi-Fi 6E AX210"), 80);
+        let down = network_summary_parts(&down, Some("Intel Wi-Fi 6E AX210"), None, 80);
         let down = format!("{}{}{}", down.0, down.1, down.2);
         assert!(down.contains("○ down"));
         assert!(!down.contains("RX"));
@@ -269,6 +288,7 @@ mod tests {
         let parts = network_summary_parts(
             &interface,
             Some("A deliberately very long network adapter model description"),
+            None,
             60,
         );
         let text = format!("{}{}{}", parts.0, parts.1, parts.2);
@@ -309,7 +329,7 @@ mod tests {
     #[test]
     fn narrow_network_summary_keeps_status_and_compact_rates() {
         let interface = test_interface("enp8s0", OperState::Up);
-        let parts = network_summary_parts(&interface, Some("Realtek RTL8125 2.5GbE"), 36);
+        let parts = network_summary_parts(&interface, Some("Realtek RTL8125 2.5GbE"), None, 36);
         let text = format!("{}{}{}", parts.0, parts.1, parts.2);
 
         assert!(text.chars().count() <= 36);
@@ -317,6 +337,63 @@ mod tests {
         assert!(text.contains("● up"));
         assert!(text.contains("R1.2M/s"));
         assert!(text.contains("T84K/s"));
+    }
+
+    fn summary_text(width: usize, temperature: Option<&Temperature>) -> String {
+        let interface = test_interface("enp6s0", OperState::Up);
+        network_summary_line(
+            &interface,
+            Some("Realtek RTL8125 2.5GbE"),
+            temperature,
+            width,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+    }
+
+    #[test]
+    fn nic_temperature_follows_the_traffic_and_outlasts_the_model() {
+        let temperature = Temperature {
+            key: crate::linux::TemperatureKey::CpuPackage(0),
+            celsius: Some(47),
+            max: Some(120),
+            crit: None,
+        };
+        let wide = summary_text(100, Some(&temperature));
+        assert!(
+            wide.starts_with("enp6s0  Realtek RTL8125 2.5GbE  ● up  RX"),
+            "{wide}"
+        );
+        assert!(wide.ends_with("TX 84.2 KiB/s  47°C"), "{wide}");
+
+        for width in 0..100 {
+            let text = summary_text(width, Some(&temperature));
+            assert!(text.chars().count() <= width.max(4), "{width}: {text}");
+            if text.contains("Realtek") {
+                assert!(
+                    text.contains("47°C"),
+                    "the model goes first: {width}: {text}"
+                );
+            }
+            // The temperature never displaces traffic that fits without it.
+            let traffic = |text: &str| text.contains("1.2");
+            assert_eq!(
+                traffic(&text),
+                traffic(&summary_text(width, None)),
+                "{width}: {text}"
+            );
+        }
+        assert_eq!(summary_text(100, None), {
+            let parts = network_summary_parts(
+                &test_interface("enp6s0", OperState::Up),
+                Some("Realtek RTL8125 2.5GbE"),
+                None,
+                100,
+            );
+            format!("{}{}{}", parts.0, parts.1, parts.2)
+        });
     }
 
     #[test]

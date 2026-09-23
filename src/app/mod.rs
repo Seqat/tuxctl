@@ -1341,6 +1341,37 @@ mod tests {
     }
 
     #[test]
+    fn temperature_changes_redraw_only_the_overview() {
+        use crate::linux::{Temperature, TemperatureKey};
+        let with_temperature = |celsius| SystemMetrics {
+            cpu_percent: Some(10.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
+            temperatures: vec![Temperature {
+                key: TemperatureKey::CpuPackage(0),
+                celsius: Some(celsius),
+                max: None,
+                crit: None,
+            }],
+            ..SystemMetrics::default()
+        };
+        let mut app = App::default();
+        app.update(Action::SystemMetricsUpdated(with_temperature(50)));
+
+        // Hidden Overview: the new value is cached without a redraw.
+        for tab in [Tab::Processes, Tab::Services, Tab::Logs, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            let celsius = 51 + tab as i16;
+            assert!(
+                !app.update(Action::SystemMetricsUpdated(with_temperature(celsius))),
+                "{tab:?}"
+            );
+            assert_eq!(app.system_metrics().temperatures[0].celsius, Some(celsius));
+        }
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(app.update(Action::SystemMetricsUpdated(with_temperature(60))));
+    }
+
+    #[test]
     fn overview_collector_health_transitions_redraw_only_while_visible() {
         let mut app = App::default();
         let process_snapshot = processes(vec![process(1, "init")]);

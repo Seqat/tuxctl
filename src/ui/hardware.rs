@@ -1,14 +1,19 @@
+use std::{path::Path, sync::Arc};
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::{
     app::App,
-    linux::{GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics},
+    linux::{
+        GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics,
+        Temperature, TemperatureKey,
+    },
 };
 
 use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network, theme};
@@ -17,6 +22,9 @@ const MAX_RAM_GAUGE_WIDTH: usize = 36;
 const MAX_STORAGE_ROWS: u16 = 4;
 /// A section heading plus one value row; anything less is not drawn.
 const LOWER_SECTION_MIN_HEIGHT: u16 = 2;
+/// A temperature after a row's text is dropped rather than leave the text
+/// fewer columns than this.
+const MIN_TEXT_BEFORE_TEMPERATURE: usize = 8;
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
@@ -68,7 +76,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
     render_ram(frame, app, inventory, metrics, areas[1]);
-    render_gpu(frame, inventory, areas[2]);
+    render_gpu(frame, inventory, metrics, areas[2]);
     render_storage(frame, inventory, metrics, areas[3]);
     hardware_network_summary::render(frame, app, inventory, areas[4]);
 }
@@ -242,7 +250,12 @@ pub(super) fn usage_bar_line(label: &str, usage: crate::linux::ByteUsage, width:
     )
 }
 
-fn render_gpu(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Rect) {
+fn render_gpu(
+    frame: &mut Frame,
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    area: Rect,
+) {
     if area.height == 0 {
         return;
     }
@@ -268,10 +281,12 @@ fn render_gpu(frame: &mut Frame, inventory: Option<&HardwareInventory>, area: Re
                         .vram_bytes
                         .map(|bytes| format!("  {} VRAM", format_binary_capacity(bytes)))
                         .unwrap_or_default();
-                    Line::from(layout::truncate(
+                    let temperature = device_temperature(metrics, gpu.device_path.as_ref());
+                    line_with_temperatures(
                         &format!("{}{}{}", gpu.model, kind, vram),
+                        temperature.map(|temperature| vec![temperature_span(temperature)]),
                         width,
-                    ))
+                    )
                 }));
                 if show_overflow {
                     lines.push(Line::from(format!(
@@ -315,13 +330,14 @@ fn render_storage(
                         let (label, count_index) = storage_label(device.kind);
                         let index = counts[count_index];
                         counts[count_index] += 1;
-                        (
-                            format_storage_device(label, index, device),
-                            disk_rates(metrics, &device.system_name),
-                        )
+                        StorageRow {
+                            description: format_storage_device(label, index, device),
+                            rates: disk_rates(metrics, &device.system_name),
+                            temperature: device_temperature(metrics, device.device_path.as_ref()),
+                        }
                     })
                     .collect();
-                lines.extend(storage_lines(&rows, width).into_iter().map(Line::from));
+                lines.extend(storage_lines(&rows, width));
                 if show_overflow {
                     lines.push(Line::from(format!(
                         "… {} more devices",
@@ -332,6 +348,67 @@ fn render_storage(
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The temperature of the device at `path`, when a sensor belongs to it.
+pub(super) fn device_temperature<'a>(
+    metrics: &'a SystemMetrics,
+    path: Option<&Arc<Path>>,
+) -> Option<&'a Temperature> {
+    let path = path?;
+    metrics
+        .temperatures
+        .iter()
+        .find(|temperature| matches!(&temperature.key, TemperatureKey::Device(key) if key == path))
+}
+
+/// `45°C`, or `–` while a known sensor has no value (a suspended GPU).
+pub(super) fn temperature_text(temperature: &Temperature) -> String {
+    temperature
+        .celsius
+        .map_or_else(|| "–".into(), |celsius| format!("{celsius}°C"))
+}
+
+/// Highlighted only when the driver reports a limit and the value reaches it.
+pub(super) fn temperature_style(temperature: &Temperature) -> Style {
+    if temperature.at_limit() {
+        Style::default().fg(theme::WARNING)
+    } else {
+        Style::default()
+    }
+}
+
+pub(super) fn temperature_span(temperature: &Temperature) -> Span<'static> {
+    Span::styled(
+        temperature_text(temperature),
+        temperature_style(temperature),
+    )
+}
+
+/// `text  <temperatures>`: the text is truncated first; the temperatures are
+/// dropped when the text would keep fewer than
+/// [`MIN_TEXT_BEFORE_TEMPERATURE`] columns.
+pub(super) fn line_with_temperatures(
+    text: &str,
+    temperatures: Option<Vec<Span<'static>>>,
+    width: usize,
+) -> Line<'static> {
+    let Some(temperatures) = temperatures.filter(|spans| !spans.is_empty()) else {
+        return Line::from(layout::truncate(text, width));
+    };
+    let suffix_width = 2 + temperatures
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let Some(room) = width
+        .checked_sub(suffix_width)
+        .filter(|room| *room >= MIN_TEXT_BEFORE_TEMPERATURE.min(text.chars().count()))
+    else {
+        return Line::from(layout::truncate(text, width));
+    };
+    let mut spans = vec![Span::raw(format!("{}  ", layout::truncate(text, room)))];
+    spans.extend(temperatures);
+    Line::from(spans)
 }
 
 pub(super) fn section_heading(label: &'static str) -> Line<'static> {
@@ -411,24 +488,29 @@ fn disk_rates(metrics: &SystemMetrics, name: &str) -> Option<(Option<f64>, Optio
 
 type DiskRates = Option<(Option<f64>, Option<f64>)>;
 
-/// Storage rows with their rates in a column right after the longest
-/// description, so the numbers stay next to the device they belong to on a
-/// wide panel. When the panel is narrow the models are truncated first, then
-/// the rates switch to a tight form, and they are left out when not even the
-/// device labels would remain.
-fn storage_lines(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
+/// A storage row before layout.
+struct StorageRow<'a> {
+    description: String,
+    rates: DiskRates,
+    temperature: Option<&'a Temperature>,
+}
+
+/// Storage rows: the description, a temperature column and the rates, each
+/// column right after the longest entry of the one before, so the numbers
+/// stay next to the device they belong to on a wide panel. As the panel
+/// narrows, the models are truncated first, then the rates switch to a tight
+/// form, then they are left out; the temperatures go last, when not even the
+/// device labels would remain beside them.
+fn storage_lines(rows: &[StorageRow], width: usize) -> Vec<Line<'static>> {
     let plain = || {
         rows.iter()
-            .map(|(description, _)| layout::truncate(description, width))
+            .map(|row| Line::from(layout::truncate(&row.description, width)))
             .collect()
     };
-    if rows.iter().all(|(_, rates)| rates.is_none()) {
-        return plain();
-    }
     let label_width = rows
         .iter()
-        .map(|(description, _)| {
-            description
+        .map(|row| {
+            row.description
                 .split("  ")
                 .next()
                 .unwrap_or_default()
@@ -439,17 +521,35 @@ fn storage_lines(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
         .unwrap_or(0);
     let description_width = rows
         .iter()
-        .map(|(description, _)| description.chars().count())
+        .map(|row| row.description.chars().count())
         .max()
         .unwrap_or(0);
+    let temperatures: Vec<Option<Span<'static>>> = rows
+        .iter()
+        .map(|row| row.temperature.map(temperature_span))
+        .collect();
+    let temperature_width = temperatures
+        .iter()
+        .flatten()
+        .map(|span| span.content.chars().count())
+        .max();
+    let temperature_column = temperature_width.map_or(0, |width| 2 + width);
+    let has_rates = rows.iter().any(|row| row.rates.is_some());
 
     type Format = fn(Option<f64>) -> String;
     let full: (Format, &str, &str) = (network::format_rate, "  R ", "  W ");
     let tight: (Format, &str, &str) = (hardware_network_summary::format_rate_tight, "  R", " W");
-    for (format, read_prefix, write_prefix) in [full, tight] {
+    // The rate forms, widest first; `None` leaves the rates out.
+    for form in [Some(full), Some(tight), None] {
+        if (form.is_some() && !has_rates) || (form.is_none() && temperature_width.is_none()) {
+            continue;
+        }
         let texts: Vec<Option<(String, String)>> = rows
             .iter()
-            .map(|(_, rates)| rates.map(|(read, write)| (format(read), format(write))))
+            .map(|row| {
+                let (format, ..) = form?;
+                row.rates.map(|(read, write)| (format(read), format(write)))
+            })
             .collect();
         let widest = |text: fn(&(String, String)) -> &String| {
             texts
@@ -460,24 +560,47 @@ fn storage_lines(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
                 .unwrap_or(0)
         };
         let read_column = widest(|(read, _)| read);
-        let rates_width =
-            read_prefix.len() + read_column + write_prefix.len() + widest(|(_, write)| write);
-        let Some(room) = width.checked_sub(rates_width) else {
+        let (read_prefix, write_prefix) = form.map_or(("", ""), |(_, read, write)| (read, write));
+        let rates_width = form.map_or(0, |_| {
+            read_prefix.len() + read_column + write_prefix.len() + widest(|(_, write)| write)
+        });
+        let Some(room) = width.checked_sub(rates_width + temperature_column) else {
             continue;
         };
-        if room < label_width {
+        // Truncating a longer description takes a column for `…`; the
+        // labels themselves must stay whole.
+        if room < label_width + usize::from(description_width > label_width) {
             continue;
         }
         let column = description_width.min(room);
         return rows
             .iter()
             .zip(texts)
-            .map(|((description, _), rates)| match rates {
-                Some((read, write)) => format!(
-                    "{:<column$}{read_prefix}{read:<read_column$}{write_prefix}{write}",
-                    layout::truncate(description, column),
-                ),
-                None => layout::truncate(description, width),
+            .zip(&temperatures)
+            .map(|((row, rates), temperature)| {
+                if rates.is_none() && temperature.is_none() {
+                    return Line::from(layout::truncate(&row.description, width));
+                }
+                let mut spans = vec![Span::raw(format!(
+                    "{:<column$}",
+                    layout::truncate(&row.description, column)
+                ))];
+                if let Some(temperature_width) = temperature_width {
+                    let shown = temperature
+                        .as_ref()
+                        .map_or(0, |span| span.content.chars().count());
+                    spans.push(Span::raw("  "));
+                    spans.extend(temperature.clone());
+                    if rates.is_some() {
+                        spans.push(Span::raw(" ".repeat(temperature_width - shown)));
+                    }
+                }
+                if let Some((read, write)) = rates {
+                    spans.push(Span::raw(format!(
+                        "{read_prefix}{read:<read_column$}{write_prefix}{write}"
+                    )));
+                }
+                Line::from(spans)
             })
             .collect();
     }
@@ -588,6 +711,26 @@ mod tests {
 
     const MIB: f64 = 1024.0 * 1024.0;
 
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Storage rows without temperatures, laid out as plain text.
+    fn storage_text(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
+        let rows: Vec<StorageRow> = rows
+            .iter()
+            .map(|(description, rates)| StorageRow {
+                description: description.clone(),
+                rates: *rates,
+                temperature: None,
+            })
+            .collect();
+        storage_lines(&rows, width).iter().map(line_text).collect()
+    }
+
     fn two_disks() -> Vec<(String, DiskRates)> {
         vec![
             (
@@ -603,7 +746,7 @@ mod tests {
 
     #[test]
     fn storage_rates_follow_the_longest_description_on_a_wide_panel() {
-        let lines = storage_lines(&two_disks(), 120);
+        let lines = storage_text(&two_disks(), 120);
 
         assert_eq!(
             lines,
@@ -619,7 +762,7 @@ mod tests {
     fn narrow_storage_rows_truncate_models_then_tighten_then_drop_rates() {
         let rows = two_disks();
 
-        let medium = storage_lines(&rows, 50);
+        let medium = storage_text(&rows, 50);
         assert!(
             medium.iter().all(|line| line.chars().count() <= 50),
             "{medium:?}"
@@ -629,7 +772,7 @@ mod tests {
         let w = |line: &str| line.find("  W ").unwrap();
         assert_eq!(w(&medium[0]), w(&medium[1]), "W stays aligned");
 
-        let narrow = storage_lines(&rows, 24);
+        let narrow = storage_text(&rows, 24);
         assert!(
             narrow.iter().all(|line| line.chars().count() <= 24),
             "{narrow:?}"
@@ -637,7 +780,7 @@ mod tests {
         assert!(narrow[0].starts_with("NVMe0"), "{narrow:?}");
         assert!(narrow[0].ends_with("  R12M/s W0B/s"), "{narrow:?}");
 
-        let tiny = storage_lines(&rows, 8);
+        let tiny = storage_text(&rows, 8);
         assert_eq!(tiny[0], layout::truncate(&rows[0].0, 8), "rates dropped");
     }
 
@@ -655,11 +798,134 @@ mod tests {
         assert_eq!(disk_rates(&metrics, "sda"), Some((Some(1024.0), None)));
         assert_eq!(disk_rates(&metrics, "nvme0n1"), Some((None, None)));
         let missing = [("SATA0  disk".to_owned(), disk_rates(&metrics, "nvme0n1"))];
-        assert_eq!(storage_lines(&missing, 40), ["SATA0  disk  R --  W --"]);
+        assert_eq!(storage_text(&missing, 40), ["SATA0  disk  R --  W --"]);
 
         metrics.disks.clear();
         let hidden = [("SATA0  disk".to_owned(), disk_rates(&metrics, "sda"))];
-        assert_eq!(storage_lines(&hidden, 40), ["SATA0  disk"]);
+        assert_eq!(storage_text(&hidden, 40), ["SATA0  disk"]);
+    }
+
+    fn temperature(celsius: Option<i16>, max: Option<i16>) -> Temperature {
+        Temperature {
+            key: TemperatureKey::CpuPackage(0),
+            celsius,
+            max,
+            crit: None,
+        }
+    }
+
+    #[test]
+    fn storage_temperatures_form_a_column_before_the_rates() {
+        let hot = temperature(Some(45), None);
+        let rows = [
+            StorageRow {
+                description: "NVMe0  WD Blue SN5100 1TB  1.0 TB".into(),
+                rates: Some((Some(12.3 * MIB), Some(0.0))),
+                temperature: Some(&hot),
+            },
+            StorageRow {
+                description: "SATA0  Samsung SSD 870  2.0 TB".into(),
+                rates: Some((Some(0.0), Some(512.0 * 1024.0))),
+                temperature: None,
+            },
+        ];
+
+        let wide: Vec<String> = storage_lines(&rows, 120).iter().map(line_text).collect();
+        assert_eq!(
+            wide,
+            [
+                "NVMe0  WD Blue SN5100 1TB  1.0 TB  45°C  R 12.3 MiB/s  W 0 B/s",
+                "SATA0  Samsung SSD 870  2.0 TB           R 0 B/s       W 512.0 KiB/s",
+            ],
+            "a disk without a sensor leaves the column blank"
+        );
+
+        // Narrowing: models truncate, rates tighten, rates go, then the temperature.
+        let mut stage = 0;
+        for width in (0..=120).rev() {
+            let lines: Vec<String> = storage_lines(&rows, width).iter().map(line_text).collect();
+            assert!(
+                lines.iter().all(|line| line.chars().count() <= width),
+                "{width}: {lines:?}"
+            );
+            let current = if lines[0].contains("  R 12.3") {
+                0
+            } else if lines[0].contains("  R12M/s") {
+                1
+            } else if lines[0].contains("45°C") {
+                2
+            } else {
+                3
+            };
+            assert!(
+                current >= stage,
+                "{width}: stage {current} after {stage}: {lines:?}"
+            );
+            stage = current;
+            if current <= 2 {
+                assert!(lines[0].contains("45°C"), "{width}: {lines:?}");
+                assert!(lines[0].starts_with("NVMe0"), "{width}: {lines:?}");
+            }
+        }
+        assert_eq!(stage, 3, "the temperature is dropped last");
+
+        let rates_gone: Vec<String> = storage_lines(&rows, 16).iter().map(line_text).collect();
+        assert_eq!(rates_gone[0], "NVMe0  WD…  45°C");
+        assert_eq!(
+            rates_gone[1],
+            "SATA0  Samsung SSD 870  2.0 TB"
+                .chars()
+                .take(15)
+                .collect::<String>()
+                + "…"
+        );
+    }
+
+    #[test]
+    fn storage_temperatures_without_disk_statistics_and_unavailable_sensors() {
+        let asleep = temperature(None, None);
+        let rows = [StorageRow {
+            description: "NVMe0  disk".into(),
+            rates: None,
+            temperature: Some(&asleep),
+        }];
+        let lines: Vec<String> = storage_lines(&rows, 40).iter().map(line_text).collect();
+        assert_eq!(lines, ["NVMe0  disk  –"]);
+    }
+
+    #[test]
+    fn temperatures_are_highlighted_only_at_a_driver_limit() {
+        assert_eq!(
+            temperature_style(&temperature(Some(99), None)),
+            Style::default()
+        );
+        assert_eq!(
+            temperature_style(&temperature(Some(79), Some(80))),
+            Style::default()
+        );
+        assert_eq!(
+            temperature_style(&temperature(Some(80), Some(80))),
+            Style::default().fg(theme::WARNING)
+        );
+        assert_eq!(temperature_text(&temperature(Some(-5), None)), "-5°C");
+        assert_eq!(temperature_text(&temperature(None, None)), "–");
+    }
+
+    #[test]
+    fn row_temperatures_outlast_the_text_until_it_would_be_too_short() {
+        let spans = || Some(vec![temperature_span(&temperature(Some(52), None))]);
+        let model = "NVIDIA GeForce RTX 4070  dGPU  12 GiB VRAM";
+        assert_eq!(
+            line_text(&line_with_temperatures(model, spans(), 80)),
+            format!("{model}  52°C")
+        );
+        let narrow = line_text(&line_with_temperatures(model, spans(), 20));
+        assert_eq!(narrow, "NVIDIA GeForc…  52°C");
+        // Fewer than 8 columns would remain for the model: the temperature goes.
+        let tiny = line_text(&line_with_temperatures(model, spans(), 13));
+        assert_eq!(tiny, layout::truncate(model, 13));
+        assert_eq!(line_text(&line_with_temperatures(model, None, 13)), tiny);
+        assert_eq!(line_text(&line_with_temperatures(model, spans(), 0)), "");
     }
 
     #[test]

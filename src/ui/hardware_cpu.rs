@@ -1,12 +1,17 @@
-use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
+use ratatui::{
+    layout::Rect,
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+};
 
 use crate::{
     app::{App, MetricHistory},
-    linux::{HardwareInventory, LogicalCpuMetrics, SystemMetrics},
+    linux::{HardwareInventory, LogicalCpuMetrics, SystemMetrics, TemperatureKey},
 };
 
 use super::{
-    hardware::{section_heading, utilization_bar},
+    hardware::{line_with_temperatures, section_heading, temperature_span, utilization_bar},
     layout,
 };
 
@@ -113,7 +118,11 @@ pub(super) fn render(
                 .map(|cpu| cpu.model.as_str())
                 .unwrap_or("Unavailable / none detected"),
         };
-        lines.push(Line::from(layout::truncate(model, width)));
+        lines.push(line_with_temperatures(
+            model,
+            package_temperatures(metrics),
+            width,
+        ));
     }
     if spacing >= 1 && lines.len() < height {
         lines.push(Line::from(""));
@@ -155,6 +164,37 @@ pub(super) fn render(
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `54°C` for one package, `P0 54°C  P1 56°C` for several; `None` without
+/// a CPU sensor.
+fn package_temperatures(metrics: &SystemMetrics) -> Option<Vec<Span<'static>>> {
+    let mut packages: Vec<_> = metrics
+        .temperatures
+        .iter()
+        .filter_map(|temperature| match temperature.key {
+            TemperatureKey::CpuPackage(package) => Some((package, temperature)),
+            TemperatureKey::Device(_) => None,
+        })
+        .collect();
+    packages.sort_by_key(|(package, _)| *package);
+    match packages.as_slice() {
+        [] => None,
+        [(_, temperature)] => Some(vec![temperature_span(temperature)]),
+        _ => Some(
+            packages
+                .iter()
+                .enumerate()
+                .flat_map(|(index, (package, temperature))| {
+                    let separator = if index == 0 { "" } else { "  " };
+                    [
+                        Span::raw(format!("{separator}P{package} ")),
+                        temperature_span(temperature),
+                    ]
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn cpu_grid_layout(count: usize, max_cpu_id: u32, width: usize, max_rows: usize) -> CpuGridLayout {
@@ -626,6 +666,60 @@ mod tests {
         assert!(cells[0].contains("  1%"));
         assert!(cells[1].contains(" 10%"));
         assert!(cells[2].contains("100%"));
+    }
+
+    fn model_line(temperatures: Vec<crate::linux::Temperature>, width: u16) -> String {
+        let app = App::default();
+        let inventory = crate::linux::HardwareInventory {
+            cpus: vec![crate::linux::CpuPackage {
+                physical_id: Some(0),
+                model: "AMD Ryzen 9 7950X 16-Core Processor".into(),
+            }],
+            ..crate::linux::HardwareInventory::default()
+        };
+        let metrics = SystemMetrics {
+            temperatures,
+            ..SystemMetrics::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, Some(&inventory), &metrics, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>()
+    }
+
+    fn package(id: u32, celsius: i16) -> crate::linux::Temperature {
+        crate::linux::Temperature {
+            key: TemperatureKey::CpuPackage(id),
+            celsius: Some(celsius),
+            max: None,
+            crit: None,
+        }
+    }
+
+    #[test]
+    fn cpu_model_line_shows_package_temperatures() {
+        assert_eq!(
+            model_line(vec![package(0, 54)], 60).trim_end(),
+            "AMD Ryzen 9 7950X 16-Core Processor  54°C"
+        );
+        assert_eq!(
+            model_line(vec![package(1, 56), package(0, 54)], 60).trim_end(),
+            "AMD Ryzen 9 7950X 16-Core Processor  P0 54°C  P1 56°C"
+        );
+        assert_eq!(
+            model_line(vec![package(0, 54)], 24).trim_end(),
+            "AMD Ryzen 9 7950X…  54°C",
+            "the model gives way first"
+        );
+        assert_eq!(
+            model_line(Vec::new(), 60).trim_end(),
+            "AMD Ryzen 9 7950X 16-Core Processor",
+            "no CPU sensor, nothing shown"
+        );
     }
 
     #[test]
