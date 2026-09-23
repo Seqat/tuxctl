@@ -115,6 +115,8 @@ pub enum MouseTarget {
     ProcessSignalCancel,
     ProcessSignalConfirm,
     MenuItem(MenuItem),
+    /// The `[-]`/`[+]` buttons next to the sampling interval.
+    IntervalStep(IntervalStep),
     ServiceRow(Arc<str>),
     LogRow(u64),
     NetworkRow(Arc<str>),

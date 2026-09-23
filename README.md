@@ -290,7 +290,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
-| `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the title) |
+| `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the top-right corner) |
 | `Esc` | Dismiss dialog / clear the search, then the view filter / open the main menu |
 | `q` | Quit |
 | `Ctrl+C` | Quit globally |
@@ -364,6 +364,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 - **Pinned processes:** Click `▲` / `▼` at the end of a pinned row to move it (shown when there are at least two pins and the terminal is wide enough).
 - **Confirmation dialogs:** Click `Cancel` or the confirmation action.
 - **Main menu:** Click `About` or `Exit`.
+- **Sampling interval:** Click `[-]` / `[+]` next to `⟳` in the top-right corner.
 
 ---
 

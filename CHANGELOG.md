@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `+` and `-` change the sampling interval while `tuxctl` runs, through the
   same presets as `--interval` (`250ms` to `60s`). The current interval is
-  shown as `⟳ 1s` in the frame title. Running collectors switch without a
-  restart; rates stay correct because they are computed from the actual time
+  shown as `⟳ 1s [-] [+]` in the top-right corner, and the buttons can be
+  clicked. Running collectors switch without a restart; rates stay correct because they are computed from the actual time
   between samples.
-- Overview storage rows show each disk's read and write throughput, from one
-  read of `/proc/diskstats` per sample. Partitions, loop, zram, device-mapper
+- Overview storage rows show each disk's read and write throughput next to
+  the device, from one read of `/proc/diskstats` per sample. Partitions, loop, zram, device-mapper
   and md devices are not listed; their I/O shows up on the physical disks.
 - Process pinning: `P` pins the selected process to the top of the Processes
   list (up to 8), `Shift+↑`/`Shift+↓` (or `Alt`) or the `▲`/`▼` controls

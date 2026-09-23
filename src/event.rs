@@ -125,6 +125,7 @@ fn action_for_mouse_target(target: MouseTarget) -> Action {
         MouseTarget::ProcessSignalCancel => Action::CancelProcessSignal,
         MouseTarget::ProcessSignalConfirm => Action::ConfirmProcessSignal,
         MouseTarget::MenuItem(item) => Action::ActivateMenuItem(item),
+        MouseTarget::IntervalStep(step) => Action::StepSamplingInterval(step),
         MouseTarget::ServiceRow(unit) => Action::SelectService(unit),
         MouseTarget::LogRow(id) => Action::SelectLog(id),
         MouseTarget::NetworkRow(name) => Action::SelectNetwork(name),
@@ -578,6 +579,32 @@ mod tests {
             translate_event(event, &regions, None),
             Some(Action::SelectTab(Tab::Services))
         );
+    }
+
+    #[test]
+    fn interval_button_clicks_step_the_interval() {
+        let regions = UiRegions::default().with_interval_buttons([
+            (IntervalStep::Shorter, Rect::new(100, 0, 3, 1)),
+            (IntervalStep::Longer, Rect::new(104, 0, 3, 1)),
+        ]);
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert_eq!(
+            translate_event(click(101), &regions, None),
+            Some(Action::StepSamplingInterval(IntervalStep::Shorter))
+        );
+        assert_eq!(
+            translate_event(click(106), &regions, None),
+            Some(Action::StepSamplingInterval(IntervalStep::Longer))
+        );
+        assert_eq!(translate_event(click(103), &regions, None), None);
     }
 
     #[test]

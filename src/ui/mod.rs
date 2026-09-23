@@ -22,7 +22,7 @@ use ratatui::{
 };
 
 use crate::{
-    action::{InputMode, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
+    action::{InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
     linux::ByteUsage,
 };
@@ -46,6 +46,7 @@ pub struct UiRegions {
     process_signal_cancel: Option<Rect>,
     process_signal_confirm: Option<Rect>,
     menu_items: Vec<(MenuItem, Rect)>,
+    interval_buttons: Vec<(IntervalStep, Rect)>,
     input_mode: InputMode,
 }
 
@@ -109,6 +110,7 @@ impl UiRegions {
 
     fn suppress_background_interaction(&mut self) {
         self.tabs.clear();
+        self.interval_buttons.clear();
         self.process_rows.clear();
         self.process_headers.clear();
         self.process_scroll_area = None;
@@ -145,6 +147,12 @@ impl UiRegions {
             .iter()
             .find(|region| contains(region.area, column, row))
             .map(|region| MouseTarget::Tab(region.tab))
+            .or_else(|| {
+                self.interval_buttons
+                    .iter()
+                    .find(|(_, area)| contains(*area, column, row))
+                    .map(|(step, _)| MouseTarget::IntervalStep(*step))
+            })
             .or_else(|| {
                 self.process_headers
                     .iter()
@@ -276,6 +284,15 @@ impl UiRegions {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_interval_buttons(
+        mut self,
+        buttons: impl IntoIterator<Item = (IntervalStep, Rect)>,
+    ) -> Self {
+        self.interval_buttons = buttons.into_iter().collect();
+        self
+    }
+
     /// Adds ▲/▼ controls to the first process row.
     #[cfg(test)]
     pub(crate) fn with_pin_controls(mut self, up: Rect, down: Rect) -> Self {
@@ -396,24 +413,10 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         return UiRegions::default();
     }
 
-    let mut outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::raw(" tuxctl "),
-            Span::styled(
-                interval_indicator(app),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    if let Some(marker) = stale_marker(app, area.width) {
-        outer = outer.title_top(
-            Line::from(marker)
-                .right_aligned()
-                .style(Style::default().fg(Color::Yellow)),
-        );
-    }
+    let outer = Block::default().borders(Borders::ALL).title(TITLE);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    let interval_buttons = render_top_right(frame, app, area);
 
     let screen = layout::screen(inner);
     let tab_areas = layout::tab_areas(screen.tabs);
@@ -428,6 +431,7 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     let content_render = render_content(frame, app, screen.content);
 
     let mut regions = UiRegions::from_tabs(tab_areas);
+    regions.interval_buttons = interval_buttons;
     regions.input_mode = app.input_mode();
     match content_render {
         ContentRender::Processes(process_render) => {
@@ -512,26 +516,82 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     regions
 }
 
-/// The sampling interval shown after the title, e.g. `⟳ 1s `.
-fn interval_indicator(app: &App) -> String {
-    format!("⟳ {} ", app.sampling_interval_label())
-}
+const TITLE: &str = " tuxctl ";
+/// The `[-]` and `[+]` buttons after the interval, each followed by a space.
+const INTERVAL_BUTTONS: [(IntervalStep, &str); 2] = [
+    (IntervalStep::Shorter, "[-]"),
+    (IntervalStep::Longer, "[+]"),
+];
 
-/// Names the collectors behind this screen whose data stopped updating, falling
-/// back to a bare marker when the names would crowd the title.
-fn stale_marker(app: &App, width: u16) -> Option<String> {
+/// Draws the right end of the top border: the stale marker (collectors behind
+/// this screen that stopped updating), the sampling interval and its `[-]`/`[+]`
+/// buttons. Space is given up in that order: stale names become a bare marker,
+/// then the buttons go. Returns the drawn buttons for hit testing.
+fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalStep, Rect)> {
+    // Keep both corners and a gap after the title free.
+    let room = usize::from(area.width).saturating_sub(TITLE.len() + 3);
     let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
-    if names.is_empty() {
-        return None;
-    }
-    let detailed = format!(" stale: {} ", names.join(", "));
-    let title = " tuxctl ".len() + interval_indicator(app).chars().count();
-    let room = usize::from(width).saturating_sub(title + 4);
-    Some(if detailed.chars().count() <= room {
-        detailed
+    let stale_options = if names.is_empty() {
+        vec![None]
     } else {
-        " stale ".to_owned()
-    })
+        vec![
+            Some(format!(" stale: {} ", names.join(", "))),
+            Some(" stale ".to_owned()),
+        ]
+    };
+    let interval = format!(" ⟳ {} ", app.sampling_interval_label());
+    let buttons_width = INTERVAL_BUTTONS
+        .iter()
+        .map(|(_, label)| label.len() + 1)
+        .sum::<usize>();
+    let width_of = |stale: &Option<String>, buttons: bool| {
+        stale.as_deref().map_or(0, |stale| stale.chars().count())
+            + interval.chars().count()
+            + if buttons { buttons_width } else { 0 }
+    };
+    let Some((stale, buttons)) = [true, false]
+        .into_iter()
+        .flat_map(|buttons| stale_options.iter().map(move |stale| (stale, buttons)))
+        .find(|(stale, buttons)| width_of(stale, *buttons) <= room)
+    else {
+        return Vec::new();
+    };
+
+    let width = width_of(stale, buttons) as u16;
+    let mut x = area.right().saturating_sub(1 + width);
+    let mut spans = Vec::with_capacity(4);
+    if let Some(stale) = stale {
+        spans.push(Span::styled(
+            stale.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled(
+        interval.clone(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let corner = Rect::new(x, area.y, width, 1);
+    // Blank the border under the whole corner, including the gaps between buttons.
+    frame.render_widget(Clear, corner);
+    frame.render_widget(Paragraph::new(Line::from(spans)), corner);
+    if !buttons {
+        return Vec::new();
+    }
+    x = x.saturating_add(width - buttons_width as u16);
+    INTERVAL_BUTTONS
+        .iter()
+        .map(|&(step, label)| {
+            let button = Rect::new(x, area.y, label.len() as u16, 1);
+            let style = if app.hovered() == Some(&MouseTarget::IntervalStep(step)) {
+                Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            frame.render_widget(Paragraph::new(label).style(style), button);
+            x = x.saturating_add(button.width + 1);
+            (step, button)
+        })
+        .collect()
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -979,6 +1039,7 @@ mod tests {
             process_signal_cancel: None,
             process_signal_confirm: None,
             menu_items: Vec::new(),
+            interval_buttons: vec![(IntervalStep::Longer, target_area)],
             input_mode: InputMode::ProcessSignalConfirm,
         };
 
@@ -1204,6 +1265,87 @@ mod tests {
             "three names fall back to a bare marker"
         );
         assert!(text.contains(" tuxctl "));
+    }
+
+    /// The top border row as text.
+    fn top_row(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_interval_and_its_buttons_sit_in_the_top_right_corner() {
+        let app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+        let top = top_row(&terminal);
+
+        assert!(top.starts_with("┌ tuxctl ─"), "{top}");
+        assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
+        assert_eq!(regions.interval_buttons.len(), 2);
+        for (step, area) in &regions.interval_buttons {
+            assert_eq!(area.y, 0);
+            for x in area.x..area.right() {
+                assert_eq!(
+                    regions.target_at(x, 0),
+                    Some(MouseTarget::IntervalStep(*step))
+                );
+            }
+            // The gap after each button is not part of it.
+            assert_eq!(regions.target_at(area.right(), 0), None);
+        }
+        let label = |step| {
+            regions
+                .interval_buttons
+                .iter()
+                .find(|(s, _)| *s == step)
+                .map(|(_, area)| {
+                    (area.x..area.right())
+                        .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                        .collect::<String>()
+                })
+        };
+        assert_eq!(label(IntervalStep::Shorter).as_deref(), Some("[-]"));
+        assert_eq!(label(IntervalStep::Longer).as_deref(), Some("[+]"));
+    }
+
+    #[test]
+    fn the_top_right_corner_gives_up_space_without_touching_the_title() {
+        let mut app = App::default().with_collector_periods(
+            crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(1)),
+        );
+        for _ in 0..7 {
+            app.update(Action::StepSamplingInterval(IntervalStep::Shorter));
+        }
+        let start = std::time::Instant::now();
+        app.update(Action::Tick(start));
+        app.update(Action::Tick(start + std::time::Duration::from_secs(10)));
+
+        for width in [40_u16, 30, 24, 20] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
+            let regions = rendered_regions(&mut terminal, &app);
+            if width < layout::MIN_TERMINAL_WIDTH {
+                continue;
+            }
+            let top = top_row(&terminal);
+            assert!(top.starts_with("┌ tuxctl ─"), "{width}: {top}");
+            assert!(top.ends_with('┐'), "{width}: {top}");
+            assert!(top.contains(" stale "), "{width}: {top}");
+            assert!(top.contains("250ms"), "{width}: {top}");
+            assert_eq!(regions.interval_buttons.is_empty(), !top.contains("[+]"));
+        }
+    }
+
+    #[test]
+    fn a_modal_disables_the_interval_buttons() {
+        let mut app = App::default();
+        app.update(Action::ShowHelp);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.interval_buttons.is_empty());
     }
 
     fn overview_sweep_app(cpu_count: u32) -> App {
