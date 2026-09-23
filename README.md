@@ -43,6 +43,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Per-logical-CPU utilization.
   - Responsive logical-CPU grid for different terminal sizes.
 - Live RAM usage with used/total capacity and a usage trend.
+- Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
 - Hardware inventory:
   - CPU model information.
   - RAM module information via EDAC sysfs when available.
@@ -50,6 +51,29 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
 - Compact physical network interface summary with live RX/TX rates and a combined traffic trend with its peak.
 - Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
+
+#### Temperatures
+
+A temperature appears next to a component only when the kernel provides a sensor for it; components without one show nothing. `–` means the sensor exists but has no value right now, for example while a GPU is runtime-suspended. A value is highlighted only when it reaches a limit reported by the driver (`temp*_max` or `temp*_crit`); `tuxctl` does not invent thresholds. Sensors are read at most every 2 seconds, whatever the sampling interval.
+
+| Component | Source |
+| --- | --- |
+| Intel CPU | `coretemp`: the `Package id N` sensor, or the hottest core when there is none |
+| AMD CPU | `k10temp` or `zenpower`: `Tdie`, else `Tctl` (per-CCD sensors are not used) |
+| Other CPUs (ARM, SoCs) | Only without a CPU hwmon driver: the hottest thermal zone whose type names the CPU or SoC (never `acpitz`) |
+| AMD GPU | `amdgpu` (the `edge` sensor) or `radeon` hwmon |
+| Intel GPU | `i915` / `xe` hwmon, when the GPU has its own sensor; integrated GPUs usually do not |
+| NVIDIA GPU, `nouveau` | `nouveau` hwmon |
+| NVIDIA GPU, proprietary driver | NVML (`libnvidia-ml.so.1`, installed with the driver), only with `--nvidia-temperature` |
+| NVMe | `nvme` hwmon (`Composite`) |
+| SATA / SAS | `drivetemp` hwmon, only when that module is loaded (`modprobe drivetemp`) |
+| Network adapter | A hwmon sensor on the adapter or on its PHY |
+
+RAM (SPD) sensors are not shown.
+
+**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML. It is off by default because NVML is expensive in memory: on the reference machine below, `--nvidia-temperature` adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. The static release binaries cannot load NVML and refuse the flag with a message; use a glibc build, such as one built with `cargo install`.
+
+**Runtime power management.** `tuxctl` never wakes a sleeping GPU: it reads `power/runtime_status` first and shows `–` while the GPU is suspended. NVML stays initialized only when the GPU cannot runtime-suspend anyway (`power/control` is `on`, or the driver reports `Runtime D3 status` as not supported or disabled). With RTD3 enabled, as on many hybrid laptops, NVML is initialized for each reading and shut down right after, and only while every NVIDIA GPU is awake, so `tuxctl` never keeps the GPU powered.
 
 ### Processes
 
@@ -228,6 +252,8 @@ install -Dm755 "tuxctl-$arch-unknown-linux-musl/tuxctl" ~/.local/bin/tuxctl
 
 `~/.local/bin` must be on your `PATH`.
 
+The static binaries cannot load NVIDIA's NVML library, so they cannot show temperatures of NVIDIA GPUs on the proprietary driver; build from source for that (see [Temperatures](#temperatures)).
+
 ### Install from Source
 
 Install a tagged version directly with Cargo:
@@ -262,12 +288,13 @@ cargo build --release --locked
 ### Command-Line Options
 
 ```text
-tuxctl [--interval <DURATION>]
+tuxctl [--interval <DURATION>] [--nvidia-temperature]
 ```
 
 | Option | Description |
 | --- | --- |
 | `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. `+` and `-` change the interval while `tuxctl` runs. |
+| `--nvidia-temperature` | Show temperatures of NVIDIA GPUs on the proprietary driver through NVML. Off by default because NVML adds about 20 MiB of private memory; needs a glibc build (see [Temperatures](#temperatures)). The Help overlay shows whether it is on. |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print the version. |
 
@@ -440,6 +467,7 @@ Within supported dimensions, layouts adapt to available space. On narrow termina
 
 - **Linux only:** `tuxctl` relies directly on Linux `/proc`, `/sys`, systemd utilities, and Linux-specific process signaling.
 - **systemd dependency:** Services and Logs require access to `systemctl` and `journalctl`.
+- **NVIDIA temperatures:** GPUs on the proprietary driver need `--nvidia-temperature` and a glibc build.
 - **Hardware hotplug:** Hardware inventory is discovered at startup. Newly attached hardware is not dynamically re-enumerated until `tuxctl` is restarted.
 - **Process permissions:** Signaling another user's or privileged processes is subject to normal Linux permissions.
 - **pidfd availability:** Process signaling requires safe pidfd support. `tuxctl` intentionally does not fall back to PID-only signaling if that safety guarantee is unavailable.

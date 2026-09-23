@@ -120,6 +120,8 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
+    /// `--nvidia-temperature`, shown in Help.
+    nvidia_temperature: bool,
     aggregate_cpu_history: MetricHistory,
     memory_history: MetricHistory,
     /// Combined RX+TX bytes/s of the interfaces the Overview lists.
@@ -191,6 +193,7 @@ impl Default for App {
             active_tab: Tab::Overview,
             system_metrics: SystemMetrics::default(),
             hardware: None,
+            nvidia_temperature: false,
             aggregate_cpu_history: MetricHistory::default(),
             memory_history: MetricHistory::default(),
             network_history: MetricHistory::default(),
@@ -306,6 +309,15 @@ impl App {
 
     pub fn hardware(&self) -> Option<&HardwareInventory> {
         self.hardware.as_ref()
+    }
+
+    pub fn with_nvidia_temperature(mut self, enabled: bool) -> Self {
+        self.nvidia_temperature = enabled;
+        self
+    }
+
+    pub fn nvidia_temperature(&self) -> bool {
+        self.nvidia_temperature
     }
 
     pub fn input_mode(&self) -> InputMode {

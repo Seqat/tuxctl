@@ -512,7 +512,7 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         regions.suppress_background_interaction();
     }
     if app.help_visible() {
-        render_help(frame, area);
+        render_help(frame, app, area);
         regions.suppress_background_interaction();
         regions.process_signal_cancel = None;
         regions.process_signal_confirm = None;
@@ -767,8 +767,8 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 /// Width of the Help popup; every line must fit inside its borders.
 const HELP_WIDTH: u16 = 64;
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let lines = help_lines();
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = help_lines(app.nvidia_temperature());
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = layout::centered_rect(area, HELP_WIDTH, height);
     if popup.width == 0 || popup.height == 0 {
@@ -782,7 +782,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn help_lines() -> Vec<Line<'static>> {
+fn help_lines(nvidia_temperature: bool) -> Vec<Line<'static>> {
     let heading = |text: &'static str| {
         Line::from(text).style(
             Style::default()
@@ -814,8 +814,23 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Services            r refresh system services"),
         Line::from("  Logs                f follow, Space toggle pause"),
         Line::from(""),
+        heading("Temperatures (Overview):"),
+        Line::from("  Sources             hwmon, thermal zones (– = no value now)"),
+        Line::from(nvidia_help(nvidia_temperature)),
+        Line::from(""),
         Line::from("Esc closes").style(Style::default().fg(theme::MUTED)),
     ]
+}
+
+/// Whether NVIDIA temperatures are on, and how to turn them on.
+fn nvidia_help(enabled: bool) -> &'static str {
+    if enabled {
+        "  NVIDIA GPUs         on (NVML, about 20 MiB of memory)"
+    } else if crate::cli::NVML_AVAILABLE {
+        "  NVIDIA GPUs         off; start with --nvidia-temperature"
+    } else {
+        "  NVIDIA GPUs         off; --nvidia-temperature needs glibc"
+    }
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -2406,7 +2421,15 @@ mod tests {
 
     #[test]
     fn help_lists_every_binding_and_every_line_fits() {
-        let lines = help_lines();
+        for enabled in [false, true] {
+            for line in help_lines(enabled) {
+                assert!(
+                    line.to_string().chars().count() <= usize::from(HELP_WIDTH - 2),
+                    "{line:?} is cut off"
+                );
+            }
+        }
+        let lines = help_lines(false);
         let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
         for line in &text {
             assert!(
@@ -2426,6 +2449,7 @@ mod tests {
             "v kernel threads",
             "Ctrl+C",
             "Space",
+            "--nvidia-temperature",
         ] {
             assert!(all.contains(binding), "Help does not mention {binding:?}");
         }

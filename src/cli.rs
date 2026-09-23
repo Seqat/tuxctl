@@ -15,7 +15,7 @@ pub enum Command {
     Run {
         interval: Duration,
         /// Read NVIDIA GPU temperatures through NVML (off by default: it
-        /// costs about 25 MiB of memory while loaded).
+        /// costs about 20 MiB of private memory once initialized).
         nvidia_temperature: bool,
     },
     Help,
@@ -54,7 +54,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
 /// Static musl builds cannot load the (glibc) NVIDIA library.
 pub const NVML_AVAILABLE: bool = !cfg!(target_env = "musl");
 const NVML_UNAVAILABLE: &str = "--nvidia-temperature needs a glibc build of tuxctl, such as \
-     `cargo install tuxctl`; this static build cannot load the NVIDIA library";
+     one built with `cargo install`; this static build cannot load the NVIDIA library";
 
 fn parse_interval(value: &str) -> Result<Duration, String> {
     SAMPLING_PRESETS
@@ -92,9 +92,9 @@ Options:
                              One of: {presets}
                              Processes refresh at most once per second, services every 5s.
                              Press + / - inside {name} to change it while running.
-      --nvidia-temperature   Show NVIDIA GPU temperatures (proprietary driver) through
-                             NVML. Off by default: NVML adds about 25 MiB of memory.
-                             Needs a glibc build such as `cargo install tuxctl`.
+      --nvidia-temperature   Show temperatures of NVIDIA GPUs on the proprietary driver
+                             through NVML. Off by default: NVML adds about 20 MiB of
+                             private memory. Needs a glibc build (e.g. `cargo install`).
   -h, --help                 Print help
   -V, --version              Print version
 
