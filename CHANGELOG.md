@@ -36,8 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Esc` with nothing to close or clear opens the main menu instead of doing
+  nothing. The menu starts on About, so an extra `Enter` does not quit.
 - The Overview CPU history starts over when the interval changes, so its time
   span stays accurate.
+- The Help overlay lists every binding and is sized to its content.
 
 ### Fixed
 
@@ -56,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise embed escape sequences, for example to overwrite the clipboard
   of whoever views the Processes or Logs screen (OSC 52) or to reset the
   terminal. Affected cells now show `�`.
+
+### Internal
+
+- Collectors take their sampling period from the shared control primitive,
+  so it can change while they run.
+- `measure.py --check` derives the idle redraw limit from `--interval`; CI
+  and the performance workflow also measure at `250ms`. `smoke.py` covers the
+  main menu and the interval keys.
 
 ## [0.2.7] - 2026-09-23
 
