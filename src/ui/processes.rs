@@ -305,8 +305,8 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
         (
             format!("Filter: \"{query}\""),
             &[
-                "/ edit   Esc clear   P pin   t term   K kill",
-                "/ edit   Esc clear   t term   K kill",
+                "/ edit   Esc clear   P pin   T term   K kill",
+                "/ edit   Esc clear   T term   K kill",
                 "Esc clear",
             ],
         )
@@ -319,9 +319,9 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
                 if sort.descending { "▼" } else { "▲" }
             ),
             &[
-                "/ search   Enter details   P pin   v view   t term   K kill",
-                "/ search   Enter details   P pin   t term   K kill",
-                "/ search   Enter details   t term   K kill",
+                "/ search   Enter details   P pin   v view   T term   K kill",
+                "/ search   Enter details   P pin   T term   K kill",
+                "/ search   Enter details   T term   K kill",
                 "/ find   Enter view",
             ],
         )

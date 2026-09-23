@@ -790,7 +790,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         heading("Screen Controls:"),
         Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
-        Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+        Line::from("  Signals             T terminate (SIGTERM), K kill (SIGKILL)"),
         Line::from("  Pins                P pin / unpin, Shift+↑/↓ move (or ▲/▼)"),
         Line::from("  Views               v kernel threads, failed units, priority"),
         Line::from("  Services            r refresh system services"),

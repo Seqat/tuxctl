@@ -95,7 +95,12 @@ pub const GLOBAL: &[Binding] = &[
 
 /// Overview and Processes (`InputMode::Normal`).
 pub const PROCESSES: &[Binding] = &[
-    bind(ch('t'), Action::RequestProcessSignal(ProcessSignal::Term)),
+    bind(ch('T'), Action::RequestProcessSignal(ProcessSignal::Term)),
+    bind_with(
+        ch('t'),
+        SHIFT,
+        Action::RequestProcessSignal(ProcessSignal::Term),
+    ),
     bind(ch('K'), Action::RequestProcessSignal(ProcessSignal::Kill)),
     bind_with(
         ch('k'),
@@ -329,5 +334,43 @@ mod tests {
             lookup(InputMode::Normal, key(ch('c'), KeyModifiers::ALT)),
             Some(Action::SortProcesses(ProcessSortField::Cpu))
         );
+    }
+
+    /// Actions that change the system or persistent state.
+    fn changes_state(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::RequestProcessSignal(_) | Action::TogglePin | Action::MoveSelectedPin(_)
+        )
+    }
+
+    #[test]
+    fn state_changing_actions_need_shift_or_an_uppercase_key() {
+        let all = [
+            GLOBAL,
+            PROCESSES,
+            SERVICES,
+            LOGS,
+            NETWORK,
+            PROCESS_SEARCH,
+            SERVICE_SEARCH,
+            LOG_SEARCH,
+            SIGNAL_CONFIRM,
+            MENU,
+            POPUP,
+            HELP,
+        ];
+        for binding in all.iter().flat_map(|table| table.iter()) {
+            if !changes_state(&binding.action) {
+                continue;
+            }
+            let shifted = match binding.key.mods {
+                Mods::AnyOf(mods) => mods.contains(KeyModifiers::SHIFT),
+                Mods::Any => {
+                    matches!(binding.key.code, KeyCode::Char(c) if c.is_ascii_uppercase())
+                }
+            };
+            assert!(shifted, "{binding:?} changes state without Shift");
+        }
     }
 }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `SIGTERM` is now requested with `T` / `Shift+T` instead of `t`.
+  Keys that change the system or persistent state (signals, pins) use `Shift`;
+  navigation, sorting, views, search and menus stay on plain keys. A plain
+  `t` does nothing.
+- Key bindings live in one table per input mode (`src/keymap.rs`).
+
 ## [0.3.0] - 2026-09-23
 
 Tracking and interaction: pin processes, filter views, change the sampling

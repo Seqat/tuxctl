@@ -66,7 +66,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 - Kernel-thread filter (`v`).
 - Detailed process inspection (`Enter`).
 - Safe process signaling:
-  - SIGTERM with `t`.
+  - SIGTERM with `T` / `Shift+T`.
   - SIGKILL with `K` / `Shift+K`.
   - Explicit confirmation before destructive actions.
   - `Cancel` is the safe default.
@@ -315,7 +315,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `m` | Sort by Memory |
 | `p` | Sort by PID |
 | `n` | Sort by Name |
-| `t` | Request `SIGTERM` for selected process |
+| `T` / `Shift+T` | Request `SIGTERM` for selected process |
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
 | `P` / `Shift+P` | Pin / unpin the selected process (up to 8) |
 | `Shift+↑` / `Shift+↓` | Move the selected pinned process up / down (`Alt+↑` / `Alt+↓` also work) |

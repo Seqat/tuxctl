@@ -281,6 +281,7 @@ mod tests {
             "Space" => plain(KeyCode::Char(' ')),
             "Ctrl+C" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             "Shift+K" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT),
+            "Shift+T" => KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SHIFT),
             "Shift+P" => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT),
             "Shift+↑" => KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
             "Shift+↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
@@ -998,13 +999,22 @@ mod tests {
         let empty_regions = UiRegions::default();
 
         // Normal mode shortcuts
-        let t_key = Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(
-            translate_event(t_key, &empty_regions, None),
-            Some(Action::RequestProcessSignal(
-                crate::linux::ProcessSignal::Term
-            ))
-        );
+        for t_key in [
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(
+                translate_event(Event::Key(t_key), &empty_regions, None),
+                Some(Action::RequestProcessSignal(
+                    crate::linux::ProcessSignal::Term
+                )),
+                "{t_key:?}"
+            );
+        }
+        // Signals need Shift; a plain `t` does nothing.
+        let t_plain = Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(translate_event(t_plain, &empty_regions, None), None);
 
         let k_upper = Event::Key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
         assert_eq!(
