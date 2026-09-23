@@ -3,6 +3,7 @@ mod action;
 mod app;
 mod cli;
 mod event;
+mod keymap;
 mod linux;
 mod shutdown;
 mod ui;

@@ -8,7 +8,8 @@ use crossterm::event::{
 };
 
 use crate::{
-    action::{Action, InputMode, IntervalStep, MouseTarget, PinMove, ProcessSortField, Tab},
+    action::{Action, InputMode, MouseTarget},
+    keymap,
     ui::UiRegions,
 };
 
@@ -143,231 +144,24 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         return Some(Action::Quit);
     }
 
-    if input_mode == InputMode::ProcessSearch {
-        return match key.code {
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Enter => Some(Action::OpenProcessDetails),
-            KeyCode::Backspace => Some(Action::BackspaceProcessSearch),
-            // Arrows move through the matches; letters (including j/k) stay query text.
-            KeyCode::Up => Some(Action::ProcessPrevious),
-            KeyCode::Down => Some(Action::ProcessNext),
-            KeyCode::PageUp => Some(Action::ProcessPreviousPage),
-            KeyCode::PageDown => Some(Action::ProcessNextPage),
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(Action::AppendProcessSearch(character))
-            }
-            _ => None,
-        };
+    if let Some(action) = keymap::lookup(input_mode, key) {
+        return Some(action);
     }
 
-    if input_mode == InputMode::ServiceSearch {
-        return match key.code {
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Enter => Some(Action::OpenServiceDetails),
-            KeyCode::Backspace => Some(Action::BackspaceServiceSearch),
-            KeyCode::Up => Some(Action::ServicePrevious),
-            KeyCode::Down => Some(Action::ServiceNext),
-            KeyCode::PageUp => Some(Action::ServicePreviousPage),
-            KeyCode::PageDown => Some(Action::ServiceNextPage),
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(Action::AppendServiceSearch(character))
-            }
-            _ => None,
-        };
+    // Unbound characters are query text while searching.
+    let KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
     }
-
-    if input_mode == InputMode::LogSearch {
-        return match key.code {
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Enter => Some(Action::OpenLogDetails),
-            KeyCode::Backspace => Some(Action::BackspaceLogSearch),
-            KeyCode::Up => Some(Action::LogPrevious),
-            KeyCode::Down => Some(Action::LogNext),
-            KeyCode::PageUp => Some(Action::LogPreviousPage),
-            KeyCode::PageDown => Some(Action::LogNextPage),
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(Action::AppendLogSearch(character))
-            }
-            _ => None,
-        };
-    }
-
-    if input_mode == InputMode::ProcessSignalConfirm {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Esc => Some(Action::CancelProcessSignal),
-            KeyCode::Left | KeyCode::Char('h') => Some(Action::FocusProcessSignal(
-                crate::action::SignalConfirmButton::Cancel,
-            )),
-            KeyCode::Right | KeyCode::Char('l') => Some(Action::FocusProcessSignal(
-                crate::action::SignalConfirmButton::Confirm,
-            )),
-            KeyCode::Tab | KeyCode::BackTab => Some(Action::ToggleProcessSignalFocus),
-            KeyCode::Enter => Some(Action::ExecuteFocusedProcessSignal),
-            _ => None,
-        };
-    }
-
-    if input_mode == InputMode::Menu {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Up | KeyCode::Char('k') => Some(Action::MenuPrevious),
-            KeyCode::Down | KeyCode::Char('j') => Some(Action::MenuNext),
-            KeyCode::Enter => Some(Action::ActivateSelectedMenuItem),
-            _ => None,
-        };
-    }
-
-    if matches!(
-        input_mode,
-        InputMode::Help
-            | InputMode::About
-            | InputMode::ProcessDetail
-            | InputMode::ServiceDetail
-            | InputMode::LogDetail
-            | InputMode::NetworkDetail
-    ) {
-        return match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Esc => Some(Action::Escape),
-            KeyCode::Char('?') if input_mode == InputMode::Help => Some(Action::Escape),
-            _ => None,
-        };
-    }
-
-    // Tab screens share the global keys; screen keys never shadow them (tested).
-    global_tab_key(key).or_else(|| match input_mode {
-        InputMode::Services => service_key(key),
-        InputMode::Logs => log_key(key),
-        InputMode::Network => network_key(key),
-        _ => process_key(key),
-    })
-}
-
-/// Keys that behave the same on every tab screen.
-fn global_tab_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Char('1') => Some(Action::SelectTab(Tab::Overview)),
-        KeyCode::Char('2') => Some(Action::SelectTab(Tab::Processes)),
-        KeyCode::Char('3') => Some(Action::SelectTab(Tab::Services)),
-        KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
-        KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
-        KeyCode::Char('?') => Some(Action::ShowHelp),
-        KeyCode::Char('+') => Some(Action::StepSamplingInterval(IntervalStep::Longer)),
-        KeyCode::Char('-') => Some(Action::StepSamplingInterval(IntervalStep::Shorter)),
-        KeyCode::Esc => Some(Action::Escape),
-        KeyCode::BackTab => Some(Action::PreviousTab),
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::PreviousTab),
-        KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
-        KeyCode::Left => Some(Action::PreviousTab),
-        _ => None,
-    }
-}
-
-/// Overview and Processes (InputMode::Normal).
-fn process_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Char('t') => Some(Action::RequestProcessSignal(
-            crate::linux::ProcessSignal::Term,
-        )),
-        KeyCode::Char('K') => Some(Action::RequestProcessSignal(
-            crate::linux::ProcessSignal::Kill,
-        )),
-        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(
-            Action::RequestProcessSignal(crate::linux::ProcessSignal::Kill),
-        ),
-        // Shifted forms come before `p` (sort) and plain arrows (navigation).
-        KeyCode::Char('P') => Some(Action::TogglePin),
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(Action::TogglePin)
-        }
-        KeyCode::Up
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            Some(Action::MoveSelectedPin(PinMove::Up))
-        }
-        KeyCode::Down
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            Some(Action::MoveSelectedPin(PinMove::Down))
-        }
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::ProcessPrevious),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::ProcessNext),
-        KeyCode::PageUp => Some(Action::ProcessPreviousPage),
-        KeyCode::PageDown => Some(Action::ProcessNextPage),
-        KeyCode::Home => Some(Action::ProcessFirst),
-        KeyCode::End => Some(Action::ProcessLast),
-        KeyCode::Char('/') => Some(Action::BeginProcessSearch),
-        KeyCode::Enter => Some(Action::OpenProcessDetails),
-        KeyCode::Char('c') => Some(Action::SortProcesses(ProcessSortField::Cpu)),
-        KeyCode::Char('m') => Some(Action::SortProcesses(ProcessSortField::Memory)),
-        KeyCode::Char('p') => Some(Action::SortProcesses(ProcessSortField::Pid)),
-        KeyCode::Char('n') => Some(Action::SortProcesses(ProcessSortField::Name)),
-        KeyCode::Char('v') => Some(Action::CycleViewFilter),
-        _ => None,
-    }
-}
-
-fn service_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::ServicePrevious),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::ServiceNext),
-        KeyCode::PageUp => Some(Action::ServicePreviousPage),
-        KeyCode::PageDown => Some(Action::ServiceNextPage),
-        KeyCode::Home => Some(Action::ServiceFirst),
-        KeyCode::End => Some(Action::ServiceLast),
-        KeyCode::Char('/') => Some(Action::BeginServiceSearch),
-        KeyCode::Enter => Some(Action::OpenServiceDetails),
-        KeyCode::Char('r') => Some(Action::RefreshServices),
-        KeyCode::Char('v') => Some(Action::CycleViewFilter),
-        _ => None,
-    }
-}
-
-fn log_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::LogPrevious),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::LogNext),
-        KeyCode::PageUp => Some(Action::LogPreviousPage),
-        KeyCode::PageDown => Some(Action::LogNextPage),
-        KeyCode::Home => Some(Action::LogFirst),
-        KeyCode::End => Some(Action::LogLast),
-        KeyCode::Char('/') => Some(Action::BeginLogSearch),
-        KeyCode::Enter => Some(Action::OpenLogDetails),
-        KeyCode::Char('f') => Some(Action::ToggleLogFollow),
-        KeyCode::Char(' ') => Some(Action::ToggleLogPause),
-        KeyCode::Char('v') => Some(Action::CycleViewFilter),
-        _ => None,
-    }
-}
-
-fn network_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::NetworkPrevious),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::NetworkNext),
-        KeyCode::PageUp => Some(Action::NetworkPreviousPage),
-        KeyCode::PageDown => Some(Action::NetworkNextPage),
-        KeyCode::Home => Some(Action::NetworkFirst),
-        KeyCode::End => Some(Action::NetworkLast),
-        KeyCode::Enter => Some(Action::OpenNetworkDetails),
+    match input_mode {
+        InputMode::ProcessSearch => Some(Action::AppendProcessSearch(character)),
+        InputMode::ServiceSearch => Some(Action::AppendServiceSearch(character)),
+        InputMode::LogSearch => Some(Action::AppendLogSearch(character)),
         _ => None,
     }
 }
@@ -380,6 +174,7 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::*;
+    use crate::action::{IntervalStep, PinMove, ProcessSortField, Tab};
     use crate::linux::ProcessIdentity;
 
     fn no_regions() -> UiRegions {
@@ -432,13 +227,13 @@ mod tests {
     fn screen_keys_never_shadow_global_tab_keys() {
         type ScreenKeys = fn(KeyEvent) -> Option<Action>;
         let screens: [(&str, ScreenKeys); 4] = [
-            ("processes", process_key),
-            ("services", service_key),
-            ("logs", log_key),
-            ("network", network_key),
+            ("processes", |key| keymap::find(keymap::PROCESSES, key)),
+            ("services", |key| keymap::find(keymap::SERVICES, key)),
+            ("logs", |key| keymap::find(keymap::LOGS, key)),
+            ("network", |key| keymap::find(keymap::NETWORK, key)),
         ];
         for key in candidate_keys() {
-            if global_tab_key(key).is_none() {
+            if keymap::find(keymap::GLOBAL, key).is_none() {
                 continue;
             }
             for (screen, screen_key) in screens {
@@ -454,7 +249,7 @@ mod tests {
     #[test]
     fn global_keys_behave_the_same_in_every_tab_mode() {
         for key in candidate_keys() {
-            let Some(global) = global_tab_key(key) else {
+            let Some(global) = keymap::find(keymap::GLOBAL, key) else {
                 continue;
             };
             for mode in TAB_MODES {
