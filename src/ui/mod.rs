@@ -15,6 +15,7 @@ mod theme;
 use std::sync::Arc;
 
 use ratatui::{
+    buffer::Buffer,
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -475,6 +476,9 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         ContentRender::None => {}
     }
 
+    if app.overlay_open() {
+        dim_backdrop(frame.buffer_mut(), area);
+    }
     if app.process_detail_visible() {
         processes::render_detail(frame, app.selected_process(), area);
         regions.suppress_background_interaction();
@@ -515,6 +519,18 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     }
 
     regions
+}
+
+/// Greys out the screen behind a popup so the popup stands out. Popups clear
+/// their own area, so they are drawn at full color on top of it.
+fn dim_backdrop(buffer: &mut Buffer, area: Rect) {
+    buffer.set_style(
+        area,
+        Style::new()
+            .fg(theme::BACKDROP_FG)
+            .bg(theme::BACKDROP_BG)
+            .remove_modifier(Modifier::BOLD | Modifier::REVERSED),
+    );
 }
 
 const TITLE: &str = " tuxctl ";
@@ -1267,6 +1283,51 @@ mod tests {
             "three names fall back to a bare marker"
         );
         assert!(text.contains(" tuxctl "));
+    }
+
+    #[test]
+    fn an_open_popup_dims_the_screen_behind_it() {
+        // The border and tab rows lie outside every popup.
+        let dimmed = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width).all(|x| {
+                (0..2).all(|y| {
+                    let cell = &buffer[(x, y)];
+                    cell.fg == theme::BACKDROP_FG && cell.bg == theme::BACKDROP_BG
+                })
+            })
+        };
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        assert!(!dimmed(&terminal));
+
+        app.update(Action::Escape);
+        rendered_regions(&mut terminal, &app);
+        assert!(dimmed(&terminal));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme::SELECTED_BG),
+            "the menu keeps its colors"
+        );
+
+        app.update(Action::Escape);
+        rendered_regions(&mut terminal, &app);
+        assert!(!dimmed(&terminal), "closing the menu restores colors");
+    }
+
+    #[test]
+    fn dimming_is_safe_in_tiny_terminals() {
+        let mut app = App::default();
+        app.update(Action::Escape);
+        for (width, height) in [(1, 1), (2, 2), (10, 3), (20, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+        }
     }
 
     /// The top border row as text.

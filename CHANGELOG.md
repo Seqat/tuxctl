@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The screen behind a popup (main menu, About, Help, details, signal
+  confirmation) is greyed out so the popup stands out.
+
 ### Changed
 
 - **Breaking:** `SIGTERM` is now requested with `T` / `Shift+T` instead of `t`.

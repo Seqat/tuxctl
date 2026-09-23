@@ -279,6 +279,11 @@ impl App {
         }
     }
 
+    /// Whether a popup (menu, dialog or details) covers the screen.
+    pub fn overlay_open(&self) -> bool {
+        self.overlay.is_some()
+    }
+
     pub fn about_visible(&self) -> bool {
         self.overlay == Some(Overlay::About)
     }

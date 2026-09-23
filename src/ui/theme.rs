@@ -24,6 +24,10 @@ pub(super) const ROW_SELECTED_BG: Color = Color::DarkGray;
 /// A hovered row of a table.
 pub(super) const ROW_HOVER_BG: Color = Color::Rgb(35, 35, 35);
 
+/// Foreground of the screen behind a popup.
+pub(super) const BACKDROP_FG: Color = Color::DarkGray;
+pub(super) const BACKDROP_BG: Color = Color::Reset;
+
 #[cfg(test)]
 mod tests {
     /// Colors are only chosen here; tests may still compare against literals.
