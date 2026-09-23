@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc,
+    },
     thread,
 };
 
@@ -49,6 +52,8 @@ pub struct GpuDevice {
     pub model: String,
     pub kind: Option<GpuKind>,
     pub vram_bytes: Option<u64>,
+    /// Canonical sysfs path of the PCI device; temperatures are matched by it.
+    pub device_path: Option<Arc<Path>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,12 +71,17 @@ pub struct StorageDevice {
     pub kind: StorageKind,
     pub model: Option<String>,
     pub capacity_bytes: Option<u64>,
+    /// Canonical path of the disk's `device` link; temperatures are matched by it.
+    pub device_path: Option<Arc<Path>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkDevice {
     pub interface_name: String,
     pub model: Option<String>,
+    /// Canonical path of the interface's `device` link; temperatures are
+    /// matched by it.
+    pub device_path: Option<Arc<Path>>,
 }
 
 pub struct HardwareCollector {
@@ -117,6 +127,7 @@ fn discover_network_devices(root: &Path) -> Vec<NetworkDevice> {
             Some(NetworkDevice {
                 interface_name,
                 model: discover_nic_model(&device),
+                device_path: Some(Arc::from(device)),
             })
         })
         .collect()
@@ -293,8 +304,9 @@ fn read_gpu(card: &Path, nvidia_root: &Path) -> Option<GpuDevice> {
     let device = card.join("device");
     let vendor = read_hex(device.join("vendor"))?;
     let device_id = read_hex(device.join("device"));
-    let pci_address = fs::canonicalize(&device)
-        .ok()
+    let device_path = fs::canonicalize(&device).ok();
+    let pci_address = device_path
+        .as_deref()
         .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
     let nvidia = pci_address
         .as_deref()
@@ -317,6 +329,7 @@ fn read_gpu(card: &Path, nvidia_root: &Path) -> Option<GpuDevice> {
         model,
         kind,
         vram_bytes,
+        device_path: device_path.map(Arc::from),
     })
 }
 
@@ -401,6 +414,7 @@ fn discover_storage(root: &Path) -> Vec<StorageDevice> {
                 kind,
                 model,
                 capacity_bytes,
+                device_path: fs::canonicalize(path.join("device")).ok().map(Arc::from),
             })
         })
         .collect::<Vec<_>>();
@@ -601,6 +615,41 @@ mod tests {
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].interface_name, "enp6s0");
         assert_eq!(discovered[0].model, None);
+        assert_eq!(
+            discovered[0].device_path.as_deref(),
+            Some(fs::canonicalize(&devices).unwrap().as_path())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_and_gpu_record_their_canonical_device_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("device-paths");
+        let disk_device = root.join("devices/pci0000:00/0000:02:00.0/nvme/nvme0");
+        let gpu_device = root.join("devices/pci0000:00/0000:01:00.0");
+        fs::create_dir_all(&disk_device).unwrap();
+        fs::create_dir_all(&gpu_device).unwrap();
+        fs::write(gpu_device.join("vendor"), "0x1002\n").unwrap();
+        let block = root.join("block");
+        fs::create_dir_all(block.join("nvme0n1")).unwrap();
+        symlink(&disk_device, block.join("nvme0n1/device")).unwrap();
+        let drm = root.join("drm");
+        fs::create_dir_all(drm.join("card0")).unwrap();
+        symlink(&gpu_device, drm.join("card0/device")).unwrap();
+
+        let storage = discover_storage(&block);
+        assert_eq!(
+            storage[0].device_path.as_deref(),
+            Some(fs::canonicalize(&disk_device).unwrap().as_path())
+        );
+        let gpus = discover_gpus(&drm, &root.join("no-nvidia"));
+        assert_eq!(
+            gpus[0].device_path.as_deref(),
+            Some(fs::canonicalize(&gpu_device).unwrap().as_path())
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -631,6 +680,7 @@ mod tests {
             model: fallback_gpu_name(0x8086, Some(0x1234)),
             kind: None,
             vram_bytes: None,
+            device_path: None,
         };
 
         assert_eq!(gpu.model, "Intel graphics device [1234]");

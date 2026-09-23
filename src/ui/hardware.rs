@@ -767,6 +767,7 @@ mod tests {
             model: Some("A very long storage model name that exceeds the panel".into()),
             capacity_bytes: Some(1_000_000_000_000),
             kind: StorageKind::Nvme,
+            device_path: None,
         };
         let line = layout::truncate(&format_storage_device("NVMe", 0, &device), 24);
 

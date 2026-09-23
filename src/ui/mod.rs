@@ -1450,16 +1450,19 @@ mod tests {
                     model: "Test Graphics".into(),
                     kind: None,
                     vram_bytes: None,
+                    device_path: None,
                 }],
                 storage_devices: vec![crate::linux::StorageDevice {
                     system_name: "nvme0n1".into(),
                     kind: crate::linux::StorageKind::Nvme,
                     model: Some("Test Disk".into()),
                     capacity_bytes: Some(1_000_000_000_000),
+                    device_path: None,
                 }],
                 network_devices: vec![crate::linux::NetworkDevice {
                     interface_name: "eth0".into(),
                     model: None,
+                    device_path: None,
                 }],
             },
         ));

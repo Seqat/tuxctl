@@ -292,6 +292,7 @@ mod tests {
             network_devices: vec![crate::linux::NetworkDevice {
                 interface_name: "enp6s0".into(),
                 model: None,
+                device_path: None,
             }],
             ..HardwareInventory::default()
         };
