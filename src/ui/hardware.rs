@@ -272,16 +272,21 @@ fn render_storage(
                 let show_overflow = inventory.storage_devices.len() > remaining && remaining > 1;
                 let device_limit = remaining.saturating_sub(usize::from(show_overflow));
                 let mut counts = [0_usize; 5];
-                for device in inventory.storage_devices.iter().take(device_limit) {
-                    let (label, count_index) = storage_label(device.kind);
-                    let index = counts[count_index];
-                    counts[count_index] += 1;
-                    lines.push(Line::from(storage_line(
-                        &format_storage_device(label, index, device),
-                        disk_rates(metrics, &device.system_name),
-                        width,
-                    )));
-                }
+                let rows: Vec<_> = inventory
+                    .storage_devices
+                    .iter()
+                    .take(device_limit)
+                    .map(|device| {
+                        let (label, count_index) = storage_label(device.kind);
+                        let index = counts[count_index];
+                        counts[count_index] += 1;
+                        (
+                            format_storage_device(label, index, device),
+                            disk_rates(metrics, &device.system_name),
+                        )
+                    })
+                    .collect();
+                lines.extend(storage_lines(&rows, width).into_iter().map(Line::from));
                 if show_overflow {
                     lines.push(Line::from(format!(
                         "… {} more devices",
@@ -369,46 +374,79 @@ fn disk_rates(metrics: &SystemMetrics, name: &str) -> Option<(Option<f64>, Optio
     )
 }
 
-/// The device description with its rates right-aligned: the model is
-/// truncated first, then the rates switch to a tight form, and they are left
-/// out when not even the device label would remain.
-fn storage_line(
-    description: &str,
-    rates: Option<(Option<f64>, Option<f64>)>,
-    width: usize,
-) -> String {
-    let Some((read, write)) = rates else {
-        return layout::truncate(description, width);
+type DiskRates = Option<(Option<f64>, Option<f64>)>;
+
+/// Storage rows with their rates in a column right after the longest
+/// description, so the numbers stay next to the device they belong to on a
+/// wide panel. When the panel is narrow the models are truncated first, then
+/// the rates switch to a tight form, and they are left out when not even the
+/// device labels would remain.
+fn storage_lines(rows: &[(String, DiskRates)], width: usize) -> Vec<String> {
+    let plain = || {
+        rows.iter()
+            .map(|(description, _)| layout::truncate(description, width))
+            .collect()
     };
-    let label_width = description
-        .split("  ")
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .count();
-    let candidates = [
-        format!(
-            "  R {}  W {}",
-            network::format_rate(read),
-            network::format_rate(write)
-        ),
-        format!(
-            "  R{} W{}",
-            hardware_network_summary::format_rate_tight(read),
-            hardware_network_summary::format_rate_tight(write)
-        ),
-    ];
-    candidates
+    if rows.iter().all(|(_, rates)| rates.is_none()) {
+        return plain();
+    }
+    let label_width = rows
         .iter()
-        .find_map(|rates| {
-            let room = width.checked_sub(rates.chars().count())?;
-            (room >= label_width).then(|| {
-                let description = layout::truncate(description, room);
-                let padding = room.saturating_sub(description.chars().count());
-                format!("{description}{}{rates}", " ".repeat(padding))
-            })
+        .map(|(description, _)| {
+            description
+                .split("  ")
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count()
         })
-        .unwrap_or_else(|| layout::truncate(description, width))
+        .max()
+        .unwrap_or(0);
+    let description_width = rows
+        .iter()
+        .map(|(description, _)| description.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    type Format = fn(Option<f64>) -> String;
+    let full: (Format, &str, &str) = (network::format_rate, "  R ", "  W ");
+    let tight: (Format, &str, &str) = (hardware_network_summary::format_rate_tight, "  R", " W");
+    for (format, read_prefix, write_prefix) in [full, tight] {
+        let texts: Vec<Option<(String, String)>> = rows
+            .iter()
+            .map(|(_, rates)| rates.map(|(read, write)| (format(read), format(write))))
+            .collect();
+        let widest = |text: fn(&(String, String)) -> &String| {
+            texts
+                .iter()
+                .flatten()
+                .map(|pair| text(pair).chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let read_column = widest(|(read, _)| read);
+        let rates_width =
+            read_prefix.len() + read_column + write_prefix.len() + widest(|(_, write)| write);
+        let Some(room) = width.checked_sub(rates_width) else {
+            continue;
+        };
+        if room < label_width {
+            continue;
+        }
+        let column = description_width.min(room);
+        return rows
+            .iter()
+            .zip(texts)
+            .map(|((description, _), rates)| match rates {
+                Some((read, write)) => format!(
+                    "{:<column$}{read_prefix}{read:<read_column$}{write_prefix}{write}",
+                    layout::truncate(description, column),
+                ),
+                None => layout::truncate(description, width),
+            })
+            .collect();
+    }
+    plain()
 }
 
 fn format_binary_capacity(bytes: u64) -> String {
@@ -513,28 +551,59 @@ mod tests {
         assert_eq!(format_memory_module(0, &module), "SLOT0  8 GiB");
     }
 
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    fn two_disks() -> Vec<(String, DiskRates)> {
+        vec![
+            (
+                "NVMe0  WD Blue SN5100 1TB  1.0 TB".into(),
+                Some((Some(12.3 * MIB), Some(0.0))),
+            ),
+            (
+                "SATA0  Samsung SSD 870  2.0 TB".into(),
+                Some((Some(0.0), Some(512.0 * 1024.0))),
+            ),
+        ]
+    }
+
     #[test]
-    fn storage_rates_are_right_aligned_and_the_model_truncates_first() {
-        let description = "NVMe0  Samsung SSD 980 PRO 1TB  1.0 TB";
-        let rates = Some((Some(12.3 * 1024.0 * 1024.0), Some(0.0)));
+    fn storage_rates_follow_the_longest_description_on_a_wide_panel() {
+        let lines = storage_lines(&two_disks(), 120);
 
-        let wide = storage_line(description, rates, 70);
-        assert_eq!(wide.chars().count(), 70);
-        assert!(wide.starts_with(description), "{wide}");
-        assert!(wide.ends_with("  R 12.3 MiB/s  W 0 B/s"), "{wide}");
+        assert_eq!(
+            lines,
+            [
+                "NVMe0  WD Blue SN5100 1TB  1.0 TB  R 12.3 MiB/s  W 0 B/s",
+                "SATA0  Samsung SSD 870  2.0 TB     R 0 B/s       W 512.0 KiB/s",
+            ],
+            "rates sit after the descriptions, with R and W aligned"
+        );
+    }
 
-        let medium = storage_line(description, rates, 40);
-        assert_eq!(medium.chars().count(), 40);
-        assert!(medium.starts_with("NVMe0  Sams"), "{medium}");
-        assert!(medium.ends_with("  R 12.3 MiB/s  W 0 B/s"), "{medium}");
+    #[test]
+    fn narrow_storage_rows_truncate_models_then_tighten_then_drop_rates() {
+        let rows = two_disks();
 
-        let narrow = storage_line(description, rates, 20);
-        assert!(narrow.chars().count() <= 20, "{narrow}");
-        assert!(narrow.starts_with("NVMe0"), "{narrow}");
-        assert!(narrow.ends_with("  R12M/s W0B/s"), "{narrow}");
+        let medium = storage_lines(&rows, 50);
+        assert!(
+            medium.iter().all(|line| line.chars().count() <= 50),
+            "{medium:?}"
+        );
+        assert!(medium[0].starts_with("NVMe0  WD Blue"), "{medium:?}");
+        assert!(medium[0].contains("…  R 12.3 MiB/s  W 0 B/s"), "{medium:?}");
+        let w = |line: &str| line.find("  W ").unwrap();
+        assert_eq!(w(&medium[0]), w(&medium[1]), "W stays aligned");
 
-        let tiny = storage_line(description, rates, 8);
-        assert_eq!(tiny, layout::truncate(description, 8), "rates dropped");
+        let narrow = storage_lines(&rows, 24);
+        assert!(
+            narrow.iter().all(|line| line.chars().count() <= 24),
+            "{narrow:?}"
+        );
+        assert!(narrow[0].starts_with("NVMe0"), "{narrow:?}");
+        assert!(narrow[0].ends_with("  R12M/s W0B/s"), "{narrow:?}");
+
+        let tiny = storage_lines(&rows, 8);
+        assert_eq!(tiny[0], layout::truncate(&rows[0].0, 8), "rates dropped");
     }
 
     #[test]
@@ -550,14 +619,12 @@ mod tests {
 
         assert_eq!(disk_rates(&metrics, "sda"), Some((Some(1024.0), None)));
         assert_eq!(disk_rates(&metrics, "nvme0n1"), Some((None, None)));
-        assert!(
-            storage_line("SATA0  disk", disk_rates(&metrics, "nvme0n1"), 40)
-                .ends_with("  R --  W --")
-        );
+        let missing = [("SATA0  disk".to_owned(), disk_rates(&metrics, "nvme0n1"))];
+        assert_eq!(storage_lines(&missing, 40), ["SATA0  disk  R --  W --"]);
 
         metrics.disks.clear();
-        assert_eq!(disk_rates(&metrics, "sda"), None);
-        assert_eq!(storage_line("SATA0  disk", None, 40), "SATA0  disk");
+        let hidden = [("SATA0  disk".to_owned(), disk_rates(&metrics, "sda"))];
+        assert_eq!(storage_lines(&hidden, 40), ["SATA0  disk"]);
     }
 
     #[test]
