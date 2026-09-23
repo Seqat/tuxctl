@@ -17,6 +17,9 @@ impl LocalTime {
     /// Converts Unix seconds to local time. Call this off the render path: the
     /// first conversion may read the time zone database from disk.
     pub fn from_unix_seconds(seconds: i64) -> Option<Self> {
+        // libc marks `time_t` deprecated on musl only to announce its future
+        // 64-bit change on 32-bit targets; the conversion stays correct.
+        #[allow(deprecated)]
         let seconds = libc::time_t::try_from(seconds).ok()?;
         // SAFETY: `libc::tm` is plain old data, so the all-zero value is valid.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };

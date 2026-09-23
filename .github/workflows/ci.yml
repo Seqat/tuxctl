@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -24,6 +28,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
+      - name: Package contents
+        run: cargo package --locked --list
 
   msrv:
     name: MSRV (1.88)
@@ -33,3 +39,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
+
+  pty:
+    name: pty smoke and redraw guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Smoke test
+        run: scripts/smoke.py target/release/tuxctl
+      - run: cargo build --release --locked --features redraw-counter --target-dir target/counter
+      - name: Measure (short)
+        # Fails only on structural guards (redraw caps, liveness, catastrophe
+        # limits); CPU and RSS are reported in the summary and artifact.
+        run: >
+          scripts/measure.py target/counter/release/tuxctl
+          --label "${GITHUB_SHA::7}" --secs 8 --json measure.json --check
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: measure-${{ github.sha }}
+          path: measure.json
+          if-no-files-found: ignore
+          retention-days: 30

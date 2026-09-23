@@ -1,6 +1,6 @@
 [package]
 name = "tuxctl"
-version = "0.2.5"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Seqat"]
@@ -8,7 +8,17 @@ license = "MIT"
 repository = "https://github.com/Seqat/tuxctl"
 description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
 readme = "README.md"
+# Screenshots and development tooling are not needed to build from the crate.
+exclude = ["docs/screenshots/", "scripts/", ".github/"]
 
+
+# Measured against the default profile (3 runs each, scripts/measure.py): 35 %
+# smaller binary, about 200 KiB less RSS, same CPU and redraws. Unwinding stays
+# on: a panicking worker thread must not abort the UI.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [features]
 # Development only: count renders and write the total to $TUXCTL_REDRAW_LOG
@@ -20,3 +30,4 @@ crossterm = "0.28"
 libc = "0.2"
 ratatui = "0.29"
 serde_json = "1"
+signal-hook = "0.3"

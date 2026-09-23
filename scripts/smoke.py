@@ -8,6 +8,7 @@ failure. Needs systemd (systemctl/journalctl) for the Services and Logs checks.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -28,10 +29,18 @@ def check(name, ok, detail=""):
 t = Tui(ARGV, cols=120, rows=40)
 check("startup enters alternate screen + mouse capture", b"\x1b[?1049h" in t.all and b"\x1b[?1000h" in t.all)
 
+
+def children(tui, name):
+    return [pid for pid, comm in tui.session_processes() if comm == name]
+
+
+check("no journalctl before the Logs tab is visited", not children(t, "journalctl"))
+
 for key in "12345":
     t.send(key)
 t.send("\t"); t.send("\x1b[Z"); t.send("\x1b[C"); t.send("\x1b[D")
 check("tab navigation keys (1-5, Tab, Shift+Tab, arrows)", t.alive())
+check("one journalctl after the Logs tab is visited", len(children(t, "journalctl")) == 1)
 
 t.send("1")
 out = b""
@@ -114,14 +123,35 @@ os.write(t.fd, b"\x03")
 code = t.wait_exit()
 tail = t.all[-400:]
 check("Ctrl+C quits from search mode (exit 0)", code == 0, f"exit={code}")
-check("terminal restored: leave alt screen, mouse off, cursor shown",
-      b"\x1b[?1049l" in tail and b"\x1b[?1000l" in tail and b"\x1b[?25h" in tail)
+
+
+def restored(output):
+    return b"\x1b[?1049l" in output and b"\x1b[?1000l" in output and b"\x1b[?25h" in output
+
+
+check("terminal restored: leave alt screen, mouse off, cursor shown", restored(tail))
+time.sleep(0.3)
+check("no process left in the session after exit", not t.session_processes(), str(t.session_processes()))
 
 t2 = Tui(ARGV, cols=80, rows=24)
 t2.send("3", 0.5)
 os.write(t2.fd, b"q")
 code = t2.wait_exit()
 check("'q' exits from Services (exit 0)", code == 0, f"exit={code}")
+
+# Signals quit like `q`, restore the terminal, stop the collectors, and then end
+# the process with the signal itself.
+for sig in (signal.SIGTERM, signal.SIGHUP):
+    ts = Tui(ARGV, cols=80, rows=24)
+    ts.send("4", 0.8)
+    ts.all = b""
+    os.kill(ts.pid, sig)
+    code = ts.wait_exit(1.0)
+    time.sleep(0.3)
+    left = ts.session_processes()
+    check(f"{sig.name} ends tuxctl by the signal within 1 s", code == -sig, f"exit={code}")
+    check(f"{sig.name} restores the terminal", restored(ts.all[-400:]))
+    check(f"{sig.name} leaves no process in the session", not left, str(left))
 
 for name, ok, detail in results:
     print(f"{'PASS' if ok else 'FAIL'}  {name}{('  ' + detail) if detail and not ok else ''}")
