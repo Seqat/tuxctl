@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "tuxctl"
-version = "0.2.5"
+version = "0.2.7"
 dependencies = [
  "crossterm",
  "libc",

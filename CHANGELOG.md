@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-09-23
+
+Performance, documentation, and release hardening before v0.3.0. No new keys
+or screens.
+
+### Added
+
+- Statically linked (musl) binaries for x86_64 and aarch64 Linux, with
+  `SHA256SUMS`, are attached to each GitHub release.
+- README: quick start, binary installation with checksum verification,
+  measured performance numbers, and an architecture overview
+  (`docs/performance.md` has the method and history).
+
+### Changed
+
+- Release builds use link-time optimization and stripped symbols: the binary
+  is about 35 % smaller (1.27 MB instead of 1.94 MB for x86_64 glibc) and uses
+  about 200 KiB less memory. CPU usage and redraw rates are unchanged.
+
+### Fixed
+
+- SIGTERM, SIGHUP, and SIGINT no longer leave the terminal in raw mode on the
+  alternate screen with mouse capture enabled. `tuxctl` now quits as with `q`,
+  restores the terminal and stops `journalctl`, then exits by the signal. A
+  second signal while the first is being handled terminates immediately.
+- Builds for musl targets no longer emit a deprecation warning.
+
+### Internal
+
+- CI runs the pty smoke test and the redraw-rate guards (`measure.py --check`)
+  on every push and pull request, and lists the crate package contents. A
+  manual workflow runs the full measurements and a 15-minute RSS check.
+- `measure.py` writes JSON, uses an exactly paced log storm, and also reports
+  time to first frame, input latency during a storm, and RSS growth with a
+  full log ring. `rss.py` gains `--every`, `--json`, and `--max-growth`.
+- `smoke.py` checks that `journalctl` starts only when the Logs tab is
+  visited, that no process is left behind after exit, and SIGTERM/SIGHUP
+  shutdown.
+- Integration tests for the command line; the crate package excludes
+  screenshots and development tooling.
+
 ## [0.2.5] - 2026-09-23
 
 Groundwork for v0.3.0, plus a few small features pulled forward.
@@ -126,7 +167,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
 [0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5
 [0.2.2]: https://github.com/Seqat/tuxctl/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Seqat/tuxctl/compare/v0.2.0...v0.2.1
