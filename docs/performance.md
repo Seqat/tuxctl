@@ -61,22 +61,50 @@ it maps, so RSS is higher than for the static build.
 
 Same machine, glibc builds, `measure.py` as of v0.2.7, median of three runs.
 
-| Scenario | v0.2.5 CPU % | v0.2.7 CPU % | v0.2.5 redraws/s | v0.2.7 redraws/s |
-| --- | --- | --- | --- | --- |
-| Overview, idle | 0.55 | 0.55 | 1.40 | 1.25 |
-| Processes, idle | 0.60 | 0.55 | 2.00 | 2.00 |
-| Logs, idle | 0.55 | 0.50 | 0.00 | 0.05 |
-| Logs, 200 journal messages/s | 0.67 | 0.67 | 3.87 | 3.87 |
-| Mouse hover at 240 Hz | 1.20 | 1.10 | 13.56 | 13.54 |
+| Scenario | v0.2.5 CPU % | v0.2.7 CPU % | v0.3.0 CPU % | v0.2.5 redraws/s | v0.2.7 redraws/s | v0.3.0 redraws/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Overview, idle | 0.55 | 0.55 | 0.55 | 1.40 | 1.25 | 1.10 |
+| Processes, idle | 0.60 | 0.55 | 0.60 | 2.00 | 2.00 | 2.00 |
+| Logs, idle | 0.55 | 0.50 | 0.55 | 0.00 | 0.05 | 0.10 |
+| Logs, 200 journal messages/s | 0.67 | 0.67 | 0.67 | 3.87 | 3.87 | 3.93 |
+| Mouse hover at 240 Hz | 1.20 | 1.10 | 1.19 | 13.56 | 13.54 | 13.42 |
 
-| | v0.2.5 | v0.2.7 |
-| --- | --- | --- |
-| Startup RSS | 5.1 MiB | 4.8 MiB |
-| RSS after 15 minutes | 5.4 MiB¹ | 5.2 MiB |
-| Binary size | 1.94 MB | 1.27 MB |
+| | v0.2.5 | v0.2.7 | v0.3.0 |
+| --- | --- | --- | --- |
+| Startup RSS | 5.1 MiB | 4.8 MiB | 4.9 MiB |
+| RSS after 15 minutes | 5.4 MiB¹ | 5.2 MiB | 5.1 MiB² |
+| Binary size | 1.94 MB | 1.27 MB | 1.33 MB |
 
 ¹ Measured before v0.2.7 with the same `rss.py` run: 5 496 kB, flat after
 minute 4.
+² 5 264 kB, +4 KiB since minute 5; v0.2.7 measured 5 200 kB (+0 KiB) in the
+same session.
+
+v0.3.0 was measured interleaved with three fresh v0.2.7 runs on the same day
+(v0.2.7: 0.55 / 0.60 / 0.50 / 0.67 / 1.09 % CPU, 1.10 / 2.00 / 0.00 / 3.93 /
+13.48 redraws/s); every difference is within the noise band. Time to the first
+frame stayed at about 1.9 ms and storm input latency at about 0.5 ms. Single
+runs of each intermediate v0.3.0 commit stayed within the same band, so no
+item stands out. The sanitization pass over every frame does not show in the
+hover scenario, the most render-heavy one. The binary grew by 4.8 % (disk I/O,
+pinning, filters, menu, sparklines). The Logs idle redraws come from host
+journal traffic, as noted below.
+
+### Shortest interval (`--interval 250ms`)
+
+One run each, glibc builds; the idle guard is 9.5 redraws/s at this interval.
+
+| Scenario | v0.2.7 CPU % | v0.3.0 CPU % | v0.2.7 redraws/s | v0.3.0 redraws/s |
+| --- | --- | --- | --- | --- |
+| Overview, idle | 0.75 | 0.80 | 4.00 | 4.00 |
+| Processes, idle | 0.80 | 0.85 | 3.80 | 3.85 |
+| Logs, idle | 0.65 | 0.70 | 0.15 | 0.00 |
+| Logs, 200 journal messages/s | 0.80 | 0.80 | 3.87 | 3.87 |
+| Mouse hover at 240 Hz | 1.29 | 1.39 | 13.48 | 13.58 |
+
+Four times as many metrics and network samples cost about 0.2 CPU percentage
+points on the idle screens and four redraws per second on Overview: the
+metrics and network updates usually arrive together and share one redraw.
 
 v0.2.7 changes no collector cadence or rendering path; the CPU and redraw
 differences above are within the noise band. The smaller binary and the
