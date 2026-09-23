@@ -151,6 +151,8 @@ impl App {
         }
         // Samples taken at another interval would make the window label wrong.
         self.aggregate_cpu_history.clear();
+        self.memory_history.clear();
+        self.network_history.clear();
         self.sampling_interval_changed = true;
         true
     }
@@ -459,14 +461,23 @@ mod tests {
         for sample in 0..10 {
             app.update(Action::SystemMetricsUpdated(SystemMetrics {
                 cpu_percent: Some(f64::from(sample)),
+                memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
                 ..SystemMetrics::default()
+            }));
+            app.update(Action::NetworkUpdated(NetworkSnapshot {
+                interfaces: vec![dummy_network("eth0")],
+                error: None,
             }));
         }
         assert_eq!(app.aggregate_cpu_history().iter().count(), 10);
+        assert_eq!(app.memory_history().iter().count(), 10);
+        assert_eq!(app.network_history().iter().count(), 10);
 
         step(&mut app, IntervalStep::Longer);
 
         assert_eq!(app.aggregate_cpu_history().iter().count(), 0);
+        assert_eq!(app.memory_history().iter().count(), 0);
+        assert_eq!(app.network_history().iter().count(), 0);
         assert_eq!(app.cpu_history_interval(), Duration::from_secs(2));
     }
 

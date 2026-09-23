@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that exits is shown as `exited` for 5 seconds, cannot be signaled, and is
   then removed. The Overview System panel lists pinned processes with their
   CPU and memory.
+- Overview shows RAM usage and network traffic trends next to the existing CPU
+  history: sparklines of the last 60 samples, the network one scaled to its
+  peak and counting only the interfaces the Overview lists. Like the CPU
+  history, they start over when the interval changes.
 - View filters on `v`: Processes hide kernel threads; Services show all
   units, loaded units (hiding `not-found`), or failed units; Logs show a
   minimum priority of notice, warning, or error. They combine with the search,

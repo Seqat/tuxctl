@@ -42,13 +42,13 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - 1-minute, 5-minute, and 15-minute load averages.
   - Per-logical-CPU utilization.
   - Responsive logical-CPU grid for different terminal sizes.
-- Live RAM usage with used/total capacity.
+- Live RAM usage with used/total capacity and a usage trend.
 - Hardware inventory:
   - CPU model information.
   - RAM module information via EDAC sysfs when available.
   - GPU devices using DRM/NVIDIA sysfs metadata.
   - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
-- Compact physical network interface summary with live RX/TX rates.
+- Compact physical network interface summary with live RX/TX rates and a combined traffic trend with its peak.
 - Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
 
 ### Processes

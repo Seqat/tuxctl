@@ -34,7 +34,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let metrics = app.system_metrics();
     let width = usize::from(inner.width);
     let lower_desired = [
-        2_u16.saturating_add(
+        // Heading, usage, trend and up to two modules.
+        3_u16.saturating_add(
             inventory
                 .map(|inventory| inventory.memory_modules.len().min(2) as u16)
                 .unwrap_or(0),
@@ -66,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let areas = vertical_areas(inner, heights, spacing);
 
     hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
-    render_ram(frame, inventory, metrics, areas[1]);
+    render_ram(frame, app, inventory, metrics, areas[1]);
     render_gpu(frame, inventory, areas[2]);
     render_storage(frame, inventory, metrics, areas[3]);
     hardware_network_summary::render(frame, app, inventory, areas[4]);
@@ -150,6 +151,7 @@ fn vertical_areas(area: Rect, heights: [u16; 5], spacing: u16) -> [Rect; 5] {
 
 fn render_ram(
     frame: &mut Frame,
+    app: &App,
     inventory: Option<&HardwareInventory>,
     metrics: &SystemMetrics,
     area: Rect,
@@ -166,6 +168,18 @@ fn render_ram(
             |memory| usage_bar_line("Used  ", memory, width),
         );
         lines.push(Line::from(layout::truncate(&usage_line, width)));
+    }
+
+    // The trend gives way first: it is shown only when the modules fit too.
+    let module_rows = inventory.map_or(0, |inventory| inventory.memory_modules.len().min(2));
+    if usize::from(area.height) >= lines.len() + 1 + module_rows {
+        lines.push(Line::from(trend_line(
+            app.memory_history(),
+            app.cpu_history_interval(),
+            100.0,
+            None,
+            width,
+        )));
     }
 
     if let Some(inventory) = inventory {
@@ -185,6 +199,27 @@ fn render_ram(
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `Trend  ▂▃▅  60s`, optionally followed by a note such as the peak rate.
+pub(super) fn trend_line(
+    history: &crate::app::MetricHistory,
+    interval: std::time::Duration,
+    scale: f64,
+    note: Option<&str>,
+    width: usize,
+) -> String {
+    // As wide as the CPU line's `Util   12%  `, so the sparklines line up.
+    const LABEL: &str = "Trend       ";
+    let note = note.map(|note| format!("  {note}")).unwrap_or_default();
+    let room = width.saturating_sub(LABEL.len() + note.chars().count());
+    layout::truncate(
+        &format!(
+            "{LABEL}{}{note}",
+            hardware_cpu::history_line(history, interval, room, scale)
+        ),
+        width,
+    )
 }
 
 /// Formats `<label>N%  [bar]  used / total`, dropping the bar when it would be too narrow.
@@ -625,6 +660,104 @@ mod tests {
         metrics.disks.clear();
         let hidden = [("SATA0  disk".to_owned(), disk_rates(&metrics, "sda"))];
         assert_eq!(storage_lines(&hidden, 40), ["SATA0  disk"]);
+    }
+
+    #[test]
+    fn ram_and_network_trends_appear_when_there_is_room() {
+        use crate::action::Action;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::default();
+        for used in [1_u64, 2, 3] {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                memory: Some(crate::linux::ByteUsage {
+                    used: used << 30,
+                    total: 4 << 30,
+                }),
+                ..SystemMetrics::default()
+            }));
+        }
+        for rx in [0.0, 512.0, 2048.0] {
+            app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
+                interfaces: vec![crate::linux::NetworkInterfaceInfo {
+                    name: "enp6s0".into(),
+                    operstate: crate::linux::OperState::Up,
+                    mac_address: None,
+                    mtu: Some(1500),
+                    ipv4_addresses: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    rx_errors: 0,
+                    tx_errors: 0,
+                    rx_dropped: 0,
+                    tx_dropped: 0,
+                    rx_rate_bytes_per_sec: Some(rx),
+                    tx_rate_bytes_per_sec: Some(0.0),
+                }],
+                error: None,
+            }));
+        }
+        let rows = |height| {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+
+        let tall = rows(40);
+        let trends: Vec<&String> = tall.iter().filter(|row| row.contains("Trend ")).collect();
+        assert_eq!(trends.len(), 2, "{tall:#?}");
+        assert!(
+            trends[0].contains("▃▅▆"),
+            "RAM at 25/50/75 %: {}",
+            trends[0]
+        );
+        assert!(
+            trends[1].contains("▁▃█"),
+            "network scaled to its peak: {}",
+            trends[1]
+        );
+        assert!(trends[1].contains("peak 2.0 KiB/s"), "{}", trends[1]);
+
+        // The CPU and RAM sparklines start in the same column.
+        let column = |row: &String, marker: char| row.chars().position(|c| c == marker);
+        let cpu = tall.iter().find(|row| row.contains("Util")).unwrap();
+        assert_eq!(
+            column(cpu, '—'),
+            column(trends[0], '▃'),
+            "{cpu}\n{}",
+            trends[0]
+        );
+
+        // A trend never displaces the row it summarizes.
+        for height in 8..40 {
+            let panel = rows(height);
+            let at = |text: &str| panel.iter().position(|row| row.contains(text));
+            let trend_rows: Vec<usize> = panel
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains("Trend "))
+                .map(|(index, _)| index)
+                .collect();
+            for trend in trend_rows {
+                let owner = if at("NETWORK").is_some_and(|network| trend > network) {
+                    at("enp6s0")
+                } else {
+                    at("Used")
+                };
+                assert!(
+                    owner.is_some_and(|owner| owner < trend),
+                    "{height}: {panel:#?}"
+                );
+            }
+        }
     }
 
     #[test]

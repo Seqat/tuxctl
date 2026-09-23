@@ -34,11 +34,12 @@ mod test_support;
 use health::CollectorHealth;
 pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
 use logs::LogView;
+pub(crate) use network::{is_overview_interface, is_physical_interface};
 use processes::{PinnedProcess, ProcessKeys, ProcessRow, ProcessView};
 use services::ServiceView;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
-const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
+const METRIC_HISTORY_CAPACITY: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -48,30 +49,37 @@ pub struct ProcessSignalConfirmation {
     pub focused_button: SignalConfirmButton,
 }
 
+/// The last `METRIC_HISTORY_CAPACITY` samples of one metric (CPU %, RAM %,
+/// network bytes/s), one per sampling interval. The buffer is allocated once
+/// and never grows.
 #[derive(Debug)]
-pub struct AggregateCpuHistory {
+pub struct MetricHistory {
     samples: VecDeque<f64>,
 }
 
-impl Default for AggregateCpuHistory {
+impl Default for MetricHistory {
     fn default() -> Self {
         Self {
-            samples: VecDeque::with_capacity(AGGREGATE_CPU_HISTORY_CAPACITY),
+            samples: VecDeque::with_capacity(METRIC_HISTORY_CAPACITY),
         }
     }
 }
 
-impl AggregateCpuHistory {
-    fn push(&mut self, utilization_percent: f64) -> bool {
-        if !utilization_percent.is_finite() {
+impl MetricHistory {
+    /// Records a sample; non-finite or negative values are rejected.
+    fn push(&mut self, value: f64) -> bool {
+        if !value.is_finite() || value < 0.0 {
             return false;
         }
-        if self.samples.len() == AGGREGATE_CPU_HISTORY_CAPACITY {
+        if self.samples.len() == METRIC_HISTORY_CAPACITY {
             self.samples.pop_front();
         }
-        self.samples
-            .push_back(utilization_percent.clamp(0.0, 100.0));
+        self.samples.push_back(value);
         true
+    }
+
+    fn push_percent(&mut self, percent: f64) -> bool {
+        percent.is_finite() && self.push(percent.clamp(0.0, 100.0))
     }
 
     fn clear(&mut self) {
@@ -80,7 +88,7 @@ impl AggregateCpuHistory {
 
     /// Number of samples kept; the history covers `capacity × sampling interval`.
     pub fn capacity(&self) -> usize {
-        AGGREGATE_CPU_HISTORY_CAPACITY
+        METRIC_HISTORY_CAPACITY
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = f64> + ExactSizeIterator + '_ {
@@ -112,7 +120,10 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
-    aggregate_cpu_history: AggregateCpuHistory,
+    aggregate_cpu_history: MetricHistory,
+    memory_history: MetricHistory,
+    /// Combined RX+TX bytes/s of the interfaces the Overview lists.
+    network_history: MetricHistory,
     processes: Vec<ProcessInfo>,
     /// Lowercased search/sort keys parallel to `processes`; empty until the next
     /// filter rebuild after a snapshot replaced `processes`.
@@ -180,7 +191,9 @@ impl Default for App {
             active_tab: Tab::Overview,
             system_metrics: SystemMetrics::default(),
             hardware: None,
-            aggregate_cpu_history: AggregateCpuHistory::default(),
+            aggregate_cpu_history: MetricHistory::default(),
+            memory_history: MetricHistory::default(),
+            network_history: MetricHistory::default(),
             processes: Vec::new(),
             process_keys: Vec::new(),
             process_summary: ProcessSummary::default(),
@@ -274,8 +287,16 @@ impl App {
         &self.system_metrics
     }
 
-    pub fn aggregate_cpu_history(&self) -> &AggregateCpuHistory {
+    pub fn aggregate_cpu_history(&self) -> &MetricHistory {
         &self.aggregate_cpu_history
+    }
+
+    pub fn memory_history(&self) -> &MetricHistory {
+        &self.memory_history
+    }
+
+    pub fn network_history(&self) -> &MetricHistory {
+        &self.network_history
     }
 
     pub fn hardware(&self) -> Option<&HardwareInventory> {
@@ -333,9 +354,13 @@ impl App {
                 let process_metrics_changed = self.system_metrics.cpu_percent
                     != metrics.cpu_percent
                     || self.system_metrics.memory != metrics.memory;
-                let history_changed = metrics
+                let cpu_recorded = metrics
                     .cpu_percent
-                    .is_some_and(|sample| self.aggregate_cpu_history.push(sample));
+                    .is_some_and(|sample| self.aggregate_cpu_history.push_percent(sample));
+                let memory_recorded = metrics
+                    .memory
+                    .is_some_and(|memory| self.memory_history.push_percent(memory.percent()));
+                let history_changed = cpu_recorded || memory_recorded;
                 let metrics_changed = self.system_metrics != metrics;
                 if metrics_changed {
                     self.system_metrics = metrics;
@@ -1318,9 +1343,86 @@ mod tests {
     }
 
     #[test]
+    fn metric_history_never_grows_and_rejects_invalid_samples() {
+        let mut history = MetricHistory::default();
+        let capacity = history.samples.capacity();
+
+        for sample in 0..(METRIC_HISTORY_CAPACITY * 3) {
+            assert!(history.push(sample as f64));
+        }
+        assert!(!history.push(f64::NAN));
+        assert!(!history.push(f64::INFINITY));
+        assert!(!history.push(-1.0));
+        assert!(history.push_percent(250.0), "percentages are clamped");
+
+        assert_eq!(history.iter().len(), METRIC_HISTORY_CAPACITY);
+        assert_eq!(history.iter().last(), Some(100.0));
+        assert_eq!(history.samples.capacity(), capacity, "no reallocation");
+    }
+
+    #[test]
+    fn memory_usage_is_recorded_with_each_metrics_sample() {
+        let mut app = App::default();
+        for used in [1, 2, 3] {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                memory: Some(crate::linux::ByteUsage { used, total: 4 }),
+                ..SystemMetrics::default()
+            }));
+        }
+        assert_eq!(
+            app.memory_history().iter().collect::<Vec<_>>(),
+            [25.0, 50.0, 75.0]
+        );
+    }
+
+    #[test]
+    fn network_history_sums_the_overview_interfaces_once_per_snapshot() {
+        let mut app = App::default();
+        let interface = |name: &str, rx, tx| NetworkInterfaceInfo {
+            rx_rate_bytes_per_sec: rx,
+            tx_rate_bytes_per_sec: tx,
+            ..dummy_network(name)
+        };
+        let snapshot = NetworkSnapshot {
+            interfaces: vec![
+                interface("enp6s0", Some(1000.0), Some(24.0)),
+                interface("wlan0", Some(1.0), None),
+                interface("lo", Some(5000.0), Some(5000.0)),
+                interface("docker0", Some(700.0), Some(700.0)),
+                interface("veth12ab", Some(700.0), Some(700.0)),
+            ],
+            error: None,
+        };
+
+        assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
+        // An unchanged snapshot still adds a sample and redraws the Overview.
+        assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
+        assert_eq!(
+            app.network_history().iter().collect::<Vec<_>>(),
+            [1025.0, 1025.0]
+        );
+
+        // Errors and snapshots without any rate add nothing.
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: Vec::new(),
+            error: Some("read failed".into()),
+        }));
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![interface("enp6s0", None, None)],
+            error: None,
+        }));
+        assert_eq!(app.network_history().iter().len(), 2);
+
+        // Hidden from the Overview, a sample is still kept but redraws nothing.
+        app.update(Action::SelectTab(Tab::Logs));
+        assert!(!app.update(Action::NetworkUpdated(snapshot)));
+        assert_eq!(app.network_history().iter().len(), 3);
+    }
+
+    #[test]
     fn aggregate_cpu_history_is_bounded_and_evicts_oldest_samples() {
         let mut app = App::default();
-        let sample_count = AGGREGATE_CPU_HISTORY_CAPACITY + 5;
+        let sample_count = METRIC_HISTORY_CAPACITY + 5;
 
         for sample in 0..sample_count {
             app.update(Action::SystemMetricsUpdated(SystemMetrics {
@@ -1330,7 +1432,7 @@ mod tests {
         }
 
         let history = app.aggregate_cpu_history().iter().collect::<Vec<_>>();
-        assert_eq!(history.len(), AGGREGATE_CPU_HISTORY_CAPACITY);
+        assert_eq!(history.len(), METRIC_HISTORY_CAPACITY);
         assert_eq!(history.first(), Some(&5.0));
         assert_eq!(history.last(), Some(&64.0));
     }

@@ -1,7 +1,7 @@
 use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
 
 use crate::{
-    app::App,
+    app::{App, MetricHistory},
     linux::{HardwareInventory, LogicalCpuMetrics, SystemMetrics},
 };
 
@@ -283,20 +283,34 @@ fn dense_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize
 }
 
 /// The CPU sparkline followed by the time span it covers, e.g. `▂▃▅  60s`.
-/// The span counts only the samples that fit, so it shrinks on narrow panels.
 fn utilization_history(app: &App, width: usize) -> String {
+    history_line(
+        app.aggregate_cpu_history(),
+        app.cpu_history_interval(),
+        width,
+        100.0,
+    )
+}
+
+/// A metric's sparkline followed by the time span it covers, e.g. `▂▃▅  60s`;
+/// `scale` is the value drawn as a full block. The span counts only the
+/// samples that fit, so it shrinks on narrow panels.
+pub(super) fn history_line(
+    history: &MetricHistory,
+    interval: std::time::Duration,
+    width: usize,
+    scale: f64,
+) -> String {
     const LABEL_GAP: &str = "  ";
     const MIN_SPARKLINE_WIDTH: usize = 4;
-    let history = app.aggregate_cpu_history();
-    let interval = app.cpu_history_interval();
     let widest_label = format_window(interval.saturating_mul(history.capacity() as u32));
     let sparkline_width = width
         .saturating_sub(LABEL_GAP.len() + widest_label.chars().count())
         .min(history.capacity());
     if sparkline_width < MIN_SPARKLINE_WIDTH {
-        return history_sparkline(history.iter(), width);
+        return history_sparkline(history.iter(), width, scale);
     }
-    let sparkline = history_sparkline(history.iter(), sparkline_width);
+    let sparkline = history_sparkline(history.iter(), sparkline_width, scale);
     let window = format_window(interval.saturating_mul(sparkline_width as u32));
     format!(
         "{}{LABEL_GAP}{window}",
@@ -321,16 +335,25 @@ fn format_window(window: std::time::Duration) -> String {
     }
 }
 
-fn history_sparkline(samples: impl ExactSizeIterator<Item = f64>, width: usize) -> String {
+fn history_sparkline(
+    samples: impl ExactSizeIterator<Item = f64>,
+    width: usize,
+    scale: f64,
+) -> String {
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     if width == 0 {
         return String::new();
     }
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
     let skip = samples.len().saturating_sub(width);
     let result = samples
         .skip(skip)
         .map(|sample| {
-            let index = ((sample.clamp(0.0, 100.0) / 100.0) * 7.0).round() as usize;
+            let index = ((sample / scale).clamp(0.0, 1.0) * 7.0).round() as usize;
             LEVELS[index.min(LEVELS.len() - 1)]
         })
         .collect::<String>();
@@ -477,9 +500,19 @@ mod tests {
     fn history_sparkline_keeps_the_newest_samples_that_fit() {
         let samples = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 100.0];
 
-        assert_eq!(history_sparkline(samples.into_iter(), 4), "▅▆▇█");
-        assert_eq!(history_sparkline(samples.into_iter(), 0), "");
-        assert_eq!(history_sparkline([].into_iter(), 4), "—");
+        assert_eq!(history_sparkline(samples.into_iter(), 4, 100.0), "▅▆▇█");
+        assert_eq!(history_sparkline(samples.into_iter(), 0, 100.0), "");
+        assert_eq!(history_sparkline([].into_iter(), 4, 100.0), "—");
+    }
+
+    #[test]
+    fn sparklines_scale_to_the_given_maximum() {
+        let rates = [0.0, 256.0, 512.0, 1024.0];
+        assert_eq!(history_sparkline(rates.into_iter(), 4, 1024.0), "▁▃▅█");
+        // Values above the scale are capped; a zero or invalid scale is safe.
+        assert_eq!(history_sparkline([2048.0].into_iter(), 1, 1024.0), "█");
+        assert_eq!(history_sparkline([0.0, 5.0].into_iter(), 2, 0.0), "▁█");
+        assert_eq!(history_sparkline([1.0].into_iter(), 1, f64::NAN), "█");
     }
 
     #[test]
