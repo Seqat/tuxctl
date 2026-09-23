@@ -15,6 +15,7 @@ use super::{
     hardware::is_whole_disk,
     latest_snapshot::{self, LatestReceiver},
     rate::CounterSample,
+    temperature::{NoNvidia, SysfsRoots, Temperature, TemperatureSampler},
 };
 
 const PROC_STAT: &str = "/proc/stat";
@@ -39,6 +40,8 @@ pub struct SystemMetrics {
     pub system_identity: SystemIdentity,
     /// Throughput of whole disks; empty when /proc/diskstats is unreadable.
     pub disks: Vec<DiskIo>,
+    /// One entry per discovered sensor, read at most every 2 s.
+    pub temperatures: Vec<Temperature>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,18 +168,22 @@ struct SystemMetricsSampler {
     previous_cpu: Option<CpuSample>,
     system_identity: SystemIdentity,
     disks: DiskIoSampler,
+    temperatures: TemperatureSampler<NoNvidia>,
 }
 
 impl SystemMetricsSampler {
+    /// Created on the worker thread: temperature discovery runs here.
     fn new(system_identity: SystemIdentity) -> Self {
         Self {
             previous_cpu: None,
             system_identity,
             disks: DiskIoSampler::default(),
+            temperatures: TemperatureSampler::new(SysfsRoots::default(), NoNvidia, Instant::now()),
         }
     }
 
     fn collect(&mut self) -> SystemMetrics {
+        let now = Instant::now();
         let current_cpu = fs::read_to_string(PROC_STAT)
             .ok()
             .and_then(|contents| parse_cpu_sample(&contents));
@@ -202,9 +209,8 @@ impl SystemMetricsSampler {
                 .and_then(|contents| parse_load_average(&contents)),
             root_filesystem: filesystem_usage("/").ok(),
             system_identity: self.system_identity.clone(),
-            disks: self
-                .disks
-                .collect(Path::new(PROC_DISKSTATS), Instant::now()),
+            disks: self.disks.collect(Path::new(PROC_DISKSTATS), now),
+            temperatures: self.temperatures.sample(now).to_vec(),
         }
     }
 }

@@ -8,6 +8,7 @@ mod process;
 mod rate;
 mod service;
 mod system;
+mod temperature;
 
 #[cfg(test)]
 pub(crate) use hardware::{CpuPackage, GpuDevice, NetworkDevice};

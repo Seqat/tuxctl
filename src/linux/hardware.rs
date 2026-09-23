@@ -284,7 +284,7 @@ fn discover_gpus(drm_root: &Path, nvidia_root: &Path) -> Vec<GpuDevice> {
         .collect()
 }
 
-fn sorted_drm_cards(names: impl IntoIterator<Item = String>) -> Vec<(u32, String)> {
+pub(super) fn sorted_drm_cards(names: impl IntoIterator<Item = String>) -> Vec<(u32, String)> {
     let mut cards = names
         .into_iter()
         .filter_map(|name| drm_card_index(&name).map(|index| (index, name)))
@@ -479,7 +479,7 @@ fn is_letters_after(name: &str, prefix: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
-fn read_sorted_directories(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+pub(super) fn read_sorted_directories(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut entries = fs::read_dir(root)
         .ok()
         .into_iter()
@@ -494,7 +494,7 @@ fn read_sorted_directories(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<Path
     entries
 }
 
-fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+pub(super) fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path)
         .ok()
         .and_then(|value| meaningful(Some(value)))
