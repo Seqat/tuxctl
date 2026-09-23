@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
@@ -345,7 +345,15 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         return UiRegions::default();
     }
 
-    let mut outer = Block::default().borders(Borders::ALL).title(" tuxctl ");
+    let mut outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::raw(" tuxctl "),
+            Span::styled(
+                interval_indicator(app),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
     if let Some(marker) = stale_marker(app, area.width) {
         outer = outer.title_top(
             Line::from(marker)
@@ -448,6 +456,11 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     regions
 }
 
+/// The sampling interval shown after the title, e.g. `⟳ 1s `.
+fn interval_indicator(app: &App) -> String {
+    format!("⟳ {} ", app.sampling_interval_label())
+}
+
 /// Names the collectors behind this screen whose data stopped updating, falling
 /// back to a bare marker when the names would crowd the title.
 fn stale_marker(app: &App, width: u16) -> Option<String> {
@@ -456,7 +469,8 @@ fn stale_marker(app: &App, width: u16) -> Option<String> {
         return None;
     }
     let detailed = format!(" stale: {} ", names.join(", "));
-    let room = usize::from(width).saturating_sub(" tuxctl ".len() + 4);
+    let title = " tuxctl ".len() + interval_indicator(app).chars().count();
+    let room = usize::from(width).saturating_sub(title + 4);
     Some(if detailed.chars().count() <= room {
         detailed
     } else {
@@ -618,7 +632,7 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = layout::centered_rect(area, 64, 21);
+    let popup = layout::centered_rect(area, 64, 22);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
@@ -634,6 +648,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Line::from("  1-5                 Select tab"),
             Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
             Line::from("  ?                   Toggle help"),
+            Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
             Line::from("  Esc                 Close popup / cancel search"),
             Line::from("  q / Ctrl+C          Quit application"),
             Line::from(""),

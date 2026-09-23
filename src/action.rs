@@ -13,6 +13,7 @@ pub enum Action {
     PreviousTab,
     ShowHelp,
     Escape,
+    StepSamplingInterval(IntervalStep),
     SystemMetricsUpdated(SystemMetrics),
     HardwareDiscovered(HardwareInventory),
     ProcessesUpdated(ProcessSnapshot),
@@ -89,6 +90,13 @@ pub enum MouseTarget {
     ServiceRow(Arc<str>),
     LogRow(u64),
     NetworkRow(Arc<str>),
+}
+
+/// Direction of a `+`/`-` step through the sampling presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalStep {
+    Longer,
+    Shorter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -32,7 +32,7 @@ speed, so they hold on shared CI runners:
 | --- | --- | --- |
 | Rapid hover redraws/s | ≤ 31 | Hover redraws are coalesced to one per 33 ms. |
 | Log storm redraws/s | ≤ 21 | Background redraws are limited to one per 50 ms. |
-| Overview and Processes idle redraws/s | ≤ 3.5 | At most one redraw per 1 s collector update, never one per 250 ms tick. Only checked at the default interval. |
+| Overview and Processes idle redraws/s | ≤ 3.5 at `1s`, ≤ 9.5 at `250ms` | At most one redraw per collector update (metrics and network every interval, processes at most once per second), plus 0.5, never one per 250 ms tick. The limit follows `--interval` after `--`. |
 | Startup RSS | ≤ 16 MiB | Catastrophe limit (about 3× a typical desktop). |
 | Storm input latency (median) | ≤ 1000 ms | Catastrophe limit. |
 | Exit | `q` exits with status 0 | Liveness. |

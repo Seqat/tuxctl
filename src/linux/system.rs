@@ -89,7 +89,7 @@ pub struct SystemMetricsCollector {
 impl SystemMetricsCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (metrics_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("system-metrics".into())
@@ -98,7 +98,6 @@ impl SystemMetricsCollector {
                 let mut sampler = SystemMetricsSampler::new(identity);
 
                 run_periodic(
-                    refresh_rate,
                     &worker_control,
                     || sampler.collect(),
                     |snapshot| metrics_tx.publish(snapshot),
@@ -114,6 +113,11 @@ impl SystemMetricsCollector {
 
     pub fn latest(&self) -> Option<SystemMetrics> {
         self.receiver.take_latest()
+    }
+
+    /// Applies a new sampling period to the running worker.
+    pub fn set_period(&self, period: Duration) {
+        self.control.set_period(period);
     }
 }
 

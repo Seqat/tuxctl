@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `+` and `-` change the sampling interval while `tuxctl` runs, through the
+  same presets as `--interval` (`250ms` to `60s`). The current interval is
+  shown as `⟳ 1s` in the frame title. Running collectors switch without a
+  restart; rates stay correct because they are computed from the actual time
+  between samples.
+
+### Changed
+
+- The Overview CPU history starts over when the interval changes, so its time
+  span stays accurate.
+
 ### Fixed
 
 - While typing a search on Processes, Services, or Logs, `↑`/`↓` and

@@ -34,6 +34,11 @@ jobs:
         run: >
           scripts/measure.py target/counter/release/tuxctl
           --label "${GITHUB_SHA::7}" --secs "$SECS" --json measure.json --check
+      - name: Measure at the shortest interval
+        run: >
+          scripts/measure.py target/counter/release/tuxctl
+          --label "${GITHUB_SHA::7}-250ms" --secs "$SECS" --json measure-250ms.json --check
+          -- --interval 250ms
       - name: RSS over time
         # Reported, not enforced: hosted runners are not the reference machine.
         continue-on-error: true
@@ -46,5 +51,6 @@ jobs:
           name: perf-${{ github.sha }}
           path: |
             measure.json
+            measure-250ms.json
             rss.json
           if-no-files-found: ignore

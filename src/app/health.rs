@@ -2,6 +2,33 @@
 
 use super::*;
 
+/// Selectable sampling intervals, for `--interval` and the `+`/`-` keys.
+/// Shorter intervals are out of scope: the main loop picks up snapshots on a
+/// 250 ms tick and /proc sampling gets noisy.
+pub const SAMPLING_PRESETS: [(&str, Duration); 8] = [
+    ("250ms", Duration::from_millis(250)),
+    ("500ms", Duration::from_millis(500)),
+    ("1s", Duration::from_secs(1)),
+    ("2s", Duration::from_secs(2)),
+    ("5s", Duration::from_secs(5)),
+    ("10s", Duration::from_secs(10)),
+    ("30s", Duration::from_secs(30)),
+    ("60s", Duration::from_secs(60)),
+];
+pub const DEFAULT_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The preset next to `current` in the direction of `step`, if any.
+fn step_preset(current: Duration, step: IntervalStep) -> Option<Duration> {
+    let index = SAMPLING_PRESETS
+        .iter()
+        .position(|(_, interval)| *interval == current)?;
+    let next = match step {
+        IntervalStep::Longer => index.checked_add(1)?,
+        IntervalStep::Shorter => index.checked_sub(1)?,
+    };
+    SAMPLING_PRESETS.get(next).map(|(_, interval)| *interval)
+}
+
 /// How often each background collector samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectorPeriods {
@@ -81,6 +108,54 @@ impl App {
     /// Enables stale markers: a collector is stale after three missed periods.
     /// Services also allow for a full `systemctl` timeout before being flagged.
     pub fn with_collector_periods(mut self, periods: CollectorPeriods) -> Self {
+        self.apply_collector_periods(periods);
+        self
+    }
+
+    /// Label of the current sampling interval, e.g. `1s`.
+    pub fn sampling_interval_label(&self) -> &'static str {
+        SAMPLING_PRESETS
+            .iter()
+            .find(|(_, interval)| *interval == self.sampling_interval)
+            .map_or("?", |(label, _)| label)
+    }
+
+    /// New collector periods after the interval changed, for the main loop to
+    /// hand to the running collectors.
+    pub fn take_sampling_interval_change(&mut self) -> Option<CollectorPeriods> {
+        std::mem::take(&mut self.sampling_interval_changed)
+            .then(|| CollectorPeriods::for_sampling_interval(self.sampling_interval))
+    }
+
+    /// Moves to the neighbouring preset; `false` at either end.
+    pub(super) fn step_sampling_interval(&mut self, step: IntervalStep) -> bool {
+        let Some(interval) = step_preset(self.sampling_interval, step) else {
+            return false;
+        };
+        let staleness_enabled = self
+            .collector_health
+            .iter()
+            .any(|health| health.stale_after.is_some());
+        if staleness_enabled {
+            self.apply_collector_periods(CollectorPeriods::for_sampling_interval(interval));
+            // Collectors pick up the new period on their next wake; judge them
+            // against it from the next tick instead of flagging the old gap.
+            for health in &mut self.collector_health {
+                health.last_update = None;
+                health.updated_since_tick = false;
+                health.stale = false;
+            }
+        } else {
+            self.sampling_interval = interval;
+            self.cpu_history_interval = interval;
+        }
+        // Samples taken at another interval would make the window label wrong.
+        self.aggregate_cpu_history.clear();
+        self.sampling_interval_changed = true;
+        true
+    }
+
+    fn apply_collector_periods(&mut self, periods: CollectorPeriods) {
         for collector in Collector::ALL {
             let threshold = match collector {
                 Collector::Metrics => periods.metrics.saturating_mul(3),
@@ -90,8 +165,8 @@ impl App {
             };
             self.collector_health[collector.index()].stale_after = Some(threshold);
         }
+        self.sampling_interval = periods.metrics;
         self.cpu_history_interval = periods.metrics;
-        self
     }
 
     /// Time between aggregate CPU history samples.
@@ -310,6 +385,99 @@ mod tests {
         );
         assert!(app.update(Action::Tick(start + Duration::from_secs(4))));
         assert_eq!(stale_names(&app), ["metrics", "processes", "network"]);
+    }
+
+    fn step(app: &mut App, step: IntervalStep) -> bool {
+        app.update(Action::StepSamplingInterval(step))
+    }
+
+    #[test]
+    fn interval_steps_walk_the_presets_and_stop_at_both_ends() {
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
+        assert_eq!(app.sampling_interval_label(), "1s");
+
+        let mut labels = Vec::new();
+        while step(&mut app, IntervalStep::Longer) {
+            labels.push(app.sampling_interval_label());
+        }
+        assert_eq!(labels, ["2s", "5s", "10s", "30s", "60s"]);
+        assert!(app.take_sampling_interval_change().is_some());
+        assert!(
+            !step(&mut app, IntervalStep::Longer),
+            "no redraw at the end"
+        );
+        assert!(app.take_sampling_interval_change().is_none());
+
+        while step(&mut app, IntervalStep::Shorter) {}
+        assert_eq!(app.sampling_interval_label(), "250ms");
+        assert!(!step(&mut app, IntervalStep::Shorter));
+    }
+
+    #[test]
+    fn interval_change_hands_clamped_periods_to_the_collectors_once() {
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
+        assert!(app.take_sampling_interval_change().is_none());
+
+        assert!(step(&mut app, IntervalStep::Shorter));
+        assert!(step(&mut app, IntervalStep::Shorter));
+
+        let periods = app.take_sampling_interval_change().expect("changed");
+        assert_eq!(periods.metrics, Duration::from_millis(250));
+        assert_eq!(periods.network, Duration::from_millis(250));
+        assert_eq!(periods.processes, Duration::from_secs(1));
+        assert_eq!(periods.services, Duration::from_secs(5));
+        assert!(app.take_sampling_interval_change().is_none(), "taken once");
+    }
+
+    #[test]
+    fn interval_change_applies_new_thresholds_without_a_false_stale_flash() {
+        let mut app = App::default().with_collector_periods(
+            CollectorPeriods::for_sampling_interval(Duration::from_secs(60)),
+        );
+        let start = Instant::now();
+        fresh_tick(&mut app, start);
+
+        // 10 s after the last 60 s sample, switch to 250 ms (threshold 750 ms).
+        let changed = start + Duration::from_secs(10);
+        assert!(!app.update(Action::Tick(changed)));
+        while step(&mut app, IntervalStep::Shorter) {}
+        assert_eq!(app.sampling_interval_label(), "250ms");
+
+        assert!(!app.update(Action::Tick(changed + Duration::from_millis(250))));
+        assert!(stale_names(&app).is_empty(), "the old gap is not a miss");
+
+        assert!(app.update(Action::Tick(changed + Duration::from_millis(1_100))));
+        assert_eq!(stale_names(&app), ["metrics", "network"]);
+    }
+
+    #[test]
+    fn interval_change_clears_the_cpu_history_and_updates_its_window() {
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
+        for sample in 0..10 {
+            app.update(Action::SystemMetricsUpdated(SystemMetrics {
+                cpu_percent: Some(f64::from(sample)),
+                ..SystemMetrics::default()
+            }));
+        }
+        assert_eq!(app.aggregate_cpu_history().iter().count(), 10);
+
+        step(&mut app, IntervalStep::Longer);
+
+        assert_eq!(app.aggregate_cpu_history().iter().count(), 0);
+        assert_eq!(app.cpu_history_interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn interval_keys_are_ignored_while_an_overlay_is_open() {
+        let mut app = App::default()
+            .with_collector_periods(CollectorPeriods::for_sampling_interval(SAMPLING));
+        app.update(Action::ShowHelp);
+
+        assert!(!step(&mut app, IntervalStep::Longer));
+        assert_eq!(app.sampling_interval_label(), "1s");
     }
 
     #[test]

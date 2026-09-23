@@ -249,7 +249,7 @@ pub struct ProcessCollector {
 impl ProcessCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("process-metrics".into())
@@ -257,7 +257,6 @@ impl ProcessCollector {
                 let mut sampler = ProcessSampler::default();
 
                 run_periodic(
-                    refresh_rate,
                     &worker_control,
                     || sampler.collect(),
                     |snapshot| snapshot_tx.publish(snapshot),
@@ -273,6 +272,11 @@ impl ProcessCollector {
 
     pub fn latest(&self) -> Option<ProcessSnapshot> {
         self.receiver.take_latest()
+    }
+
+    /// Applies a new sampling period to the running worker.
+    pub fn set_period(&self, period: Duration) {
+        self.control.set_period(period);
     }
 }
 

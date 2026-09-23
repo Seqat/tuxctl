@@ -261,7 +261,7 @@ tuxctl [--interval <DURATION>]
 
 | Option | Description |
 | --- | --- |
-| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. |
+| `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. `+` and `-` change the interval while `tuxctl` runs. |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print the version. |
 
@@ -285,6 +285,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
+| `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the title) |
 | `Esc` | Dismiss dialog / clear active search |
 | `q` | Quit |
 | `Ctrl+C` | Quit globally |

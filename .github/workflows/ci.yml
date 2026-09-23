@@ -57,10 +57,17 @@ jobs:
         run: >
           scripts/measure.py target/counter/release/tuxctl
           --label "${GITHUB_SHA::7}" --secs 8 --json measure.json --check
+      - name: Measure at the shortest interval (short)
+        run: >
+          scripts/measure.py target/counter/release/tuxctl
+          --label "${GITHUB_SHA::7}-250ms" --secs 8 --json measure-250ms.json --check
+          -- --interval 250ms
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: measure-${{ github.sha }}
-          path: measure.json
+          path: |
+            measure.json
+            measure-250ms.json
           if-no-files-found: ignore
           retention-days: 30

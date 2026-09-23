@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     action::{
-        Action, InputMode, MouseTarget, ProcessSort, ProcessSortField, SignalConfirmButton, Tab,
+        Action, InputMode, IntervalStep, MouseTarget, ProcessSort, ProcessSortField,
+        SignalConfirmButton, Tab,
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
@@ -31,7 +32,7 @@ mod services;
 mod test_support;
 
 use health::CollectorHealth;
-pub use health::{Collector, CollectorPeriods};
+pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
 use processes::ProcessKeys;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
@@ -69,6 +70,10 @@ impl AggregateCpuHistory {
         self.samples
             .push_back(utilization_percent.clamp(0.0, 100.0));
         true
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
     }
 
     /// Number of samples kept; the history covers `capacity × sampling interval`.
@@ -149,6 +154,8 @@ pub struct App {
     hovered: Option<MouseTarget>,
     collector_health: [CollectorHealth; 4],
     cpu_history_interval: Duration,
+    sampling_interval: Duration,
+    sampling_interval_changed: bool,
     logs_visited: bool,
 }
 
@@ -203,7 +210,9 @@ impl Default for App {
             network_error: None,
             hovered: None,
             collector_health: [CollectorHealth::default(); 4],
-            cpu_history_interval: Duration::from_secs(1),
+            cpu_history_interval: DEFAULT_SAMPLING_INTERVAL,
+            sampling_interval: DEFAULT_SAMPLING_INTERVAL,
+            sampling_interval_changed: false,
             logs_visited: false,
         }
     }
@@ -374,6 +383,7 @@ impl App {
                 self.hovered = None;
                 true
             }
+            Action::StepSamplingInterval(step) => self.step_sampling_interval(step),
             Action::SelectTab(tab) => self.select_tab(tab),
             Action::NextTab => self.select_tab(self.active_tab.next()),
             Action::PreviousTab => self.select_tab(self.active_tab.previous()),

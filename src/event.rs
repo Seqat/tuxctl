@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 
 use crate::{
-    action::{Action, InputMode, MouseTarget, ProcessSortField, Tab},
+    action::{Action, InputMode, IntervalStep, MouseTarget, ProcessSortField, Tab},
     ui::UiRegions,
 };
 
@@ -252,6 +252,8 @@ fn global_tab_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('4') => Some(Action::SelectTab(Tab::Logs)),
         KeyCode::Char('5') => Some(Action::SelectTab(Tab::Network)),
         KeyCode::Char('?') => Some(Action::ShowHelp),
+        KeyCode::Char('+') => Some(Action::StepSamplingInterval(IntervalStep::Longer)),
+        KeyCode::Char('-') => Some(Action::StepSamplingInterval(IntervalStep::Shorter)),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::BackTab => Some(Action::PreviousTab),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::PreviousTab),
@@ -817,6 +819,34 @@ mod tests {
                     "{code:?} in {mode:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plus_and_minus_step_the_interval_on_tabs_and_are_text_in_search() {
+        let plus = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT);
+        let minus = KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE);
+        for mode in TAB_MODES {
+            assert_eq!(
+                translate_key_event(plus, mode),
+                Some(Action::StepSamplingInterval(IntervalStep::Longer))
+            );
+            assert_eq!(
+                translate_key_event(minus, mode),
+                Some(Action::StepSamplingInterval(IntervalStep::Shorter))
+            );
+        }
+        assert_eq!(
+            translate_key_event(minus, InputMode::ProcessSearch),
+            Some(Action::AppendProcessSearch('-'))
+        );
+        for mode in [
+            InputMode::Help,
+            InputMode::ProcessDetail,
+            InputMode::ProcessSignalConfirm,
+            InputMode::LogDetail,
+        ] {
+            assert_eq!(translate_key_event(plus, mode), None, "{mode:?}");
         }
     }
 

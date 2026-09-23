@@ -37,15 +37,31 @@ GUARDS = [
     ("rapid hover 240 Hz", 31, "33 ms hover coalescing"),
     ("logs storm", 21, "50 ms background frame limit"),
 ]
-# Only valid at the default 1 s interval: at most one render per collector
-# update (metrics, processes, network), never one per 250 ms tick.
-IDLE_GUARDS = [
-    ("overview idle", 3.5, "one render per 1 s collector update, not per 250 ms tick"),
-    ("processes idle", 3.5, "one render per 1 s collector update, not per 250 ms tick"),
-]
+# At most one render per collector update (metrics and network every interval,
+# processes at most once per second), never one per 250 ms tick; see
+# idle_limit(). At the default 1 s interval the limit is 3.5.
+IDLE_GUARDS = ["overview idle", "processes idle"]
+INTERVALS = {"250ms": 0.25, "500ms": 0.5, "1s": 1.0, "2s": 2.0, "5s": 5.0,
+             "10s": 10.0, "30s": 30.0, "60s": 60.0}
 # Catastrophe limits only; absolute numbers are compared locally.
 MAX_STARTUP_RSS_KIB = 16 * 1024
 MAX_STORM_LATENCY_MS = 1000
+
+
+def sampling_interval(extra):
+    """The --interval passed to tuxctl in seconds (default 1 s), None if unknown."""
+    value = "1s"
+    for index, arg in enumerate(extra):
+        if arg == "--interval" and index + 1 < len(extra):
+            value = extra[index + 1]
+        elif arg.startswith("--interval="):
+            value = arg.split("=", 1)[1]
+    return INTERVALS.get(value)
+
+
+def idle_limit(interval):
+    """Collector updates per second at `interval`, plus 0.5 of slack."""
+    return round(2 / interval + 1 / max(interval, 1.0) + 0.5, 2)
 
 
 def environment(binary, label, secs, extra, counter_build):
@@ -178,9 +194,11 @@ def main():
     guards = []
     if counter_build:
         by_name = {row["scenario"]: row for row in rows}
-        default_interval = all(not arg.startswith("--interval") for arg in extra) or \
-            extra in (["--interval", "1s"], ["--interval=1s"])
-        for name, limit, reason in GUARDS + (IDLE_GUARDS if default_interval else []):
+        interval = sampling_interval(extra)
+        idle = [] if interval is None else [
+            (name, idle_limit(interval), f"one render per collector update at {interval:g} s, "
+             "not per 250 ms tick") for name in IDLE_GUARDS]
+        for name, limit, reason in GUARDS + idle:
             if name in by_name:
                 value = by_name[name]["redraws_per_s"]
                 guards.append((f"{name} redraws/s {value} <= {limit}", value <= limit, reason))

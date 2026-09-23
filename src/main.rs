@@ -117,6 +117,12 @@ fn main() -> io::Result<()> {
                 ready(&mut events, app.hovered())
             })?;
 
+            if let Some(periods) = app.take_sampling_interval_change() {
+                metrics.set_period(periods.metrics);
+                processes.set_period(periods.processes);
+                network.set_period(periods.network);
+                services.set_period(periods.services);
+            }
             // Queue the tab-entry refresh before resuming so the worker wakes
             // to exactly one collection.
             if let Some(generation) = app.take_service_refresh_request() {
@@ -531,6 +537,7 @@ mod tests {
             Action::SelectTab(Tab::Processes),
             Action::ProcessNext,
             Action::SortProcesses(action::ProcessSortField::Cpu),
+            Action::StepSamplingInterval(action::IntervalStep::Shorter),
             Action::Resize,
         ] {
             assert_eq!(RedrawPolicy::for_action(&action), RedrawPolicy::Immediate);

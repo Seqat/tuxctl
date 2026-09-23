@@ -211,7 +211,7 @@ pub struct NetworkCollector {
 impl NetworkCollector {
     pub fn start(refresh_rate: Duration) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("network-metrics".into())
@@ -219,7 +219,6 @@ impl NetworkCollector {
                 let mut sampler = NetworkSampler::default();
 
                 run_periodic(
-                    refresh_rate,
                     &worker_control,
                     || sampler.collect(),
                     |snapshot| snapshot_tx.publish(snapshot),
@@ -235,6 +234,11 @@ impl NetworkCollector {
 
     pub fn latest(&self) -> Option<NetworkSnapshot> {
         self.receiver.take_latest()
+    }
+
+    /// Applies a new sampling period to the running worker.
+    pub fn set_period(&self, period: Duration) {
+        self.control.set_period(period);
     }
 }
 

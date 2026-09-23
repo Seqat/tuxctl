@@ -64,13 +64,12 @@ impl ServiceCollector {
     /// [`ServiceCollector::set_paused`] resumes it.
     pub fn start(refresh_rate: Duration, paused: bool) -> io::Result<Self> {
         let (snapshot_tx, receiver) = latest_snapshot::channel();
-        let control = Arc::new(CollectorControl::new_paused(paused));
+        let control = Arc::new(CollectorControl::new(refresh_rate, paused));
         let worker_control = Arc::clone(&control);
         let worker = thread::Builder::new()
             .name("systemd-services".into())
             .spawn(move || {
                 run_collector(
-                    refresh_rate,
                     &worker_control,
                     || collect_services(&worker_control),
                     |snapshot| snapshot_tx.publish(snapshot),
@@ -95,6 +94,10 @@ impl ServiceCollector {
     pub fn set_paused(&self, paused: bool) {
         self.control.set_paused(paused);
     }
+
+    pub fn set_period(&self, period: Duration) {
+        self.control.set_period(period);
+    }
 }
 
 impl Drop for ServiceCollector {
@@ -107,7 +110,6 @@ impl Drop for ServiceCollector {
 }
 
 fn run_collector(
-    refresh_rate: Duration,
     control: &CollectorControl,
     mut collect: impl FnMut() -> ServiceSnapshot,
     mut publish: impl FnMut(ServiceSnapshot) -> bool,
@@ -126,7 +128,7 @@ fn run_collector(
             break;
         }
 
-        collection_generation = match control.wait(refresh_rate) {
+        collection_generation = match control.wait_period() {
             CollectorWake::Refresh(generation) => Some(generation),
             CollectorWake::Timeout => None,
             CollectorWake::Stop => break,
@@ -322,7 +324,7 @@ mod tests {
 
     #[test]
     fn refresh_requested_during_collection_requires_the_follow_up_collection() {
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new(Duration::from_secs(60), false));
         let worker_control = Arc::clone(&control);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -330,7 +332,6 @@ mod tests {
         let worker = thread::spawn(move || {
             let mut collection = 0;
             run_collector(
-                Duration::from_secs(60),
                 &worker_control,
                 || {
                     started_tx.send(collection).unwrap();
@@ -357,14 +358,13 @@ mod tests {
 
     #[test]
     fn paused_collector_runs_no_command_until_resumed_with_one_refresh() {
-        let control = Arc::new(CollectorControl::new_paused(true));
+        let control = Arc::new(CollectorControl::new(Duration::from_secs(3600), true));
         let worker_control = Arc::clone(&control);
         let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_collections = Arc::clone(&collections);
         let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             run_collector(
-                Duration::from_secs(3600),
                 &worker_control,
                 || {
                     worker_collections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -506,12 +506,11 @@ mod tests {
 
     #[test]
     fn collector_stop_during_a_hung_collection_joins_promptly() {
-        let control = Arc::new(CollectorControl::default());
+        let control = Arc::new(CollectorControl::new(Duration::from_secs(60), false));
         let worker_control = Arc::clone(&control);
         let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             run_collector(
-                Duration::from_secs(60),
                 &worker_control,
                 || match run_with_deadline(shell("sleep 30; :"), SYSTEMCTL_TIMEOUT, &worker_control)
                 {
