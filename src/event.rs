@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 
 use crate::{
-    action::{Action, InputMode, IntervalStep, MouseTarget, ProcessSortField, Tab},
+    action::{Action, InputMode, IntervalStep, MouseTarget, PinMove, ProcessSortField, Tab},
     ui::UiRegions,
 };
 
@@ -275,6 +275,25 @@ fn process_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(
             Action::RequestProcessSignal(crate::linux::ProcessSignal::Kill),
         ),
+        // Shifted forms come before `p` (sort) and plain arrows (navigation).
+        KeyCode::Char('P') => Some(Action::TogglePin),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(Action::TogglePin)
+        }
+        KeyCode::Up
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            Some(Action::MoveSelectedPin(PinMove::Up))
+        }
+        KeyCode::Down
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            Some(Action::MoveSelectedPin(PinMove::Down))
+        }
         KeyCode::Up | KeyCode::Char('k') => Some(Action::ProcessPrevious),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ProcessNext),
         KeyCode::PageUp => Some(Action::ProcessPreviousPage),
@@ -386,6 +405,7 @@ mod tests {
         ] {
             keys.push(KeyEvent::new(code, KeyModifiers::NONE));
             keys.push(KeyEvent::new(code, KeyModifiers::SHIFT));
+            keys.push(KeyEvent::new(code, KeyModifiers::ALT));
         }
         keys
     }
@@ -448,6 +468,11 @@ mod tests {
             "Space" => plain(KeyCode::Char(' ')),
             "Ctrl+C" => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             "Shift+K" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT),
+            "Shift+P" => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT),
+            "Shift+↑" => KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            "Shift+↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            "Alt+↑" => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+            "Alt+↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
             single if single.chars().count() == 1 => {
                 plain(KeyCode::Char(single.chars().next().unwrap()))
             }
@@ -922,6 +947,66 @@ mod tests {
                 Some(Action::SortProcesses(field))
             );
         }
+    }
+
+    #[test]
+    fn pin_keys_do_not_shadow_sorting_or_navigation() {
+        let key = |code, modifiers| {
+            translate_key_event(KeyEvent::new(code, modifiers), InputMode::Normal)
+        };
+
+        assert_eq!(
+            key(KeyCode::Char('P'), KeyModifiers::NONE),
+            Some(Action::TogglePin)
+        );
+        assert_eq!(
+            key(KeyCode::Char('P'), KeyModifiers::SHIFT),
+            Some(Action::TogglePin)
+        );
+        // Kitty keyboard protocol reports Shift+p as a lowercase key with SHIFT.
+        assert_eq!(
+            key(KeyCode::Char('p'), KeyModifiers::SHIFT),
+            Some(Action::TogglePin)
+        );
+        assert_eq!(
+            key(KeyCode::Char('p'), KeyModifiers::NONE),
+            Some(Action::SortProcesses(ProcessSortField::Pid))
+        );
+
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert_eq!(
+                key(KeyCode::Up, modifiers),
+                Some(Action::MoveSelectedPin(PinMove::Up))
+            );
+            assert_eq!(
+                key(KeyCode::Down, modifiers),
+                Some(Action::MoveSelectedPin(PinMove::Down))
+            );
+        }
+        assert_eq!(
+            key(KeyCode::Up, KeyModifiers::NONE),
+            Some(Action::ProcessPrevious)
+        );
+        assert_eq!(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            Some(Action::ProcessNext)
+        );
+
+        // While typing a search, P is query text and Shift+arrows navigate.
+        assert_eq!(
+            translate_key_event(
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                InputMode::ProcessSearch
+            ),
+            Some(Action::AppendProcessSearch('P'))
+        );
+        assert_eq!(
+            translate_key_event(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+                InputMode::ProcessSearch
+            ),
+            Some(Action::ProcessPrevious)
+        );
     }
 
     #[test]

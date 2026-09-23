@@ -35,6 +35,9 @@ pub enum Action {
     FocusProcessSignal(SignalConfirmButton),
     ExecuteFocusedProcessSignal,
     SortProcesses(ProcessSortField),
+    /// Pin or unpin the selected process.
+    TogglePin,
+    MoveSelectedPin(PinMove),
     ServicesUpdated(ServiceSnapshot),
     ServicePrevious,
     ServiceNext,
@@ -72,10 +75,22 @@ pub enum Action {
     SelectNetwork(Arc<str>),
     OpenNetworkDetails,
     HoverMouseTarget(Option<MouseTarget>),
-    ProcessViewportChanged { start: usize, height: usize },
-    ServiceViewportChanged { start: usize, height: usize },
-    LogViewportChanged { start: usize, height: usize },
-    NetworkViewportChanged { start: usize, height: usize },
+    ProcessViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    ServiceViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    LogViewportChanged {
+        start: usize,
+        height: usize,
+    },
+    NetworkViewportChanged {
+        start: usize,
+        height: usize,
+    },
     Resize,
     Tick(Instant),
 }
@@ -90,6 +105,13 @@ pub enum MouseTarget {
     ServiceRow(Arc<str>),
     LogRow(u64),
     NetworkRow(Arc<str>),
+}
+
+/// Direction in which a pinned process moves within the pinned section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMove {
+    Up,
+    Down,
 }
 
 /// Direction of a `+`/`-` step through the sampling presets.

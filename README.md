@@ -61,6 +61,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - PID (`p`)
   - Name (`n`)
 - Case-insensitive search (`/`).
+- Pinning (`P`): keep up to 8 processes at the top of the list, in your own order.
 - Detailed process inspection (`Enter`).
 - Safe process signaling:
   - SIGTERM with `t`.
@@ -311,8 +312,10 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `n` | Sort by Name |
 | `t` | Request `SIGTERM` for selected process |
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
+| `P` / `Shift+P` | Pin / unpin the selected process (up to 8) |
+| `Shift+↑` / `Shift+↓` | Move the selected pinned process up / down (`Alt+↑` / `Alt+↓` also work) |
 
-Repeated sort commands toggle the sort direction.
+Repeated sort commands toggle the sort direction. Pinned processes stay at the top in the order you give them, marked with `*`; sorting applies to the rows below them. While a search is active, pinned processes that do not match stay visible but dimmed. A pinned process that exits is shown as `exited` for a few seconds and then removed; it can never be signaled.
 
 #### Signal Confirmation
 

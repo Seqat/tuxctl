@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     action::{
-        Action, InputMode, IntervalStep, MouseTarget, ProcessSort, ProcessSortField,
+        Action, InputMode, IntervalStep, MouseTarget, PinMove, ProcessSort, ProcessSortField,
         SignalConfirmButton, Tab,
     },
     linux::{
@@ -33,7 +33,7 @@ mod test_support;
 
 use health::CollectorHealth;
 pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
-use processes::ProcessKeys;
+use processes::{PinnedProcess, ProcessKeys, ProcessRow};
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const AGGREGATE_CPU_HISTORY_CAPACITY: usize = 60;
@@ -112,7 +112,11 @@ pub struct App {
     /// filter rebuild after a snapshot replaced `processes`.
     process_keys: Vec<ProcessKeys>,
     process_summary: ProcessSummary,
-    filtered_processes: Vec<usize>,
+    /// Rows of the Processes table: the pinned section, then the filtered and
+    /// sorted unpinned processes.
+    filtered_processes: Vec<ProcessRow>,
+    /// Pinned processes in the user's order; at most `MAX_PINNED_PROCESSES`.
+    pinned: Vec<PinnedProcess>,
     /// Set while Processes is hidden and `filtered_processes` has been cleared
     /// instead of rebuilt; holds the selected row index to fall back to.
     deferred_process_rebuild: Option<usize>,
@@ -172,6 +176,7 @@ impl Default for App {
             process_keys: Vec::new(),
             process_summary: ProcessSummary::default(),
             filtered_processes: Vec::new(),
+            pinned: Vec::new(),
             deferred_process_rebuild: None,
             selected_process: None,
             process_scroll: 0,
@@ -369,7 +374,7 @@ impl App {
                 }
             }
             // Staleness is global state, so it is checked even while a modal is open.
-            Action::Tick(now) => self.check_collector_staleness(now),
+            Action::Tick(now) => self.check_collector_staleness(now) | self.expire_exited_pins(now),
             Action::Escape => self.escape(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
@@ -406,6 +411,8 @@ impl App {
             Action::OpenProcessDetails => self.open_process_details(),
             Action::RequestProcessSignal(signal) => self.request_process_signal(signal),
             Action::SortProcesses(field) => self.sort_processes(field),
+            Action::TogglePin => self.toggle_selected_pin(),
+            Action::MoveSelectedPin(direction) => self.move_selected_pin(direction),
             Action::ServicePrevious => self.move_service_selection(-1),
             Action::ServiceNext => self.move_service_selection(1),
             Action::ServicePreviousPage => {

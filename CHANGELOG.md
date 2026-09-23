@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Overview storage rows show each disk's read and write throughput, from one
   read of `/proc/diskstats` per sample. Partitions, loop, zram, device-mapper
   and md devices are not listed; their I/O shows up on the physical disks.
+- Process pinning: `P` pins the selected process to the top of the Processes
+  list (up to 8), `Shift+↑`/`Shift+↓` (or `Alt`) reorder pinned processes.
+  Sorting applies below the pinned rows; during a search, non-matching pinned
+  rows stay visible but dimmed. Pins follow the process identity
+  `(PID, start time)`, so a reused PID never inherits one. A pinned process
+  that exits is shown as `exited` for 5 seconds, cannot be signaled, and is
+  then removed.
 
 ### Changed
 

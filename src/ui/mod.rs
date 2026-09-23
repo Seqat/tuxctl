@@ -632,7 +632,7 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = layout::centered_rect(area, 64, 22);
+    let popup = layout::centered_rect(area, 64, 23);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
@@ -669,6 +669,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             ),
             Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
             Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+            Line::from("  Pins                P pin / unpin, Shift+↑/↓ move pinned"),
             Line::from("  Services            r refresh system services"),
             Line::from("  Logs                f follow, Space toggle pause"),
             Line::from(""),

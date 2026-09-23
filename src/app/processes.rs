@@ -1,31 +1,130 @@
-//! Processes screen: snapshot handling, search, sorting, selection and signal confirmation.
+//! Processes screen: snapshot handling, search, sorting, selection, pinning and
+//! signal confirmation.
 
 use super::*;
 
+/// Upper bound on pinned processes; keeps the pinned section within a small
+/// terminal and pin lookups trivially cheap.
+pub(super) const MAX_PINNED_PROCESSES: usize = 8;
+/// How long an exited pinned process stays listed as `exited`.
+pub(super) const EXITED_PIN_LINGER: Duration = Duration::from_secs(5);
+
+/// A process the user pinned to the top of the table, identified by
+/// `(pid, start_time)` so a reused PID never inherits the pin.
+#[derive(Debug)]
+pub(super) struct PinnedProcess {
+    identity: ProcessIdentity,
+    exited: Option<ExitedPin>,
+}
+
+#[derive(Debug)]
+struct ExitedPin {
+    /// The process as last seen, shown dimmed until the pin is dropped.
+    last_seen: ProcessInfo,
+    /// Set by the first tick after the exit was noticed.
+    since: Option<Instant>,
+}
+
+/// One row of the Processes table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessRow {
+    /// Index into `processes`. `dimmed` marks a pinned process that does not
+    /// match the search; it stays listed but is never a fallback selection.
+    Live { index: usize, dimmed: bool },
+    /// Index into `pinned` of a pinned process that has exited.
+    Exited { pin: usize },
+}
+
+/// What the table needs to draw one row.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessRowView<'a> {
+    pub process: &'a ProcessInfo,
+    pub pinned: bool,
+    pub dimmed: bool,
+    pub exited: bool,
+}
+
 impl App {
+    /// Rows in the Processes table, including pinned rows.
     pub fn process_count(&self) -> usize {
         self.filtered_processes.len()
+    }
+
+    /// Live processes the table lists as matches (not dimmed, not exited).
+    pub fn listed_process_count(&self) -> usize {
+        self.filtered_processes
+            .iter()
+            .filter(|row| matches!(row, ProcessRow::Live { dimmed: false, .. }))
+            .count()
+    }
+
+    /// Leading rows that belong to the pinned section.
+    pub fn pinned_row_count(&self) -> usize {
+        self.filtered_processes
+            .iter()
+            .take_while(|row| self.row_is_pinned(**row))
+            .count()
     }
 
     pub fn process_summary(&self) -> ProcessSummary {
         self.process_summary
     }
 
+    /// The process shown at `index`; for an exited pinned row, as last seen.
     pub fn process_at(&self, index: usize) -> Option<&ProcessInfo> {
-        self.filtered_processes
-            .get(index)
-            .and_then(|index| self.processes.get(*index))
+        self.row_process(*self.filtered_processes.get(index)?)
     }
 
-    pub fn selected_process_index(&self) -> Option<usize> {
-        let selected = self.selected_process?;
-        self.filtered_processes.iter().position(|index| {
-            self.processes
-                .get(*index)
-                .is_some_and(|process| process.identity() == selected)
+    pub fn process_row_at(&self, index: usize) -> Option<ProcessRowView<'_>> {
+        let row = *self.filtered_processes.get(index)?;
+        Some(ProcessRowView {
+            process: self.row_process(row)?,
+            pinned: self.row_is_pinned(row),
+            dimmed: matches!(row, ProcessRow::Live { dimmed: true, .. }),
+            exited: matches!(row, ProcessRow::Exited { .. }),
         })
     }
 
+    pub fn selected_process_index(&self) -> Option<usize> {
+        self.row_position(self.selected_process?)
+    }
+
+    fn row_process(&self, row: ProcessRow) -> Option<&ProcessInfo> {
+        match row {
+            ProcessRow::Live { index, .. } => self.processes.get(index),
+            ProcessRow::Exited { pin } => self
+                .pinned
+                .get(pin)
+                .and_then(|pin| pin.exited.as_ref())
+                .map(|exited| &exited.last_seen),
+        }
+    }
+
+    fn row_is_pinned(&self, row: ProcessRow) -> bool {
+        match row {
+            ProcessRow::Live { index, .. } => self.processes.get(index).is_some_and(|process| {
+                self.pinned
+                    .iter()
+                    .any(|pin| pin.identity == process.identity())
+            }),
+            ProcessRow::Exited { .. } => true,
+        }
+    }
+
+    /// Row index of `identity` in the table, pinned or not.
+    fn row_position(&self, identity: ProcessIdentity) -> Option<usize> {
+        self.filtered_processes.iter().position(|row| {
+            self.row_process(*row)
+                .is_some_and(|process| process.identity() == identity)
+        })
+    }
+
+    /// The selected row's identity, also when it is an exited pinned process.
+    pub fn selected_process_identity(&self) -> Option<ProcessIdentity> {
+        self.selected_process
+    }
+
+    /// The selected process if it is still running.
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
         let selected = self.selected_process?;
         self.processes
@@ -105,6 +204,7 @@ impl App {
                 self.deferred_process_rebuild = Some(self.selected_process_index().unwrap_or(0));
             }
             self.filtered_processes.clear();
+            self.mark_exited_pins(&snapshot.processes);
             self.processes = snapshot.processes;
             self.process_keys.clear();
             self.process_summary = summary;
@@ -115,25 +215,23 @@ impl App {
 
         let previous_index = self.selected_process_index().unwrap_or(0);
         let previous_selection = self.selected_process;
+        self.mark_exited_pins(&snapshot.processes);
         self.processes = snapshot.processes;
         self.process_keys.clear();
         self.process_summary = summary;
         self.process_error = None;
         self.rebuild_process_filter();
 
-        self.selected_process = previous_selection.filter(|identity| {
-            self.filtered_processes.iter().any(|index| {
-                self.processes
-                    .get(*index)
-                    .is_some_and(|process| process.identity() == *identity)
-            })
-        });
+        self.selected_process =
+            previous_selection.filter(|identity| self.row_position(*identity).is_some());
 
         self.close_confirmation_for_exited_process();
 
         if self.selected_process.is_none() {
-            let replacement = previous_index.min(self.filtered_processes.len().saturating_sub(1));
-            self.selected_process = self.process_at(replacement).map(ProcessInfo::identity);
+            self.selected_process = self.fallback_process_selection(previous_index);
+            self.close_overlay(&Overlay::ProcessDetail);
+        } else if self.selected_process().is_none() {
+            // The selected pinned process exited; its row stays, its details go.
             self.close_overlay(&Overlay::ProcessDetail);
         }
         self.reconcile_hovered_process();
@@ -163,6 +261,7 @@ impl App {
             self.process_searching = true;
             self.process_action_message = None;
             self.rebuild_process_filter();
+            self.leave_dimmed_selection();
             true
         } else {
             false
@@ -173,6 +272,7 @@ impl App {
         if self.process_searching && !character.is_control() {
             self.process_search_query.push(character);
             self.rebuild_process_filter();
+            self.leave_dimmed_selection();
             true
         } else {
             false
@@ -182,6 +282,7 @@ impl App {
     pub(super) fn backspace_process_search(&mut self) -> bool {
         if self.process_searching && self.process_search_query.pop().is_some() {
             self.rebuild_process_filter();
+            self.leave_dimmed_selection();
             true
         } else {
             false
@@ -200,34 +301,58 @@ impl App {
         }
 
         let keys = &self.process_keys;
-        self.filtered_processes = self
-            .processes
-            .iter()
-            .zip(keys)
-            .enumerate()
-            .filter(|(_, (process, keys))| process_matches(process, keys, &query))
-            .map(|(index, _)| index)
-            .collect();
         let processes = &self.processes;
+        let pinned = &self.pinned;
+        // One pass: live pinned processes go to their slot (at most
+        // MAX_PINNED_PROCESSES identity comparisons each), the rest are filtered.
+        let mut pinned_rows = [None; MAX_PINNED_PROCESSES];
+        let mut rows = std::mem::take(&mut self.filtered_processes);
+        rows.clear();
+        for (index, (process, keys)) in processes.iter().zip(keys).enumerate() {
+            let matches = process_matches(process, keys, &query);
+            let identity = process.identity();
+            if let Some(slot) = pinned.iter().position(|pin| pin.identity == identity) {
+                if let Some(row) = pinned_rows.get_mut(slot) {
+                    *row = Some(ProcessRow::Live {
+                        index,
+                        dimmed: !matches,
+                    });
+                }
+            } else if matches {
+                rows.push(ProcessRow::Live {
+                    index,
+                    dimmed: false,
+                });
+            }
+        }
         let sort = self.process_sort;
-        self.filtered_processes.sort_by(|&left, &right| {
+        let live_index = |row: &ProcessRow| match *row {
+            ProcessRow::Live { index, .. } => index,
+            ProcessRow::Exited { .. } => unreachable!("unpinned rows are live"),
+        };
+        rows.sort_by(|left, right| {
+            let (left, right) = (live_index(left), live_index(right));
             compare_processes(
                 (&processes[left], &keys[left]),
                 (&processes[right], &keys[right]),
                 sort,
             )
         });
-
-        self.selected_process = previous_selection.filter(|identity| {
-            self.filtered_processes.iter().any(|index| {
-                self.processes
-                    .get(*index)
-                    .is_some_and(|process| process.identity() == *identity)
-            })
+        // Pinned rows lead in the user's order; sorting never touches them.
+        let pinned_section = pinned.iter().enumerate().filter_map(|(slot, pin)| {
+            if pin.exited.is_some() {
+                Some(ProcessRow::Exited { pin: slot })
+            } else {
+                pinned_rows.get(slot).copied().flatten()
+            }
         });
+        rows.splice(0..0, pinned_section);
+        self.filtered_processes = rows;
+
+        self.selected_process =
+            previous_selection.filter(|identity| self.row_position(*identity).is_some());
         if self.selected_process.is_none() {
-            let replacement = previous_index.min(self.filtered_processes.len().saturating_sub(1));
-            self.selected_process = self.process_at(replacement).map(ProcessInfo::identity);
+            self.selected_process = self.fallback_process_selection(previous_index);
         }
         self.reconcile_hovered_process();
         self.ensure_process_visible();
@@ -264,11 +389,7 @@ impl App {
             return false;
         }
 
-        if let Some(index) = self.filtered_processes.iter().position(|index| {
-            self.processes
-                .get(*index)
-                .is_some_and(|process| process.identity() == identity)
-        }) {
+        if let Some(index) = self.row_position(identity) {
             self.select_process_index(index)
         } else {
             false
@@ -443,6 +564,137 @@ impl App {
         true
     }
 
+    /// The row to select when the selection is gone: the row now at
+    /// `previous_index`, or the nearest matching live row after or before it.
+    /// Dimmed and exited pinned rows are only ever selected on purpose.
+    fn fallback_process_selection(&self, previous_index: usize) -> Option<ProcessIdentity> {
+        let last = self.filtered_processes.len().checked_sub(1)?;
+        let start = previous_index.min(last);
+        let selectable = |index: &usize| {
+            matches!(
+                self.filtered_processes[*index],
+                ProcessRow::Live { dimmed: false, .. }
+            )
+        };
+        (start..=last)
+            .find(selectable)
+            .or_else(|| (0..start).rev().find(selectable))
+            .and_then(|index| self.process_at(index))
+            .map(ProcessInfo::identity)
+    }
+
+    /// After a query edit, moves the selection off a pinned row the query no
+    /// longer matches, so Enter acts on a match. Refreshes do not call this:
+    /// a dimmed row the user moved to on purpose stays selected.
+    fn leave_dimmed_selection(&mut self) {
+        let Some(index) = self.selected_process_index() else {
+            return;
+        };
+        if matches!(
+            self.filtered_processes[index],
+            ProcessRow::Live { dimmed: true, .. }
+        ) {
+            self.selected_process = self.fallback_process_selection(index);
+            self.ensure_process_visible();
+        }
+    }
+
+    /// Marks pinned processes missing from `next` as exited, keeping their
+    /// last known data for display. Only called with a successful snapshot.
+    fn mark_exited_pins(&mut self, next: &[ProcessInfo]) {
+        let processes = &self.processes;
+        self.pinned.retain_mut(|pin| {
+            if pin.exited.is_some() || next.iter().any(|p| p.identity() == pin.identity) {
+                return true;
+            }
+            match processes.iter().find(|p| p.identity() == pin.identity) {
+                Some(last_seen) => {
+                    pin.exited = Some(ExitedPin {
+                        last_seen: last_seen.clone(),
+                        since: None,
+                    });
+                    true
+                }
+                // Never seen in this App's data: nothing to show.
+                None => false,
+            }
+        });
+    }
+
+    /// Drops exited pins after [`EXITED_PIN_LINGER`]; redraws only when a
+    /// visible row goes away.
+    pub(super) fn expire_exited_pins(&mut self, now: Instant) -> bool {
+        let before = self.pinned.len();
+        self.pinned.retain_mut(|pin| match &mut pin.exited {
+            None => true,
+            Some(exited) => {
+                let since = *exited.since.get_or_insert(now);
+                now.saturating_duration_since(since) < EXITED_PIN_LINGER
+            }
+        });
+        if self.pinned.len() == before {
+            return false;
+        }
+        // Exited rows refer to pins by position, so the rows must be rebuilt.
+        self.rebuild_process_filter();
+        self.active_tab == Tab::Processes
+    }
+
+    pub(super) fn toggle_selected_pin(&mut self) -> bool {
+        if self.active_tab != Tab::Processes {
+            return false;
+        }
+        let Some(identity) = self.selected_process else {
+            return false;
+        };
+        if let Some(position) = self.pinned.iter().position(|pin| pin.identity == identity) {
+            self.pinned.remove(position);
+        } else {
+            if self.selected_process().is_none() {
+                return false;
+            }
+            if self.pinned.len() >= MAX_PINNED_PROCESSES {
+                self.process_action_message =
+                    Some(format!("Pin limit ({MAX_PINNED_PROCESSES}) reached"));
+                return true;
+            }
+            self.pinned.push(PinnedProcess {
+                identity,
+                exited: None,
+            });
+        }
+        self.rebuild_process_filter();
+        true
+    }
+
+    pub(super) fn move_selected_pin(&mut self, direction: PinMove) -> bool {
+        match self.selected_process {
+            Some(identity) => self.move_pin(identity, direction),
+            None => false,
+        }
+    }
+
+    /// Moves a pinned process one place within the pinned section; the
+    /// selection stays on whatever it was on.
+    pub(super) fn move_pin(&mut self, identity: ProcessIdentity, direction: PinMove) -> bool {
+        if self.active_tab != Tab::Processes {
+            return false;
+        }
+        let Some(position) = self.pinned.iter().position(|pin| pin.identity == identity) else {
+            return false;
+        };
+        let target = match direction {
+            PinMove::Up => position.checked_sub(1),
+            PinMove::Down => Some(position + 1).filter(|target| *target < self.pinned.len()),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.pinned.swap(position, target);
+        self.rebuild_process_filter();
+        true
+    }
+
     pub(super) fn ensure_process_visible(&mut self) {
         self.process_scroll = calculate_scroll(
             self.filtered_processes.len(),
@@ -454,12 +706,7 @@ impl App {
 
     fn reconcile_hovered_process(&mut self) {
         if let Some(MouseTarget::ProcessRow(identity)) = &self.hovered {
-            let remains_visible = self.filtered_processes.iter().any(|index| {
-                self.processes
-                    .get(*index)
-                    .is_some_and(|process| process.identity() == *identity)
-            });
-            if !remains_visible {
+            if self.row_position(*identity).is_none() {
                 self.hovered = None;
             }
         }
@@ -1141,6 +1388,354 @@ mod tests {
                 zombies: 1,
             }
         );
+    }
+
+    fn identity(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_time: u64::from(pid),
+        }
+    }
+
+    fn pin(app: &mut App, pid: u32) {
+        app.update(Action::SelectProcess(identity(pid)));
+        assert_eq!(app.selected_process_identity(), Some(identity(pid)));
+        assert!(app.update(Action::TogglePin), "pin {pid}");
+    }
+
+    /// Processes 1..=count sorted by CPU descending: pid 1 lowest CPU.
+    fn cpu_ranked(count: u32) -> Vec<ProcessInfo> {
+        (1..=count)
+            .map(|pid| process_with(pid, &format!("p{pid}"), Some(f64::from(pid)), 100))
+            .collect()
+    }
+
+    fn processes_app(count: u32) -> App {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(cpu_ranked(count))));
+        app
+    }
+
+    #[test]
+    fn pinned_processes_lead_in_pin_order_without_duplicates() {
+        let mut app = processes_app(5);
+        assert_eq!(visible_pids(&app), vec![5, 4, 3, 2, 1]);
+
+        pin(&mut app, 2);
+        pin(&mut app, 4);
+
+        assert_eq!(visible_pids(&app), vec![2, 4, 5, 3, 1]);
+        assert_eq!(app.pinned_row_count(), 2);
+        assert!(app.process_row_at(0).unwrap().pinned);
+        assert!(!app.process_row_at(2).unwrap().pinned);
+        assert_eq!(app.listed_process_count(), 5);
+    }
+
+    #[test]
+    fn sorting_and_refresh_reorder_only_the_unpinned_section() {
+        let mut app = processes_app(5);
+        pin(&mut app, 1);
+        pin(&mut app, 5);
+
+        app.update(Action::SortProcesses(ProcessSortField::Pid));
+        assert_eq!(visible_pids(&app), vec![1, 5, 2, 3, 4]);
+        app.update(Action::SortProcesses(ProcessSortField::Pid));
+        assert_eq!(visible_pids(&app), vec![1, 5, 4, 3, 2]);
+
+        let mut refreshed = cpu_ranked(5);
+        refreshed.reverse();
+        app.update(Action::ProcessesUpdated(processes(refreshed)));
+        assert_eq!(visible_pids(&app), vec![1, 5, 4, 3, 2]);
+
+        // Hidden snapshots defer the rebuild; the pins survive it.
+        app.update(Action::SelectTab(Tab::Logs));
+        app.update(Action::ProcessesUpdated(processes(cpu_ranked(6))));
+        app.update(Action::SelectTab(Tab::Processes));
+        assert_eq!(visible_pids(&app), vec![1, 5, 6, 4, 3, 2]);
+    }
+
+    #[test]
+    fn unpinning_returns_a_process_to_its_sorted_place() {
+        let mut app = processes_app(4);
+        pin(&mut app, 1);
+        assert_eq!(visible_pids(&app), vec![1, 4, 3, 2]);
+
+        assert!(app.update(Action::TogglePin));
+
+        assert_eq!(visible_pids(&app), vec![4, 3, 2, 1]);
+        assert_eq!(app.pinned_row_count(), 0);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+    }
+
+    #[test]
+    fn the_pin_limit_is_enforced_with_a_message() {
+        let mut app = processes_app(MAX_PINNED_PROCESSES as u32 + 2);
+        for pid in 1..=MAX_PINNED_PROCESSES as u32 {
+            pin(&mut app, pid);
+        }
+        app.update(Action::SelectProcess(identity(
+            MAX_PINNED_PROCESSES as u32 + 1,
+        )));
+
+        assert!(app.update(Action::TogglePin), "the message is shown");
+        assert_eq!(app.pinned_row_count(), MAX_PINNED_PROCESSES);
+        assert_eq!(app.process_action_message(), Some("Pin limit (8) reached"));
+    }
+
+    #[test]
+    fn a_reused_pid_never_inherits_a_pin() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+
+        let mut reused = process(2, "impostor");
+        reused.start_time = 999;
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            reused,
+            process(3, "p3"),
+        ])));
+
+        let pinned = app.process_row_at(0).unwrap();
+        assert!(pinned.exited, "the pinned identity is gone");
+        assert_eq!(pinned.process.name, "p2");
+        let impostor = (1..app.process_count())
+            .filter_map(|index| app.process_row_at(index))
+            .find(|row| row.process.name == "impostor")
+            .expect("the new process is listed");
+        assert!(!impostor.pinned);
+    }
+
+    #[test]
+    fn exited_pins_linger_then_drop_with_one_redraw_when_visible() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            process(3, "p3"),
+        ])));
+        assert!(app.process_row_at(0).unwrap().exited);
+
+        let start = Instant::now();
+        assert!(!app.update(Action::Tick(start)), "linger starts");
+        assert!(!app.update(Action::Tick(start + Duration::from_secs(4))));
+        assert!(app.process_row_at(0).unwrap().exited);
+
+        assert!(app.update(Action::Tick(start + EXITED_PIN_LINGER)));
+        assert_eq!(app.pinned_row_count(), 0);
+        assert_eq!(visible_pids(&app), vec![1, 3]);
+        assert!(!app.update(Action::Tick(start + EXITED_PIN_LINGER * 2)));
+    }
+
+    #[test]
+    fn exited_pins_dropped_on_another_tab_do_not_redraw_it() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+        app.update(Action::SelectTab(Tab::Overview));
+        app.update(Action::ProcessesUpdated(processes(vec![process(1, "p1")])));
+
+        let start = Instant::now();
+        app.update(Action::Tick(start));
+        assert!(!app.update(Action::Tick(start + EXITED_PIN_LINGER)));
+        app.update(Action::SelectTab(Tab::Processes));
+        assert_eq!(visible_pids(&app), vec![1]);
+    }
+
+    #[test]
+    fn a_failed_snapshot_does_not_mark_pins_exited() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+
+        app.update(Action::ProcessesUpdated(ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        }));
+
+        let row = app.process_row_at(0).unwrap();
+        assert!(row.pinned && !row.exited);
+    }
+
+    #[test]
+    fn exited_pinned_rows_refuse_details_and_signals_but_can_be_unpinned() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "p1"),
+            process(3, "p3"),
+        ])));
+        assert_eq!(app.selected_process_identity(), Some(identity(2)));
+
+        assert!(!app.update(Action::OpenProcessDetails));
+        assert!(!app.update(Action::RequestProcessSignal(ProcessSignal::Term)));
+        assert!(!app.update(Action::RequestProcessSignal(ProcessSignal::Kill)));
+        assert!(app.process_signal_confirmation().is_none());
+
+        assert!(app.update(Action::TogglePin));
+        assert_eq!(visible_pids(&app), vec![1, 3]);
+    }
+
+    #[test]
+    fn an_open_detail_closes_when_its_pinned_process_exits() {
+        let mut app = processes_app(2);
+        pin(&mut app, 1);
+        app.update(Action::OpenProcessDetails);
+        assert!(app.process_detail_visible());
+
+        app.update(Action::ProcessesUpdated(processes(vec![process(2, "p2")])));
+
+        assert!(!app.process_detail_visible());
+    }
+
+    #[test]
+    fn search_dims_non_matching_pins_and_never_falls_back_to_them() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::ProcessesUpdated(processes(vec![
+            process(1, "bash"),
+            process(2, "sshd"),
+            process(3, "ssh-agent"),
+        ])));
+        pin(&mut app, 1);
+
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('s'));
+        app.update(Action::AppendProcessSearch('s'));
+
+        assert_eq!(visible_pids(&app), vec![1, 2, 3], "the pin stays visible");
+        assert!(app.process_row_at(0).unwrap().dimmed);
+        assert_eq!(app.listed_process_count(), 2);
+        assert_eq!(
+            app.selected_process().map(|p| p.pid),
+            Some(2),
+            "the selection left the dimmed pin for the first match"
+        );
+
+        // Arrows cross into the pinned section; Enter opens the chosen row.
+        assert!(app.update(Action::ProcessPrevious));
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+        assert!(app.update(Action::OpenProcessDetails));
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+    }
+
+    #[test]
+    fn a_dimmed_pin_selected_on_purpose_stays_selected_across_refreshes() {
+        let mut app = App::default();
+        app.update(Action::SelectTab(Tab::Processes));
+        let snapshot = vec![process(1, "bash"), process(2, "sshd")];
+        app.update(Action::ProcessesUpdated(processes(snapshot.clone())));
+        pin(&mut app, 1);
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('s'));
+        app.update(Action::ProcessPrevious);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+
+        let mut refreshed = snapshot;
+        refreshed[1].cpu_percent = Some(50.0);
+        app.update(Action::ProcessesUpdated(processes(refreshed)));
+
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+    }
+
+    #[test]
+    fn a_search_without_matches_selects_nothing_rather_than_a_dimmed_pin() {
+        let mut app = processes_app(3);
+        pin(&mut app, 2);
+        app.update(Action::SelectProcess(identity(3)));
+
+        app.update(Action::BeginProcessSearch);
+        app.update(Action::AppendProcessSearch('z'));
+
+        assert_eq!(visible_pids(&app), vec![2]);
+        assert_eq!(app.selected_process_identity(), None);
+        assert!(!app.update(Action::OpenProcessDetails));
+    }
+
+    #[test]
+    fn moving_pins_reorders_them_and_the_selection_follows() {
+        let mut app = processes_app(4);
+        pin(&mut app, 1);
+        pin(&mut app, 2);
+        pin(&mut app, 3);
+        assert_eq!(visible_pids(&app), vec![1, 2, 3, 4]);
+
+        assert!(app.update(Action::MoveSelectedPin(PinMove::Up)));
+        assert_eq!(visible_pids(&app), vec![1, 3, 2, 4]);
+        assert!(app.update(Action::MoveSelectedPin(PinMove::Up)));
+        assert_eq!(visible_pids(&app), vec![3, 1, 2, 4]);
+        assert_eq!(app.selected_process_index(), Some(0));
+        assert!(!app.update(Action::MoveSelectedPin(PinMove::Up)), "top");
+
+        app.update(Action::SelectProcess(identity(2)));
+        assert!(
+            !app.update(Action::MoveSelectedPin(PinMove::Down)),
+            "bottom"
+        );
+        app.update(Action::SelectProcess(identity(4)));
+        assert!(
+            !app.update(Action::MoveSelectedPin(PinMove::Up)),
+            "unpinned rows do not move"
+        );
+    }
+
+    #[test]
+    fn pin_actions_need_the_processes_tab_and_no_overlay() {
+        let mut app = processes_app(3);
+        pin(&mut app, 1);
+        pin(&mut app, 2);
+
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(!app.update(Action::TogglePin));
+        assert!(!app.update(Action::MoveSelectedPin(PinMove::Up)));
+
+        app.update(Action::SelectTab(Tab::Processes));
+        for open in [
+            Action::ShowHelp,
+            Action::OpenProcessDetails,
+            Action::RequestProcessSignal(ProcessSignal::Term),
+        ] {
+            assert!(app.update(open.clone()), "{open:?}");
+            assert!(!app.update(Action::TogglePin), "{open:?}");
+            assert!(
+                !app.update(Action::MoveSelectedPin(PinMove::Up)),
+                "{open:?}"
+            );
+            app.update(Action::Escape);
+        }
+        assert_eq!(visible_pids(&app), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_pending_signal_keeps_its_target_while_rows_change() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("tuxctl_pin_signal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("2")).unwrap();
+        std::fs::write(
+            temp_dir.join("2/stat"),
+            "2 (p2) S 1 2 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .unwrap();
+
+        let mut app = processes_app(3);
+        pin(&mut app, 3);
+        pin(&mut app, 2);
+        assert!(app.update(Action::RequestProcessSignal(ProcessSignal::Term)));
+
+        // A refresh reorders everything and a pin move is attempted.
+        let mut refreshed = cpu_ranked(4);
+        refreshed.reverse();
+        app.update(Action::ProcessesUpdated(processes(refreshed)));
+        assert!(!app.update(Action::MoveSelectedPin(PinMove::Up)));
+        assert!(!app.update(Action::SelectProcess(identity(1))));
+
+        let mut sent_to = None;
+        app.confirm_process_signal_at(&temp_dir, Ok, |pid, _| {
+            sent_to = Some(*pid);
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        assert_eq!(sent_to, Some(2));
+        assert_eq!(app.process_action_message(), Some("Sent SIGTERM to p2 (2)"));
     }
 
     #[test]
