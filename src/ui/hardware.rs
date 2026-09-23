@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -11,7 +11,7 @@ use crate::{
     linux::{GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics},
 };
 
-use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network};
+use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network, theme};
 
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
 const MAX_STORAGE_ROWS: u16 = 4;
@@ -337,7 +337,7 @@ fn render_storage(
 pub(super) fn section_heading(label: &'static str) -> Line<'static> {
     Line::from(label).style(
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )
 }

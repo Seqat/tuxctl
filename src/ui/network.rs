@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
@@ -14,7 +14,7 @@ use crate::{
     linux::{NetworkInterfaceInfo, OperState},
 };
 
-use super::{format_bytes, layout};
+use super::{format_bytes, layout, theme};
 
 pub struct NetworkRender {
     pub rows: Vec<(Arc<str>, Rect)>,
@@ -69,10 +69,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> NetworkRender {
 
         let style = if is_selected {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::ROW_SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if is_hovered {
-            Style::default().bg(Color::Rgb(35, 35, 35))
+            Style::default().bg(theme::ROW_HOVER_BG)
         } else {
             Style::default()
         };
@@ -232,7 +232,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> NetworkRender {
 
     let header_row = Row::new(headers).style(
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -250,7 +250,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> NetworkRender {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(ratatui::layout::Alignment::Center),
             row_area,
         );
@@ -268,15 +268,13 @@ pub(super) fn state_display(state: OperState) -> (&'static str, Style) {
     match state {
         OperState::Up => (
             "● up",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
         ),
-        OperState::Down => ("○ down", Style::default().fg(Color::DarkGray)),
-        OperState::Dormant => ("◌ dormant", Style::default().fg(Color::Yellow)),
+        OperState::Down => ("○ down", Style::default().fg(theme::MUTED)),
+        OperState::Dormant => ("◌ dormant", Style::default().fg(theme::WARNING)),
         // Loopback and many virtual links legitimately report "unknown"; it is not a warning.
         OperState::Unknown => ("◌ unknown", Style::default()),
-        _ => (state.as_str(), Style::default().fg(Color::Yellow)),
+        _ => (state.as_str(), Style::default().fg(theme::WARNING)),
     }
 }
 
@@ -293,7 +291,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(error) = app.network_error() {
         spans.push(Span::styled(
             format!("   Error: {error}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -312,7 +312,7 @@ pub fn render_detail(frame: &mut Frame, iface: Option<&NetworkInterfaceInfo>, ar
                 Line::from("Interface is no longer available"),
                 Line::from(""),
                 Line::from("Read-only inspection; Esc closes")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::MUTED)),
             ]
         },
         |iface| {
@@ -371,7 +371,7 @@ pub fn render_detail(frame: &mut Frame, iface: Option<&NetworkInterfaceInfo>, ar
                 )),
                 Line::from(""),
                 Line::from("Read-only inspection; Esc closes")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::MUTED)),
             ]
         },
     );

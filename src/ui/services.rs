@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
@@ -14,7 +14,7 @@ use crate::{
     linux::ServiceInfo,
 };
 
-use super::{layout, status};
+use super::{layout, status, theme};
 
 pub struct ServiceRender {
     pub rows: Vec<(Arc<str>, Rect)>,
@@ -70,20 +70,20 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ServiceRender {
 
         let style = if selected == Some(service.unit.as_str()) {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::ROW_SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if matches!(hovered, Some(MouseTarget::ServiceRow(unit)) if unit.as_ref() == service.unit) {
-            Style::default().bg(Color::Rgb(35, 35, 35))
+            Style::default().bg(theme::ROW_HOVER_BG)
         } else {
             Style::default()
         };
 
         let (state_icon, state_style) = match service.active_state.as_str() {
-            "active" => ("●", Style::default().fg(Color::Green)),
-            "failed" => ("✖", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            "inactive" | "deactivating" => ("○", Style::default().fg(Color::DarkGray)),
-            "activating" | "reloading" => ("◌", Style::default().fg(Color::Yellow)),
-            _ => ("?", Style::default().fg(Color::Yellow)),
+            "active" => ("●", Style::default().fg(theme::OK)),
+            "failed" => ("✖", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)),
+            "inactive" | "deactivating" => ("○", Style::default().fg(theme::MUTED)),
+            "activating" | "reloading" => ("◌", Style::default().fg(theme::WARNING)),
+            _ => ("?", Style::default().fg(theme::WARNING)),
         };
         let active_cell = Cell::from(format!("{state_icon} {}", service.active_state.as_str()))
             .style(state_style);
@@ -110,7 +110,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ServiceRender {
 
     let header = Row::new(["UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION"]).style(
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     );
     let table = Table::new(rows, COLUMN_WIDTHS)
@@ -129,7 +129,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ServiceRender {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(ratatui::layout::Alignment::Center),
             row_area,
         );
@@ -192,7 +192,7 @@ pub fn render_detail(frame: &mut Frame, service: Option<&ServiceInfo>, area: Rec
                 Line::from(format!("Sub:         {}", fallback(&service.sub_state))),
                 Line::from(""),
                 Line::from("Read-only inspection; Esc closes")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::MUTED)),
             ]
         },
     );

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 
-use super::{format_bytes, format_uptime, format_usage, hardware, layout, processes};
+use super::{format_bytes, format_uptime, format_usage, hardware, layout, processes, theme};
 
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 90;
 
@@ -139,7 +139,7 @@ fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Pinned").style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -155,7 +155,7 @@ fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 &format!("{name:<name_width$} exited"),
                 width,
             ))
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(theme::MUTED))
         } else if width > VALUES_WIDTH + 4 {
             Line::from(format!(
                 "{name:<name_width$} {:>6} {:>9}",
@@ -206,7 +206,7 @@ fn system_lines(
             info_line("Zombies", &zombies, width),
             Line::from("Filesystem").style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
         ]
@@ -227,7 +227,7 @@ fn system_lines(
             Line::from(layout::truncate(&process_line, width)),
             Line::from("Filesystem").style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
         ]
@@ -465,7 +465,7 @@ mod tests {
             .draw(|frame| render_system(frame, &app, frame.area()))
             .unwrap();
         let y = rows.iter().position(|row| row.contains("worker")).unwrap() as u16;
-        assert_eq!(terminal.backend().buffer()[(2, y)].fg, Color::DarkGray);
+        assert_eq!(terminal.backend().buffer()[(2, y)].fg, theme::MUTED);
     }
 
     #[test]

@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `q` no longer quits straight away: it opens the main menu with Exit
   selected, and `Enter` or `q` again quits (`Esc` cancels). `Ctrl+C` still
   quits immediately. A pending signal confirmation is cancelled.
-- Key bindings live in one table per input mode (`src/keymap.rs`).
+- Key bindings live in one table per input mode (`src/keymap.rs`), and UI
+  colors are named by meaning in one place (`src/ui/theme.rs`), as groundwork
+  for configurable keys and themes.
 
 ## [0.3.0] - 2026-09-23
 

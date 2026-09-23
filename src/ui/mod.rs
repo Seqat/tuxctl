@@ -10,12 +10,13 @@ mod processes;
 mod sanitize;
 mod services;
 mod status;
+mod theme;
 
 use std::sync::Arc;
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -563,12 +564,12 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
     if let Some(stale) = stale {
         spans.push(Span::styled(
             stale.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING),
         ));
     }
     spans.push(Span::styled(
         interval.clone(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::MUTED),
     ));
     let corner = Rect::new(x, area.y, width, 1);
     // Blank the border under the whole corner, including the gaps between buttons.
@@ -583,9 +584,9 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
         .map(|&(step, label)| {
             let button = Rect::new(x, area.y, label.len() as u16, 1);
             let style = if app.hovered() == Some(&MouseTarget::IntervalStep(step)) {
-                Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+                Style::default().fg(theme::ACCENT).bg(theme::HOVER_BG)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme::ACCENT)
             };
             frame.render_widget(Paragraph::new(label).style(style), button);
             x = x.saturating_add(button.width + 1);
@@ -605,7 +606,7 @@ fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("tuxctl").style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
@@ -638,11 +639,11 @@ fn render_tabs(
     for &(tab, area) in tabs {
         let style = if tab == active_tab {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if hovered == Some(&MouseTarget::Tab(tab)) {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(theme::HOVER_BG)
         } else {
             Style::default()
         };
@@ -666,7 +667,7 @@ fn render_tabs(
             );
             frame.render_widget(
                 Paragraph::new(hint_text)
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(theme::MUTED))
                     .alignment(Alignment::Right),
                 hint_rect,
             );
@@ -769,7 +770,7 @@ fn help_lines() -> Vec<Line<'static>> {
     let heading = |text: &'static str| {
         Line::from(text).style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
     };
@@ -797,7 +798,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Services            r refresh system services"),
         Line::from("  Logs                f follow, Space toggle pause"),
         Line::from(""),
-        Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
+        Line::from("Esc closes").style(Style::default().fg(theme::MUTED)),
     ]
 }
 
