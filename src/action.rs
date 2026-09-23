@@ -13,6 +13,12 @@ pub enum Action {
     PreviousTab,
     ShowHelp,
     Escape,
+    MenuPrevious,
+    MenuNext,
+    /// Enter on the main menu.
+    ActivateSelectedMenuItem,
+    /// A click on a main menu item.
+    ActivateMenuItem(MenuItem),
     StepSamplingInterval(IntervalStep),
     SystemMetricsUpdated(SystemMetrics),
     HardwareDiscovered(HardwareInventory),
@@ -108,9 +114,28 @@ pub enum MouseTarget {
     PinMove(ProcessIdentity, PinMove),
     ProcessSignalCancel,
     ProcessSignalConfirm,
+    MenuItem(MenuItem),
     ServiceRow(Arc<str>),
     LogRow(u64),
     NetworkRow(Arc<str>),
+}
+
+/// Entries of the main menu opened by `Esc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    About,
+    Exit,
+}
+
+impl MenuItem {
+    pub const ALL: [Self; 2] = [Self::About, Self::Exit];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::About => "About",
+            Self::Exit => "Exit",
+        }
+    }
 }
 
 /// Direction in which a pinned process moves within the pinned section.
@@ -193,6 +218,8 @@ pub enum InputMode {
     Network,
     NetworkDetail,
     Help,
+    Menu,
+    About,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

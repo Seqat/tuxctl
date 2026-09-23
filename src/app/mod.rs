@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     action::{
-        Action, InputMode, IntervalStep, MouseTarget, PinMove, ProcessSort, ProcessSortField,
-        SignalConfirmButton, Tab,
+        Action, InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSort,
+        ProcessSortField, SignalConfirmButton, Tab,
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
@@ -89,10 +89,14 @@ impl AggregateCpuHistory {
 }
 
 /// The modal layer shown above the active screen; at most one is open at a time.
-///
-/// v0.3.0 adds the Esc main menu, About and Options pages here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Overlay {
+    /// The main menu, opened by `Esc` when there is nothing else to close.
+    Menu {
+        selected: MenuItem,
+    },
+    /// Opened from the menu; `Esc` returns to the menu.
+    About,
     Help,
     ProcessDetail,
     ServiceDetail,
@@ -254,6 +258,18 @@ impl App {
         self.overlay == Some(Overlay::Help)
     }
 
+    /// The highlighted item while the main menu is open.
+    pub fn menu_selection(&self) -> Option<MenuItem> {
+        match self.overlay {
+            Some(Overlay::Menu { selected }) => Some(selected),
+            _ => None,
+        }
+    }
+
+    pub fn about_visible(&self) -> bool {
+        self.overlay == Some(Overlay::About)
+    }
+
     pub fn system_metrics(&self) -> &SystemMetrics {
         &self.system_metrics
     }
@@ -270,6 +286,8 @@ impl App {
         if let Some(overlay) = &self.overlay {
             match overlay {
                 Overlay::Help => InputMode::Help,
+                Overlay::Menu { .. } => InputMode::Menu,
+                Overlay::About => InputMode::About,
                 Overlay::ProcessSignal(_) => InputMode::ProcessSignalConfirm,
                 Overlay::ProcessDetail => InputMode::ProcessDetail,
                 Overlay::ServiceDetail => InputMode::ServiceDetail,
@@ -389,6 +407,13 @@ impl App {
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
             Action::FocusProcessSignal(button) => self.focus_process_signal(button),
             Action::ExecuteFocusedProcessSignal => self.execute_focused_process_signal(),
+            Action::MenuPrevious => self.move_menu_selection(-1),
+            Action::MenuNext => self.move_menu_selection(1),
+            Action::ActivateSelectedMenuItem => match self.menu_selection() {
+                Some(item) => self.activate_menu_item(item),
+                None => false,
+            },
+            Action::ActivateMenuItem(item) => self.activate_menu_item(item),
             Action::Resize => unreachable!("resize actions return before modal suppression"),
             _ if self.overlay.is_some() => false,
             Action::ShowHelp => {
@@ -510,9 +535,16 @@ impl App {
         changed
     }
 
+    /// Esc order: close the overlay (About goes back to the menu), else clear
+    /// the tab's search, else its view filter, else open the main menu.
     fn escape(&mut self) -> bool {
         if matches!(self.overlay, Some(Overlay::ProcessSignal(_))) {
             self.cancel_process_signal()
+        } else if self.overlay == Some(Overlay::About) {
+            self.overlay = Some(Overlay::Menu {
+                selected: MenuItem::About,
+            });
+            true
         } else if self.overlay.take().is_some() {
             true
         } else {
@@ -554,7 +586,47 @@ impl App {
                     self.rebuild_log_filter();
                     true
                 }
-                _ => false,
+                _ => {
+                    self.overlay = Some(Overlay::Menu {
+                        selected: MenuItem::About,
+                    });
+                    self.hovered = None;
+                    true
+                }
+            }
+        }
+    }
+
+    fn move_menu_selection(&mut self, delta: isize) -> bool {
+        let Some(Overlay::Menu { selected }) = &mut self.overlay else {
+            return false;
+        };
+        let current = MenuItem::ALL
+            .iter()
+            .position(|item| item == selected)
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(MenuItem::ALL.len() - 1);
+        let changed = MenuItem::ALL[next] != *selected;
+        *selected = MenuItem::ALL[next];
+        changed
+    }
+
+    fn activate_menu_item(&mut self, item: MenuItem) -> bool {
+        if self.menu_selection().is_none() {
+            return false;
+        }
+        match item {
+            MenuItem::About => {
+                self.overlay = Some(Overlay::About);
+                self.hovered = None;
+                true
+            }
+            MenuItem::Exit => {
+                // Not destructive: leaving tuxctl needs no confirmation.
+                self.should_quit = true;
+                false
             }
         }
     }
@@ -600,15 +672,19 @@ mod tests {
         ServiceDetail,
         LogDetail,
         NetworkDetail,
+        Menu,
+        About,
     }
 
-    const OVERLAYS: [OverlayKind; 6] = [
+    const OVERLAYS: [OverlayKind; 8] = [
         OverlayKind::Help,
         OverlayKind::ProcessDetail,
         OverlayKind::ProcessSignal,
         OverlayKind::ServiceDetail,
         OverlayKind::LogDetail,
         OverlayKind::NetworkDetail,
+        OverlayKind::Menu,
+        OverlayKind::About,
     ];
 
     /// The input mode of a tab with no overlay and no search in progress.
@@ -650,6 +726,11 @@ mod tests {
             OverlayKind::ServiceDetail => (Tab::Services, Action::OpenServiceDetails),
             OverlayKind::LogDetail => (Tab::Logs, Action::OpenLogDetails),
             OverlayKind::NetworkDetail => (Tab::Network, Action::OpenNetworkDetails),
+            OverlayKind::Menu => (Tab::Overview, Action::Escape),
+            OverlayKind::About => {
+                app.update(Action::Escape);
+                (Tab::Overview, Action::ActivateMenuItem(MenuItem::About))
+            }
         };
         app.update(Action::SelectTab(tab));
         assert!(app.update(open), "{kind:?} did not open");
@@ -687,17 +768,20 @@ mod tests {
         }
     }
 
-    /// Current Esc order: close the overlay, else clear the tab's search or
-    /// filter, else do nothing. v0.3.0 opens the main menu in that last case.
+    /// Esc order: close the overlay, else clear the tab's search, else its
+    /// view filter, else open the main menu; Esc then closes the menu.
     #[test]
-    fn escape_with_nothing_to_close_does_nothing_on_every_tab() {
+    fn escape_with_nothing_to_close_opens_the_menu_on_every_tab() {
         for tab in Tab::ALL {
             let mut app = app_with_overlay(OverlayKind::Help);
             app.update(Action::Escape);
             app.update(Action::SelectTab(tab));
 
-            assert!(!app.update(Action::Escape), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?}");
+            assert_eq!(app.menu_selection(), Some(MenuItem::About), "{tab:?}");
             assert_eq!(app.active_tab(), tab);
+
+            assert!(app.update(Action::Escape), "{tab:?} closes the menu");
             assert!(app.overlay.is_none());
         }
     }
@@ -742,7 +826,9 @@ mod tests {
             assert!(app.update(Action::Escape), "{tab:?} closes details first");
             assert!(app.overlay.is_none());
             assert!(app.update(Action::Escape), "{tab:?} clears the filter");
-            assert!(!app.update(Action::Escape), "{tab:?} has nothing left");
+            assert!(app.menu_selection().is_none(), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?} opens the menu last");
+            assert!(app.menu_selection().is_some(), "{tab:?}");
         }
     }
 
@@ -874,7 +960,9 @@ mod tests {
             assert!(view(&app).is_some(), "{tab:?} keeps the view");
             assert!(app.update(Action::Escape), "{tab:?} clears the view");
             assert!(view(&app).is_none(), "{tab:?}");
-            assert!(!app.update(Action::Escape), "{tab:?} has nothing left");
+            assert!(app.menu_selection().is_none(), "{tab:?}");
+            assert!(app.update(Action::Escape), "{tab:?} opens the menu last");
+            assert!(app.menu_selection().is_some(), "{tab:?}");
         }
     }
 
@@ -895,15 +983,18 @@ mod tests {
 
     #[test]
     fn escape_closes_exactly_one_overlay_per_press() {
-        for kind in OVERLAYS {
+        // About goes back to the menu instead (tested below).
+        for kind in OVERLAYS
+            .into_iter()
+            .filter(|kind| !matches!(kind, OverlayKind::About))
+        {
             let mut app = app_with_overlay(kind);
 
             assert!(app.update(Action::Escape), "{kind:?}");
             assert!(app.overlay.is_none(), "{kind:?}");
-            assert!(
-                !app.update(Action::Escape),
-                "{kind:?}: nothing left to close"
-            );
+            // With nothing left to close, the next Esc opens the menu.
+            assert!(app.update(Action::Escape), "{kind:?}");
+            assert!(app.menu_selection().is_some(), "{kind:?}");
         }
     }
 
@@ -929,6 +1020,48 @@ mod tests {
 
         assert!(app.update(Action::Escape));
         assert_eq!(app.process_search_query(), "");
+    }
+
+    #[test]
+    fn the_menu_moves_between_items_and_opens_about() {
+        let mut app = App::default();
+        assert!(!app.update(Action::MenuNext), "no menu open");
+
+        assert!(app.update(Action::Escape));
+        assert_eq!(app.input_mode(), InputMode::Menu);
+        assert!(!app.update(Action::MenuPrevious), "already at the top");
+        assert!(app.update(Action::MenuNext));
+        assert_eq!(app.menu_selection(), Some(MenuItem::Exit));
+        assert!(!app.update(Action::MenuNext), "already at the bottom");
+        assert!(app.update(Action::MenuPrevious));
+
+        assert!(app.update(Action::ActivateSelectedMenuItem));
+        assert!(app.about_visible());
+        assert_eq!(app.input_mode(), InputMode::About);
+
+        assert!(app.update(Action::Escape), "About goes back to the menu");
+        assert_eq!(app.menu_selection(), Some(MenuItem::About));
+        assert!(app.update(Action::Escape));
+        assert!(app.overlay.is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn exit_quits_without_confirmation_but_only_from_the_menu() {
+        let mut app = App::default();
+        // A stale click on where the menu was must not quit.
+        app.update(Action::ActivateMenuItem(MenuItem::Exit));
+        assert!(!app.should_quit());
+
+        app.update(Action::Escape);
+        app.update(Action::MenuNext);
+        app.update(Action::ActivateSelectedMenuItem);
+        assert!(app.should_quit());
+
+        let mut app = App::default();
+        app.update(Action::Escape);
+        app.update(Action::ActivateMenuItem(MenuItem::Exit));
+        assert!(app.should_quit());
     }
 
     #[test]

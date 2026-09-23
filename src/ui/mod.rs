@@ -3,6 +3,7 @@ mod hardware_cpu;
 mod hardware_network_summary;
 mod layout;
 mod logs;
+mod menu;
 mod network;
 mod overview;
 mod processes;
@@ -21,7 +22,7 @@ use ratatui::{
 };
 
 use crate::{
-    action::{InputMode, MouseTarget, PinMove, ProcessSortField, Tab},
+    action::{InputMode, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
     linux::ByteUsage,
 };
@@ -44,6 +45,7 @@ pub struct UiRegions {
     network_viewport: Option<(usize, usize)>,
     process_signal_cancel: Option<Rect>,
     process_signal_confirm: Option<Rect>,
+    menu_items: Vec<(MenuItem, Rect)>,
     input_mode: InputMode,
 }
 
@@ -119,6 +121,13 @@ impl UiRegions {
     }
 
     pub fn target_at(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        if let Some((item, _)) = self
+            .menu_items
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+        {
+            return Some(MouseTarget::MenuItem(*item));
+        }
         if self
             .process_signal_cancel
             .is_some_and(|area| contains(area, column, row))
@@ -484,6 +493,15 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         regions.process_signal_cancel = Some(cancel_rect);
         regions.process_signal_confirm = Some(confirm_rect);
     }
+    if let Some(selected) = app.menu_selection() {
+        let items = menu::render_menu(frame, selected, app.hovered(), area);
+        regions.suppress_background_interaction();
+        regions.menu_items = items;
+    }
+    if app.about_visible() {
+        menu::render_about(frame, area);
+        regions.suppress_background_interaction();
+    }
     if app.help_visible() {
         render_help(frame, area);
         regions.suppress_background_interaction();
@@ -687,7 +705,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Line::from("  Tab / Shift+Tab     Next / previous tab (or ← / →)"),
             Line::from("  ?                   Toggle help"),
             Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
-            Line::from("  Esc                 Close popup / clear search, then view"),
+            Line::from("  Esc                 Close popup / clear search, view / menu"),
             Line::from("  q / Ctrl+C          Quit application"),
             Line::from(""),
             Line::from("Navigation:").style(
@@ -957,6 +975,7 @@ mod tests {
             network_viewport: Some((6, 10)),
             process_signal_cancel: None,
             process_signal_confirm: None,
+            menu_items: Vec::new(),
             input_mode: InputMode::ProcessSignalConfirm,
         };
 
@@ -2040,6 +2059,45 @@ mod tests {
         let regions = rendered_regions(&mut terminal, &app);
 
         assert!(regions.process_rows.is_empty());
+    }
+
+    #[test]
+    fn menu_items_are_hit_from_their_rendered_rows_and_hide_the_background() {
+        let mut app = populated_app(Tab::Processes);
+        app.update(Action::Escape);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let regions = rendered_regions(&mut terminal, &app);
+
+        assert!(regions.tabs.is_empty() && regions.process_rows.is_empty());
+        assert_eq!(regions.menu_items.len(), 2);
+        for (item, area) in &regions.menu_items {
+            assert_eq!(
+                regions.target_at(area.x, area.y),
+                Some(MouseTarget::MenuItem(*item))
+            );
+            assert_eq!(regions.target_at(area.x, area.y + 5), None);
+        }
+        let text = buffer_text(&terminal);
+        assert!(text.contains("About") && text.contains("Exit"));
+    }
+
+    #[test]
+    fn menu_and_about_render_at_every_size() {
+        let mut app = App::default();
+        app.update(Action::Escape);
+        let mut about = App::default();
+        about.update(Action::Escape);
+        about.update(Action::ActivateSelectedMenuItem);
+        for (width, height) in [(40, 15), (40, 5), (1, 1), (200, 60)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+            rendered_regions(&mut terminal, &about);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        rendered_regions(&mut terminal, &about);
+        let text = buffer_text(&terminal);
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(env!("CARGO_PKG_RUST_VERSION")));
     }
 
     #[test]

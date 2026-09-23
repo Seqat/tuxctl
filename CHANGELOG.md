@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minimum priority of notice, warning, or error. They combine with the search,
   stay visible in the status line, and `Esc` clears the search first, then
   the view.
+- A main menu on `Esc`, opened when there is no dialog, search, or view filter
+  to clear. It has an About page (version, license, source, minimum Rust
+  version) and Exit, and works with the keyboard and the mouse.
 
 ### Changed
 

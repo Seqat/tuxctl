@@ -6,7 +6,7 @@ pseudo-terminal. They need Linux with systemd. CI runs `smoke.py` and a short
 
 | Script | Purpose |
 | --- | --- |
-| `smoke.py BINARY` | Runs the CLAUDE.md smoke list: tabs, mouse, resize down to 1×1, navigation, sorting, search, details, SIGKILL confirmation, Services, Logs, Help, quit and terminal restore, plus collector processes (`journalctl` only after the Logs tab is visited, nothing left in the session after exit) and SIGTERM/SIGHUP shutdown. It exits with a non-zero status if any check fails. |
+| `smoke.py BINARY` | Runs the CLAUDE.md smoke list: tabs, mouse, resize down to 1×1, navigation, sorting, search, details, SIGKILL confirmation, Services, Logs, the Esc main menu, the `+`/`-` interval keys, Help, quit and terminal restore, plus collector processes (`journalctl` only after the Logs tab is visited, nothing left in the session after exit) and SIGTERM/SIGHUP shutdown. It exits with a non-zero status if any check fails. |
 | `measure.py BINARY [--label NAME] [--secs N] [--json PATH] [--check]` | Prints CPU %, RSS and redraws/s for idle Overview, Processes and Logs, a log storm and rapid hover, then time to first frame, input latency during a storm and RSS growth once the log ring is full. |
 | `rss.py BINARY MINUTES [--every SECS] [--json PATH] [--max-growth KIB --after MIN]` | Prints RSS once a minute (or every `SECS`) while tuxctl idles on Overview; with `--max-growth` it exits non-zero if RSS grew by more than `KIB` after minute `MIN` (default 5). |
 

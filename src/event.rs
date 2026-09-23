@@ -124,6 +124,7 @@ fn action_for_mouse_target(target: MouseTarget) -> Action {
         MouseTarget::PinMove(identity, direction) => Action::MovePin(identity, direction),
         MouseTarget::ProcessSignalCancel => Action::CancelProcessSignal,
         MouseTarget::ProcessSignalConfirm => Action::ConfirmProcessSignal,
+        MouseTarget::MenuItem(item) => Action::ActivateMenuItem(item),
         MouseTarget::ServiceRow(unit) => Action::SelectService(unit),
         MouseTarget::LogRow(id) => Action::SelectLog(id),
         MouseTarget::NetworkRow(name) => Action::SelectNetwork(name),
@@ -218,9 +219,21 @@ fn translate_key_event(key: KeyEvent, input_mode: InputMode) -> Option<Action> {
         };
     }
 
+    if input_mode == InputMode::Menu {
+        return match key.code {
+            KeyCode::Char('q') => Some(Action::Quit),
+            KeyCode::Esc => Some(Action::Escape),
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::MenuPrevious),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::MenuNext),
+            KeyCode::Enter => Some(Action::ActivateSelectedMenuItem),
+            _ => None,
+        };
+    }
+
     if matches!(
         input_mode,
         InputMode::Help
+            | InputMode::About
             | InputMode::ProcessDetail
             | InputMode::ServiceDetail
             | InputMode::LogDetail
@@ -501,6 +514,7 @@ mod tests {
                         "Global Controls" | "Navigation & Common Actions" => &TAB_MODES,
                         "Processes" => &[InputMode::Normal],
                         "Signal Confirmation" => &[InputMode::ProcessSignalConfirm],
+                        "Main Menu" => &[InputMode::Menu],
                         "Services" => &[InputMode::Services],
                         "Logs" => &[InputMode::Logs],
                         other => panic!("unknown README controls section {other:?}"),
@@ -1273,6 +1287,8 @@ mod tests {
             InputMode::LogSearch,
             InputMode::LogDetail,
             InputMode::NetworkDetail,
+            InputMode::Menu,
+            InputMode::About,
         ];
 
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1292,6 +1308,25 @@ mod tests {
                 "Ctrl+C failed in mode {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn menu_keys_navigate_select_and_quit() {
+        let key =
+            |code| translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), InputMode::Menu);
+        assert_eq!(key(KeyCode::Up), Some(Action::MenuPrevious));
+        assert_eq!(key(KeyCode::Char('k')), Some(Action::MenuPrevious));
+        assert_eq!(key(KeyCode::Down), Some(Action::MenuNext));
+        assert_eq!(key(KeyCode::Char('j')), Some(Action::MenuNext));
+        assert_eq!(key(KeyCode::Enter), Some(Action::ActivateSelectedMenuItem));
+        assert_eq!(key(KeyCode::Esc), Some(Action::Escape));
+        assert_eq!(key(KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(key(KeyCode::Char('2')), None, "tabs are blocked");
+
+        let about =
+            |code| translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), InputMode::About);
+        assert_eq!(about(KeyCode::Esc), Some(Action::Escape));
+        assert_eq!(about(KeyCode::Enter), None);
     }
 
     #[test]

@@ -126,9 +126,10 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - Dropped packets
 - Safe rate-baseline recovery across interface changes and temporary `/proc/net/dev` failures.
 
-### Help
+### Help and Menu
 
 - Contextual keybinding reference overlay (`?`).
+- Main menu (`Esc`) with an About page (version, license, source, minimum Rust version) and Exit.
 
 ---
 
@@ -290,7 +291,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `→` / `←` | Next / previous tab |
 | `?` | Toggle Help dialog |
 | `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the title) |
-| `Esc` | Dismiss dialog / clear the search, then the view filter |
+| `Esc` | Dismiss dialog / clear the search, then the view filter / open the main menu |
 | `q` | Quit |
 | `Ctrl+C` | Quit globally |
 
@@ -329,6 +330,16 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 | `Enter` | Execute focused action |
 | `Esc` | Cancel and close |
 
+#### Main Menu
+
+`Esc` opens the main menu when there is no dialog, search, or view filter to clear.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move between About and Exit (`k` / `j` also work) |
+| `Enter` | Open About, or exit `tuxctl` |
+| `Esc` | Close the menu (from About, go back to the menu) |
+
 ### Services
 
 | Key | Action |
@@ -352,6 +363,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 - **Process sorting:** Click `PID`, `NAME`, `CPU`, or `MEMORY` headers.
 - **Pinned processes:** Click `▲` / `▼` at the end of a pinned row to move it (shown when there are at least two pins and the terminal is wide enough).
 - **Confirmation dialogs:** Click `Cancel` or the confirmation action.
+- **Main menu:** Click `About` or `Exit`.
 
 ---
 
