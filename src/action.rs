@@ -8,6 +8,8 @@ use crate::linux::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    /// `q`: open the main menu on Exit instead of quitting straight away.
+    RequestQuit,
     SelectTab(Tab),
     NextTab,
     PreviousTab,

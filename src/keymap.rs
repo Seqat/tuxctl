@@ -76,7 +76,7 @@ const SHIFT_OR_ALT: KeyModifiers = KeyModifiers::SHIFT.union(KeyModifiers::ALT);
 
 /// Keys that behave the same on every tab screen; screen tables never shadow them.
 pub const GLOBAL: &[Binding] = &[
-    bind(ch('q'), Action::Quit),
+    bind(ch('q'), Action::RequestQuit),
     bind(ch('1'), Action::SelectTab(Tab::Overview)),
     bind(ch('2'), Action::SelectTab(Tab::Processes)),
     bind(ch('3'), Action::SelectTab(Tab::Services)),
@@ -212,7 +212,7 @@ pub const LOG_SEARCH: &[Binding] = &[
 ];
 
 pub const SIGNAL_CONFIRM: &[Binding] = &[
-    bind(ch('q'), Action::Quit),
+    bind(ch('q'), Action::RequestQuit),
     bind(KeyCode::Esc, Action::CancelProcessSignal),
     bind(
         KeyCode::Left,
@@ -236,6 +236,7 @@ pub const SIGNAL_CONFIRM: &[Binding] = &[
 ];
 
 pub const MENU: &[Binding] = &[
+    // `q` again confirms the quit that `q` asked for.
     bind(ch('q'), Action::Quit),
     bind(KeyCode::Esc, Action::Escape),
     bind(KeyCode::Up, Action::MenuPrevious),
@@ -247,12 +248,12 @@ pub const MENU: &[Binding] = &[
 
 /// About and the detail popups.
 pub const POPUP: &[Binding] = &[
-    bind(ch('q'), Action::Quit),
+    bind(ch('q'), Action::RequestQuit),
     bind(KeyCode::Esc, Action::Escape),
 ];
 
 pub const HELP: &[Binding] = &[
-    bind(ch('q'), Action::Quit),
+    bind(ch('q'), Action::RequestQuit),
     bind(KeyCode::Esc, Action::Escape),
     bind(ch('?'), Action::Escape),
 ];

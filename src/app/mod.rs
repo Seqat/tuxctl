@@ -427,6 +427,7 @@ impl App {
             // Staleness is global state, so it is checked even while a modal is open.
             Action::Tick(now) => self.check_collector_staleness(now) | self.expire_exited_pins(now),
             Action::Escape => self.escape(),
+            Action::RequestQuit => self.request_quit(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
@@ -622,6 +623,21 @@ impl App {
         }
     }
 
+    /// `q` never quits by itself: it opens the main menu on Exit, where Enter
+    /// or `q` confirms. A pending signal confirmation is cancelled first.
+    fn request_quit(&mut self) -> bool {
+        self.cancel_process_signal();
+        let menu = Some(Overlay::Menu {
+            selected: MenuItem::Exit,
+        });
+        if self.overlay == menu {
+            return false;
+        }
+        self.overlay = menu;
+        self.hovered = None;
+        true
+    }
+
     fn move_menu_selection(&mut self, delta: isize) -> bool {
         let Some(Overlay::Menu { selected }) = &mut self.overlay else {
             return false;
@@ -649,7 +665,7 @@ impl App {
                 true
             }
             MenuItem::Exit => {
-                // Not destructive: leaving tuxctl needs no confirmation.
+                // The menu is the confirmation step (also for `q`).
                 self.should_quit = true;
                 false
             }
@@ -1130,6 +1146,28 @@ mod tests {
                 );
                 assert!(app.overlay.is_some(), "{action:?} closed {kind:?}");
             }
+        }
+    }
+
+    #[test]
+    fn request_quit_opens_the_menu_on_exit_from_every_overlay() {
+        let mut app = App::default();
+        assert!(app.update(Action::RequestQuit));
+        assert!(!app.should_quit());
+        assert_eq!(app.menu_selection(), Some(MenuItem::Exit));
+        assert!(!app.update(Action::RequestQuit), "already open");
+        app.update(Action::ActivateSelectedMenuItem);
+        assert!(app.should_quit());
+
+        for kind in OVERLAYS {
+            let mut app = app_with_overlay(kind);
+            app.update(Action::RequestQuit);
+            assert!(!app.should_quit(), "{kind:?}");
+            assert_eq!(app.menu_selection(), Some(MenuItem::Exit), "{kind:?}");
+            assert!(app.process_signal_confirmation().is_none(), "{kind:?}");
+            assert!(app.update(Action::Escape), "{kind:?} Esc cancels");
+            assert!(app.overlay.is_none(), "{kind:?}");
+            assert!(!app.should_quit(), "{kind:?}");
         }
     }
 

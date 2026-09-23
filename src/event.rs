@@ -1143,6 +1143,31 @@ mod tests {
     }
 
     #[test]
+    fn q_asks_to_quit_outside_the_menu_and_confirms_inside_it() {
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        for mode in [
+            InputMode::Normal,
+            InputMode::Services,
+            InputMode::Logs,
+            InputMode::Network,
+            InputMode::ProcessSignalConfirm,
+            InputMode::ProcessDetail,
+            InputMode::ServiceDetail,
+            InputMode::LogDetail,
+            InputMode::NetworkDetail,
+            InputMode::Help,
+            InputMode::About,
+        ] {
+            assert_eq!(
+                translate_key_event(q, mode),
+                Some(Action::RequestQuit),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(translate_key_event(q, InputMode::Menu), Some(Action::Quit));
+    }
+
+    #[test]
     fn menu_keys_navigate_select_and_quit() {
         let key =
             |code| translate_key_event(KeyEvent::new(code, KeyModifiers::NONE), InputMode::Menu);
@@ -1152,7 +1177,7 @@ mod tests {
         assert_eq!(key(KeyCode::Char('j')), Some(Action::MenuNext));
         assert_eq!(key(KeyCode::Enter), Some(Action::ActivateSelectedMenuItem));
         assert_eq!(key(KeyCode::Esc), Some(Action::Escape));
-        assert_eq!(key(KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(key(KeyCode::Char('q')), Some(Action::Quit), "q confirms");
         assert_eq!(key(KeyCode::Char('2')), None, "tabs are blocked");
 
         let about =

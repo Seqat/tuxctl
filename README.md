@@ -293,8 +293,8 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `?` | Toggle Help dialog |
 | `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the top-right corner) |
 | `Esc` | Dismiss dialog / clear the search, then the view filter / open the main menu |
-| `q` | Quit |
-| `Ctrl+C` | Quit globally |
+| `q` | Open the main menu on Exit; `Enter` or `q` again quits |
+| `Ctrl+C` | Quit immediately, from anywhere |
 
 ### Navigation & Common Actions
 
@@ -339,6 +339,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 | --- | --- |
 | `↑` / `↓` | Move between About and Exit (`k` / `j` also work) |
 | `Enter` | Open About, or exit `tuxctl` |
+| `q` | Exit `tuxctl` |
 | `Esc` | Close the menu (from About, go back to the menu) |
 
 ### Services

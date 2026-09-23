@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Keys that change the system or persistent state (signals, pins) use `Shift`;
   navigation, sorting, views, search and menus stay on plain keys. A plain
   `t` does nothing.
+- `q` no longer quits straight away: it opens the main menu with Exit
+  selected, and `Enter` or `q` again quits (`Esc` cancels). `Ctrl+C` still
+  quits immediately. A pending signal confirmation is cancelled.
 - Key bindings live in one table per input mode (`src/keymap.rs`).
 
 ## [0.3.0] - 2026-09-23
