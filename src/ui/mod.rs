@@ -1130,10 +1130,13 @@ mod tests {
                 used: 4 << 30,
                 total: 16 << 30,
             }),
-            root_filesystem: Some(ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: 50 << 30,
+                    total: 100 << 30,
+                },
+            }],
             ..SystemMetrics::default()
         }));
         app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
@@ -1506,10 +1509,13 @@ mod tests {
                 used: 4 << 30,
                 total: 16 << 30,
             }),
-            root_filesystem: Some(ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: 50 << 30,
+                    total: 100 << 30,
+                },
+            }],
             temperatures: sweep_temperatures(),
             ..SystemMetrics::default()
         }));
@@ -2138,10 +2144,13 @@ mod tests {
                     total: 32 * 1024 * 1024 * 1024,
                 }),
                 uptime: Some(std::time::Duration::from_secs(90_000)),
-                root_filesystem: Some(ByteUsage {
-                    used: 120 * 1024 * 1024 * 1024,
-                    total: 500 * 1024 * 1024 * 1024,
-                }),
+                mounts: vec![crate::linux::MountUsage {
+                    mount_point: "/".into(),
+                    usage: crate::linux::ByteUsage {
+                        used: 120 * 1024 * 1024 * 1024,
+                        total: 500 * 1024 * 1024 * 1024,
+                    },
+                }],
                 ..SystemMetrics::default()
             };
             metrics.system_identity.hostname = Some("build-host".into());

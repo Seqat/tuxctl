@@ -38,5 +38,5 @@ pub(crate) use system::DiskIo;
 pub(crate) use system::LoadAverage;
 #[cfg(test)]
 pub(crate) use system::LogicalCpuId;
-pub use system::{ByteUsage, LogicalCpuMetrics, SystemMetrics, SystemMetricsCollector};
+pub use system::{ByteUsage, LogicalCpuMetrics, MountUsage, SystemMetrics, SystemMetricsCollector};
 pub use temperature::{Temperature, TemperatureKey};

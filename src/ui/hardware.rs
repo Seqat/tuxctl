@@ -29,6 +29,8 @@ const MAX_MODULE_ROWS: u16 = 2;
 /// A temperature after a row's text is dropped rather than leave the text
 /// fewer columns than this.
 const MIN_TEXT_BEFORE_TEMPERATURE: usize = 8;
+/// Mount points longer than this are shortened in the storage card.
+const MAX_MOUNT_LABEL: usize = 16;
 /// Storage cards this wide list mounts and devices side by side.
 const STORAGE_SIDE_BY_SIDE_WIDTH: u16 = 90;
 
@@ -38,11 +40,17 @@ fn module_rows(app: &App) -> u16 {
         .min(MAX_MODULE_ROWS)
 }
 
-pub(super) fn memory_card_height(app: &App, graphs: bool) -> CardHeight {
-    CardHeight::new(1, module_rows(app), graphs)
+/// RAM, and swap when there is any.
+fn memory_rows(app: &App) -> u16 {
+    1 + u16::from(app.system_metrics().swap.is_some())
 }
 
-/// Memory: a graph of RAM use, the RAM gauge, and the modules if known.
+pub(super) fn memory_card_height(app: &App, graphs: bool) -> CardHeight {
+    CardHeight::new(memory_rows(app), module_rows(app), graphs)
+}
+
+/// Memory: a graph of RAM use, the RAM and swap gauges, and the modules if
+/// known.
 pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool) {
     let graph = CardGraph {
         history: app.memory_history(),
@@ -56,7 +64,7 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
         &CardTitle::plain("Memory"),
         Some(graph),
         graphs,
-        1,
+        memory_rows(app),
         module_rows(app),
     );
     if rows.width == 0 || rows.height == 0 {
@@ -68,6 +76,9 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
         |memory| usage_bar("RAM  ", memory, width, true),
     );
     let mut lines = vec![usage];
+    if let Some(swap) = app.system_metrics().swap {
+        lines.push(usage_bar("Swap ", swap, width, false));
+    }
     if let Some(inventory) = app.hardware() {
         lines.extend(
             inventory
@@ -239,12 +250,12 @@ fn gpu_vram(gpu: &GpuDevice) -> Option<String> {
         .map(|bytes| format!("{} VRAM", format_binary_capacity(bytes)))
 }
 
-/// Mount rows (the root filesystem for now) and device rows.
+/// Mount rows and device rows.
 fn storage_row_counts(
     inventory: Option<&HardwareInventory>,
     metrics: &SystemMetrics,
 ) -> (u16, u16) {
-    let mounts = u16::from(metrics.root_filesystem.is_some());
+    let mounts = metrics.mounts.len() as u16;
     let devices = inventory.map_or(1, |inventory| inventory.storage_devices.len().max(1)) as u16;
     (mounts, devices)
 }
@@ -276,13 +287,7 @@ pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
     }
     let metrics = app.system_metrics();
     let inventory = app.hardware();
-    let mount_line = |width: usize| -> Vec<Line<'static>> {
-        metrics
-            .root_filesystem
-            .map(|usage| usage_bar("/  ", usage, width, false))
-            .into_iter()
-            .collect()
-    };
+    let mount_line = |width: usize| mount_lines(&metrics.mounts, width);
     if inner.width >= STORAGE_SIDE_BY_SIDE_WIDTH {
         let mount_width = inner.width * 2 / 5;
         let gap = 2;
@@ -304,6 +309,29 @@ pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(device_lines(inventory, metrics, inner.width, height));
         frame.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+/// One usage gauge per mounted filesystem, the mount points in a column as
+/// wide as the longest (at most [`MAX_MOUNT_LABEL`]).
+fn mount_lines(mounts: &[crate::linux::MountUsage], width: usize) -> Vec<Line<'static>> {
+    let label_width = mounts
+        .iter()
+        .map(|mount| mount.mount_point.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_MOUNT_LABEL);
+    mounts
+        .iter()
+        .map(|mount| {
+            let label = layout::truncate(&mount.mount_point, label_width);
+            usage_bar(
+                &format!("{label:<label_width$}  "),
+                mount.usage,
+                width,
+                false,
+            )
+        })
+        .collect()
 }
 
 /// One row per disk within `height` rows, with `… N more devices` when they
@@ -754,6 +782,60 @@ mod tests {
     }
 
     #[test]
+    fn swap_follows_ram_when_there_is_any() {
+        let mut app = memory_app();
+        let card = |app: &App| {
+            rows(app, 60, 6, |frame, app, area| {
+                render_memory_card(frame, app, area, false)
+            })
+        };
+        assert!(!card(&app).iter().any(|row| row.contains("Swap")));
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+            memory: Some(crate::linux::ByteUsage {
+                used: 8 << 30,
+                total: 32 << 30,
+            }),
+            swap: Some(crate::linux::ByteUsage {
+                used: 1 << 30,
+                total: 4 << 30,
+            }),
+            ..SystemMetrics::default()
+        }));
+        let rows = card(&app);
+        assert!(rows[1].contains("RAM  25%"), "{rows:#?}");
+        assert!(
+            rows[2].contains("Swap 25%") && rows[2].contains("1.0 GiB / 4.0 GiB"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn storage_lists_every_mount_with_aligned_mount_points() {
+        let mount = |mount_point: &str, used: u64| crate::linux::MountUsage {
+            mount_point: mount_point.into(),
+            usage: crate::linux::ByteUsage {
+                used: used << 30,
+                total: 100 << 30,
+            },
+        };
+        let lines: Vec<String> = mount_lines(
+            &[
+                mount("/", 33),
+                mount("/mnt/storage", 50),
+                mount("/a/very/long/mount/point", 5),
+            ],
+            60,
+        )
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(lines[0].starts_with("/                 33%"), "{lines:#?}");
+        assert!(lines[1].starts_with("/mnt/storage      50%"), "{lines:#?}");
+        assert!(lines[2].starts_with("/a/very/long/mo…  5%"), "{lines:#?}");
+        assert!(lines.iter().all(|line| line.chars().count() <= 60));
+    }
+
+    #[test]
     fn the_gpu_card_is_about_the_discrete_gpu_and_lists_the_others() {
         let mut app = App::default();
         let card = |app: &App| {
@@ -793,10 +875,13 @@ mod tests {
     fn storage_lists_mounts_and_disks_side_by_side_on_a_wide_card() {
         let mut app = App::default();
         app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
-            root_filesystem: Some(crate::linux::ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: 50 << 30,
+                    total: 100 << 30,
+                },
+            }],
             ..SystemMetrics::default()
         }));
         app.update(crate::action::Action::HardwareDiscovered(
