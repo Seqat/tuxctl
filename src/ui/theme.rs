@@ -35,6 +35,8 @@ mod tests {
     fn screens_take_their_colors_from_the_theme() {
         let sources = [
             ("mod.rs", include_str!("mod.rs")),
+            ("cards.rs", include_str!("cards.rs")),
+            ("sparkline.rs", include_str!("sparkline.rs")),
             ("menu.rs", include_str!("menu.rs")),
             ("overview.rs", include_str!("overview.rs")),
             ("processes.rs", include_str!("processes.rs")),

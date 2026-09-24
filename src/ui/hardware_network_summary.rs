@@ -11,88 +11,162 @@ use crate::{
 };
 
 use super::{
-    hardware::{device_temperature, section_heading, temperature_span, trend_line},
+    cards::{self, CardGraph, CardTitle, TitleOrder},
+    hardware::{device_temperature, temperature_span},
     layout, network,
+    overview::CardHeight,
 };
 
-const MAX_NETWORK_INTERFACES: usize = 3;
+/// Interfaces listed under the primary one when there is room.
+const MAX_OTHER_INTERFACES: u16 = 3;
 
-pub(super) fn desired_height(app: &App, inventory: Option<&HardwareInventory>) -> u16 {
-    let network_count = overview_network_interfaces(app.networks(), inventory).len();
-    // Heading, interfaces, an overflow line and the trend.
-    2_u16
-        .saturating_add(u16::try_from(network_count.min(MAX_NETWORK_INTERFACES)).unwrap_or(3))
-        .saturating_add(u16::from(network_count > MAX_NETWORK_INTERFACES))
+fn other_interface_rows(app: &App) -> u16 {
+    let count = overview_network_interfaces(app.networks(), app.hardware()).len();
+    (count.saturating_sub(1) as u16).min(MAX_OTHER_INTERFACES)
 }
 
-pub(super) fn render(
-    frame: &mut Frame,
-    app: &App,
-    inventory: Option<&HardwareInventory>,
-    area: Rect,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let width = usize::from(area.width);
-    let mut lines = vec![section_heading("NETWORK")];
-    let remaining = usize::from(area.height).saturating_sub(1);
-    if remaining == 0 {
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
-    }
+pub(super) fn card_height(app: &App, graphs: bool) -> CardHeight {
+    CardHeight::new(1, other_interface_rows(app), graphs)
+}
 
-    if app.network_error().is_some() {
-        lines.push(Line::from("Network data unavailable"));
-    } else if app.networks().is_empty() {
-        lines.push(Line::from("No interfaces found"));
+/// Network: the primary interface with its state and temperature in the
+/// title, a graph of the traffic of the listed interfaces, the primary
+/// interface's rates, then one row per other interface.
+pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool) {
+    let inventory = app.hardware();
+    let interfaces = if app.network_error().is_some() {
+        Vec::new()
     } else {
-        let interfaces = overview_network_interfaces(app.networks(), inventory);
-        if interfaces.is_empty() {
-            lines.push(Line::from("No hardware interfaces found"));
-            frame.render_widget(Paragraph::new(lines), area);
-            return;
+        overview_network_interfaces(app.networks(), inventory)
+    };
+    let device = |interface: &NetworkInterfaceInfo| {
+        inventory.and_then(|inventory| {
+            inventory
+                .network_devices
+                .iter()
+                .find(|device| device.interface_name == interface.name)
+        })
+    };
+    let temperature = |interface: &NetworkInterfaceInfo| {
+        device(interface).and_then(|device| {
+            device_temperature(app.system_metrics(), device.device_path.as_ref())
+        })
+    };
+    let primary = interfaces.first().copied();
+    let mut parts = Vec::new();
+    if let Some(interface) = primary {
+        let (state, style) = network::state_display(interface.operstate);
+        parts.push(vec![Span::styled(state, style)]);
+        if let Some(temperature) = temperature(interface) {
+            parts.push(vec![temperature_span(temperature)]);
         }
-        let show_overflow = interfaces.len() > MAX_NETWORK_INTERFACES && remaining > 1;
-        let interface_limit = interfaces
-            .len()
-            .min(MAX_NETWORK_INTERFACES)
-            .min(remaining.saturating_sub(usize::from(show_overflow)));
-        lines.extend(interfaces.iter().take(interface_limit).map(|interface| {
-            let device = inventory.and_then(|inventory| {
-                inventory
-                    .network_devices
-                    .iter()
-                    .find(|device| device.interface_name == interface.name)
-            });
-            let model = device.and_then(|device| device.model.as_deref());
-            let temperature = device.and_then(|device| {
-                device_temperature(app.system_metrics(), device.device_path.as_ref())
-            });
-            network_summary_line(interface, model, temperature, width)
+    }
+    let title = CardTitle {
+        name: "Network",
+        model: primary.map_or("", |interface| interface.name.as_str()),
+        parts,
+        order: TitleOrder::PartsFirst,
+    };
+    let history = app.network_history();
+    let peak = history.iter().fold(0.0_f64, f64::max);
+    let graph = CardGraph {
+        history,
+        scale: peak.max(1.0),
+        interval: app.cpu_history_interval(),
+    };
+    let (rows, other_limit) = cards::render_graph_card(
+        frame,
+        area,
+        &title,
+        Some(graph),
+        graphs,
+        1,
+        other_interface_rows(app),
+    );
+    if rows.width == 0 || rows.height == 0 {
+        return;
+    }
+    let width = usize::from(rows.width);
+    let lines = if app.network_error().is_some() {
+        vec![Line::from("Network data unavailable")]
+    } else if app.networks().is_empty() {
+        vec![Line::from("No interfaces found")]
+    } else if let Some(primary) = primary {
+        let peak = (history.iter().len() > 0).then_some(peak);
+        let model = device(primary).and_then(|device| device.model.as_deref());
+        let mut lines = vec![Line::from(rates_line(primary, peak, model, width))];
+        let others = &interfaces[1..];
+        let overflow = others.len() > usize::from(other_limit);
+        let shown = usize::from(other_limit.saturating_sub(u16::from(overflow))).min(others.len());
+        lines.extend(others[..shown].iter().map(|interface| {
+            let model = device(interface).and_then(|device| device.model.as_deref());
+            network_summary_line(interface, model, temperature(interface), width)
         }));
-        if show_overflow {
+        if overflow && other_limit > 0 {
             lines.push(Line::from(format!(
                 "… {} more interfaces",
-                interfaces.len() - interface_limit
+                others.len() - shown
             )));
         }
-        // Interfaces come first; the trend only uses a row left over.
-        if lines.len() < usize::from(area.height) {
-            let history = app.network_history();
-            let peak = history.iter().fold(0.0_f64, f64::max);
-            let note = (history.iter().len() > 0)
-                .then(|| format!("peak {}", network::format_rate(Some(peak))));
-            lines.push(Line::from(trend_line(
-                history,
-                app.cpu_history_interval(),
-                peak.max(1.0),
-                note.as_deref(),
-                width,
-            )));
+        lines
+    } else {
+        vec![Line::from("No hardware interfaces found")]
+    };
+    frame.render_widget(Paragraph::new(lines), rows);
+}
+
+/// `RX 1.2 MiB/s  TX 84.2 KiB/s  peak 2.0 MiB/s`, followed by the adapter
+/// model when it fits; tighter forms on narrow cards.
+fn rates_line(
+    interface: &NetworkInterfaceInfo,
+    peak: Option<f64>,
+    model: Option<&str>,
+    width: usize,
+) -> String {
+    let (rx, tx) = (
+        interface.rx_rate_bytes_per_sec,
+        interface.tx_rate_bytes_per_sec,
+    );
+    let full_peak = peak
+        .map(|peak| format!("  peak {}", network::format_rate(Some(peak))))
+        .unwrap_or_default();
+    let tight_peak = peak
+        .map(|peak| format!(" ▲{}", format_rate_tight(Some(peak))))
+        .unwrap_or_default();
+    let candidates = [
+        format!(
+            "RX {}  TX {}{full_peak}",
+            network::format_rate(rx),
+            network::format_rate(tx)
+        ),
+        format!(
+            "RX {}  TX {}",
+            network::format_rate(rx),
+            network::format_rate(tx)
+        ),
+        format!(
+            "R{} T{}{tight_peak}",
+            format_rate_tight(rx),
+            format_rate_tight(tx)
+        ),
+        format!("R{} T{}", format_rate_tight(rx), format_rate_tight(tx)),
+    ];
+    let line = candidates
+        .iter()
+        .find(|line| line.chars().count() <= width)
+        .cloned()
+        .unwrap_or_else(|| layout::truncate(&candidates[3], width));
+    match model {
+        Some(model) => {
+            let room = width.saturating_sub(line.chars().count() + 2);
+            if room >= 8 {
+                format!("{line}  {}", layout::truncate(model, room))
+            } else {
+                line
+            }
         }
+        None => line,
     }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn overview_network_interfaces<'a>(
@@ -411,7 +485,7 @@ mod tests {
         let backend = TestBackend::new(100, 50);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| crate::ui::hardware::render(frame, &app, frame.area()))
+            .draw(|frame| render_card(frame, &app, frame.area(), true))
             .unwrap();
         let text = terminal
             .backend()
@@ -445,7 +519,7 @@ mod tests {
         let backend = TestBackend::new(100, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, None, frame.area()))
+            .draw(|frame| render_card(frame, &app, frame.area(), true))
             .unwrap();
 
         let stale = rendered_text(&terminal);
@@ -455,7 +529,7 @@ mod tests {
 
         app.update(crate::action::Action::NetworkUpdated(healthy));
         terminal
-            .draw(|frame| render(frame, &app, None, frame.area()))
+            .draw(|frame| render_card(frame, &app, frame.area(), true))
             .unwrap();
         let recovered = rendered_text(&terminal);
         assert!(recovered.contains("enp6s0"));

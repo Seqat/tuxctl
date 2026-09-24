@@ -2,202 +2,78 @@ use std::{path::Path, sync::Arc};
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::{
     app::App,
     linux::{
-        GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind, SystemMetrics,
-        Temperature, TemperatureKey,
+        GpuDevice, GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
+        SystemMetrics, Temperature, TemperatureKey,
     },
 };
 
-use super::{format_bytes, hardware_cpu, hardware_network_summary, layout, network, theme};
+use super::{
+    cards::{self, CardGraph, CardTitle, TitleOrder},
+    format_bytes, hardware_network_summary, layout, network,
+    overview::CardHeight,
+    theme,
+};
 
 const MAX_RAM_GAUGE_WIDTH: usize = 36;
-const MAX_STORAGE_ROWS: u16 = 4;
-/// A section heading plus one value row; anything less is not drawn.
-const LOWER_SECTION_MIN_HEIGHT: u16 = 2;
+/// Memory modules listed under the RAM usage when there is room.
+const MAX_MODULE_ROWS: u16 = 2;
 /// A temperature after a row's text is dropped rather than leave the text
 /// fewer columns than this.
 const MIN_TEXT_BEFORE_TEMPERATURE: usize = 8;
+/// Storage cards this wide list mounts and devices side by side.
+const STORAGE_SIDE_BY_SIDE_WIDTH: u16 = 90;
 
-pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+fn module_rows(app: &App) -> u16 {
+    app.hardware()
+        .map_or(0, |inventory| inventory.memory_modules.len() as u16)
+        .min(MAX_MODULE_ROWS)
+}
 
-    let block = Block::default().borders(Borders::ALL).title(" Hardware ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
+pub(super) fn memory_card_height(app: &App, graphs: bool) -> CardHeight {
+    CardHeight::new(1, module_rows(app), graphs)
+}
 
-    let inventory = app.hardware();
-    let metrics = app.system_metrics();
-    let width = usize::from(inner.width);
-    let lower_desired = [
-        // Heading, usage, trend and up to two modules.
-        3_u16.saturating_add(
-            inventory
-                .map(|inventory| inventory.memory_modules.len().min(2) as u16)
-                .unwrap_or(0),
-        ),
-        1_u16.saturating_add(
-            inventory
-                .map(|inventory| inventory.gpus.len().clamp(1, 3) as u16)
-                .unwrap_or(1),
-        ),
-        1_u16.saturating_add(
-            inventory
-                .map(|inventory| {
-                    inventory
-                        .storage_devices
-                        .len()
-                        .clamp(1, MAX_STORAGE_ROWS.into()) as u16
-                })
-                .unwrap_or(1),
-        ),
-        hardware_network_summary::desired_height(app, inventory),
-    ];
-    let (heights, spacing) = allocate_section_heights(
-        inner.height,
-        hardware_cpu::priority_height(metrics, width),
-        hardware_cpu::comfortable_height(metrics, width),
-        lower_desired,
-        |height| hardware_cpu::fitted_height(metrics, width, height),
+/// Memory: a graph of RAM use, the RAM gauge, and the modules if known.
+pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool) {
+    let graph = CardGraph {
+        history: app.memory_history(),
+        scale: 100.0,
+        interval: app.cpu_history_interval(),
+    };
+    let (rows, module_limit) = cards::render_graph_card(
+        frame,
+        area,
+        &CardTitle::plain("Memory"),
+        Some(graph),
+        graphs,
+        1,
+        module_rows(app),
     );
-    let areas = vertical_areas(inner, heights, spacing);
-
-    hardware_cpu::render(frame, app, inventory, metrics, areas[0]);
-    render_ram(frame, app, inventory, metrics, areas[1]);
-    render_gpu(frame, inventory, metrics, areas[2]);
-    render_storage(frame, inventory, metrics, areas[3]);
-    hardware_network_summary::render(frame, app, inventory, areas[4]);
-}
-
-/// Splits the panel between CPU and the lower sections (RAM, GPU, storage,
-/// network), returning heights and the gap between sections.
-///
-/// 1. CPU gets its priority height (summary plus a few grid rows).
-/// 2. Lower sections, in order, get a heading plus one value row; the first
-///    that does not fit and every later one are omitted instead of being
-///    drawn as an orphan heading.
-/// 3. Lower sections grow toward their desired height.
-/// 4. Only once every lower section is complete does CPU grow toward its
-///    comfortable height, trimmed by `cpu_fitted` to the rows its grid
-///    actually draws; leftover rows then become gaps between sections.
-///
-/// CPU only gains rows in step 1 and step 4, and neither can shrink as the
-/// panel grows, so a taller panel never shows fewer CPUs.
-fn allocate_section_heights(
-    total: u16,
-    cpu_priority: u16,
-    cpu_comfortable: u16,
-    lower_desired: [u16; 4],
-    cpu_fitted: impl Fn(u16) -> u16,
-) -> ([u16; 5], u16) {
-    let mut heights = [0; 5];
-    heights[0] = cpu_priority.min(total);
-    let mut remaining = total - heights[0];
-
-    let mut all_lower_shown = true;
-    for height in &mut heights[1..] {
-        if remaining < LOWER_SECTION_MIN_HEIGHT {
-            all_lower_shown = false;
-            break;
-        }
-        *height = LOWER_SECTION_MIN_HEIGHT;
-        remaining -= LOWER_SECTION_MIN_HEIGHT;
-    }
-
-    let mut lower_complete = all_lower_shown;
-    if all_lower_shown {
-        for (height, desired) in heights[1..].iter_mut().zip(lower_desired) {
-            let addition = desired.saturating_sub(*height).min(remaining);
-            *height += addition;
-            remaining -= addition;
-            lower_complete &= *height >= desired;
-        }
-    }
-
-    if lower_complete {
-        let addition = cpu_comfortable.saturating_sub(heights[0]).min(remaining);
-        let fitted = cpu_fitted(heights[0] + addition).max(heights[0]);
-        remaining -= fitted - heights[0];
-        heights[0] = fitted;
-    }
-
-    let gaps = heights
-        .iter()
-        .filter(|height| **height > 0)
-        .count()
-        .saturating_sub(1) as u16;
-    let spacing = u16::from(gaps > 0 && remaining >= gaps);
-    (heights, spacing)
-}
-
-fn vertical_areas(area: Rect, heights: [u16; 5], spacing: u16) -> [Rect; 5] {
-    let mut y = area.y;
-    let mut index = 0;
-    heights.map(|height| {
-        let height = height.min(area.bottom().saturating_sub(y));
-        let result = Rect::new(area.x, y, area.width, height);
-        y = y.saturating_add(height);
-        if index < heights.len() - 1 && height > 0 {
-            y = y.saturating_add(spacing).min(area.bottom());
-        }
-        index += 1;
-        result
-    })
-}
-
-fn render_ram(
-    frame: &mut Frame,
-    app: &App,
-    inventory: Option<&HardwareInventory>,
-    metrics: &SystemMetrics,
-    area: Rect,
-) {
-    if area.height == 0 {
+    if rows.width == 0 || rows.height == 0 {
         return;
     }
-    let width = usize::from(area.width);
-    let mut lines = vec![section_heading("RAM")];
-
-    if lines.len() < usize::from(area.height) {
-        let usage_line = metrics.memory.map_or_else(
-            || "Used  N/A".into(),
-            |memory| usage_bar_line("Used  ", memory, width),
-        );
-        lines.push(Line::from(layout::truncate(&usage_line, width)));
-    }
-
-    // The trend gives way first: it is shown only when the modules fit too.
-    let module_rows = inventory.map_or(0, |inventory| inventory.memory_modules.len().min(2));
-    if usize::from(area.height) >= lines.len() + 1 + module_rows {
-        lines.push(Line::from(trend_line(
-            app.memory_history(),
-            app.cpu_history_interval(),
-            100.0,
-            None,
-            width,
-        )));
-    }
-
-    if let Some(inventory) = inventory {
-        let remaining = usize::from(area.height).saturating_sub(lines.len());
+    let width = usize::from(rows.width);
+    let usage = app.system_metrics().memory.map_or_else(
+        || "RAM  N/A".into(),
+        |memory| usage_bar_line("RAM  ", memory, width),
+    );
+    let mut lines = vec![Line::from(layout::truncate(&usage, width))];
+    if let Some(inventory) = app.hardware() {
         lines.extend(
             inventory
                 .memory_modules
                 .iter()
                 .enumerate()
-                .take(remaining)
+                .take(usize::from(module_limit))
                 .map(|(index, module)| {
                     Line::from(layout::truncate(
                         &format_memory_module(index, module),
@@ -206,28 +82,7 @@ fn render_ram(
                 }),
         );
     }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// `Trend  ▂▃▅  60s`, optionally followed by a note such as the peak rate.
-pub(super) fn trend_line(
-    history: &crate::app::MetricHistory,
-    interval: std::time::Duration,
-    scale: f64,
-    note: Option<&str>,
-    width: usize,
-) -> String {
-    // As wide as the CPU line's `Util   12%  `, so the sparklines line up.
-    const LABEL: &str = "Trend       ";
-    let note = note.map(|note| format!("  {note}")).unwrap_or_default();
-    let room = width.saturating_sub(LABEL.len() + note.chars().count());
-    layout::truncate(
-        &format!(
-            "{LABEL}{}{note}",
-            hardware_cpu::history_line(history, interval, room, scale)
-        ),
-        width,
-    )
+    frame.render_widget(Paragraph::new(lines), rows);
 }
 
 /// Formats `<label>N%  [bar]  used / total`, dropping the bar when it would be too narrow.
@@ -250,104 +105,208 @@ pub(super) fn usage_bar_line(label: &str, usage: crate::linux::ByteUsage, width:
     )
 }
 
-fn render_gpu(
-    frame: &mut Frame,
-    inventory: Option<&HardwareInventory>,
-    metrics: &SystemMetrics,
-    area: Rect,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let width = usize::from(area.width);
-    let mut lines = vec![section_heading("GPU")];
-    if lines.len() < usize::from(area.height) {
-        match inventory {
-            None => lines.push(Line::from("Discovering hardware…")),
-            Some(inventory) if inventory.gpus.is_empty() => {
-                lines.push(Line::from("Unavailable / none detected"));
-            }
-            Some(inventory) => {
-                let remaining = usize::from(area.height).saturating_sub(lines.len());
-                let show_overflow = inventory.gpus.len() > remaining && remaining > 1;
-                let device_limit = remaining.saturating_sub(usize::from(show_overflow));
-                lines.extend(inventory.gpus.iter().take(device_limit).map(|gpu| {
-                    let kind = match gpu.kind {
-                        Some(GpuKind::Integrated) => "  iGPU",
-                        Some(GpuKind::Discrete) => "  dGPU",
-                        None => "",
-                    };
-                    let vram = gpu
-                        .vram_bytes
-                        .map(|bytes| format!("  {} VRAM", format_binary_capacity(bytes)))
-                        .unwrap_or_default();
-                    let temperature = device_temperature(metrics, gpu.device_path.as_ref());
-                    line_with_temperatures(
-                        &format!("{}{}{}", gpu.model, kind, vram),
-                        temperature.map(|temperature| vec![temperature_span(temperature)]),
-                        width,
-                    )
-                }));
-                if show_overflow {
-                    lines.push(Line::from(format!(
-                        "… {} more GPUs",
-                        inventory.gpus.len() - device_limit
-                    )));
-                }
-            }
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+/// The GPU the card is about: the first discrete one, else the first.
+fn primary_gpu(inventory: &HardwareInventory) -> Option<usize> {
+    inventory
+        .gpus
+        .iter()
+        .position(|gpu| gpu.kind == Some(GpuKind::Discrete))
+        .or((!inventory.gpus.is_empty()).then_some(0))
 }
 
-fn render_storage(
-    frame: &mut Frame,
-    inventory: Option<&HardwareInventory>,
-    metrics: &SystemMetrics,
-    area: Rect,
-) {
-    if area.height == 0 {
+pub(super) fn gpu_card_height(inventory: Option<&HardwareInventory>) -> CardHeight {
+    let others = inventory.map_or(0, |inventory| inventory.gpus.len().saturating_sub(1));
+    CardHeight::new(1, others as u16, false)
+}
+
+/// GPU: the primary GPU in the title with its temperature; its kind and
+/// VRAM, then one row per other GPU.
+pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
+    let metrics = app.system_metrics();
+    let inventory = app.hardware();
+    let primary = inventory
+        .and_then(|inventory| primary_gpu(inventory).map(|index| (index, &inventory.gpus[index])));
+    let title = CardTitle {
+        name: "GPU",
+        model: primary.map_or("", |(_, gpu)| gpu.model.as_str()),
+        parts: primary
+            .and_then(|(_, gpu)| device_temperature(metrics, gpu.device_path.as_ref()))
+            .map(|temperature| vec![vec![temperature_span(temperature)]])
+            .unwrap_or_default(),
+        order: TitleOrder::ModelFirst,
+    };
+    let others = inventory.map_or(0, |inventory| inventory.gpus.len().saturating_sub(1)) as u16;
+    let (rows, other_limit) = cards::render_graph_card(frame, area, &title, None, false, 1, others);
+    if rows.width == 0 || rows.height == 0 {
         return;
     }
-    let width = usize::from(area.width);
-    let mut lines = vec![section_heading("STORAGE")];
-    if lines.len() < usize::from(area.height) {
-        match inventory {
-            None => lines.push(Line::from("Discovering hardware…")),
-            Some(inventory) if inventory.storage_devices.is_empty() => {
-                lines.push(Line::from("Unavailable / none detected"));
+    let width = usize::from(rows.width);
+    let lines = match (inventory, primary) {
+        (None, _) => vec![Line::from("Discovering hardware…")],
+        (Some(_), None) => vec![Line::from("No GPU detected")],
+        (Some(inventory), Some((primary, gpu))) => {
+            let details = [gpu_kind(gpu), gpu_vram(gpu)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("  ");
+            let mut lines = vec![Line::from(layout::truncate(&details, width))];
+            let mut others: Vec<&GpuDevice> = inventory
+                .gpus
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != primary)
+                .map(|(_, gpu)| gpu)
+                .collect();
+            let overflow = others.len() > usize::from(other_limit);
+            others.truncate(usize::from(other_limit.saturating_sub(u16::from(overflow))));
+            lines.extend(others.iter().map(|gpu| {
+                let text = [Some(gpu.model.clone()), gpu_kind(gpu)]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                line_with_temperatures(
+                    &text,
+                    device_temperature(metrics, gpu.device_path.as_ref())
+                        .map(|temperature| vec![temperature_span(temperature)]),
+                    width,
+                )
+            }));
+            if overflow {
+                lines.push(Line::from(format!(
+                    "… {} more GPUs",
+                    inventory.gpus.len() - 1 - others.len()
+                )));
             }
-            Some(inventory) => {
-                let remaining = usize::from(area.height).saturating_sub(lines.len());
-                let show_overflow = inventory.storage_devices.len() > remaining && remaining > 1;
-                let device_limit = remaining.saturating_sub(usize::from(show_overflow));
-                let mut counts = [0_usize; 5];
-                let rows: Vec<_> = inventory
-                    .storage_devices
-                    .iter()
-                    .take(device_limit)
-                    .map(|device| {
-                        let (label, count_index) = storage_label(device.kind);
-                        let index = counts[count_index];
-                        counts[count_index] += 1;
-                        StorageRow {
-                            description: format_storage_device(label, index, device),
-                            rates: disk_rates(metrics, &device.system_name),
-                            temperature: device_temperature(metrics, device.device_path.as_ref()),
-                        }
-                    })
-                    .collect();
-                lines.extend(storage_lines(&rows, width));
-                if show_overflow {
-                    lines.push(Line::from(format!(
-                        "… {} more devices",
-                        inventory.storage_devices.len() - device_limit
-                    )));
-                }
+            lines
+        }
+    };
+    frame.render_widget(Paragraph::new(lines), rows);
+}
+
+fn gpu_kind(gpu: &GpuDevice) -> Option<String> {
+    match gpu.kind {
+        Some(GpuKind::Integrated) => Some("iGPU".into()),
+        Some(GpuKind::Discrete) => Some("dGPU".into()),
+        None => None,
+    }
+}
+
+fn gpu_vram(gpu: &GpuDevice) -> Option<String> {
+    gpu.vram_bytes
+        .map(|bytes| format!("{} VRAM", format_binary_capacity(bytes)))
+}
+
+/// Mount rows (the root filesystem for now) and device rows.
+fn storage_row_counts(
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+) -> (u16, u16) {
+    let mounts = u16::from(metrics.root_filesystem.is_some());
+    let devices = inventory.map_or(1, |inventory| inventory.storage_devices.len().max(1)) as u16;
+    (mounts, devices)
+}
+
+pub(super) fn storage_card_height(
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    inner_width: u16,
+) -> CardHeight {
+    let (mounts, devices) = storage_row_counts(inventory, metrics);
+    if inner_width >= STORAGE_SIDE_BY_SIDE_WIDTH {
+        CardHeight::new(1, mounts.max(devices) - 1, false)
+    } else {
+        CardHeight::new(1, (mounts + devices).saturating_sub(1), false)
+    }
+}
+
+/// Storage: filesystem usage and the disks, side by side on a wide card and
+/// one after the other otherwise.
+pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
+    let inner = cards::render_card(frame, area, &CardTitle::plain("Storage"), None);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let metrics = app.system_metrics();
+    let inventory = app.hardware();
+    let mount_line = |width: usize| -> Vec<Line<'static>> {
+        metrics
+            .root_filesystem
+            .map(|usage| Line::from(usage_bar_line("/  ", usage, width)))
+            .into_iter()
+            .collect()
+    };
+    if inner.width >= STORAGE_SIDE_BY_SIDE_WIDTH {
+        let mount_width = inner.width * 2 / 5;
+        let gap = 2;
+        let devices_area = Rect::new(
+            inner.x + mount_width + gap,
+            inner.y,
+            inner.width - mount_width - gap,
+            inner.height,
+        );
+        frame.render_widget(
+            Paragraph::new(mount_line(usize::from(mount_width))),
+            Rect::new(inner.x, inner.y, mount_width, inner.height),
+        );
+        let lines = device_lines(inventory, metrics, devices_area.width, devices_area.height);
+        frame.render_widget(Paragraph::new(lines), devices_area);
+    } else {
+        let mut lines = mount_line(usize::from(inner.width));
+        let height = inner.height.saturating_sub(lines.len() as u16);
+        lines.extend(device_lines(inventory, metrics, inner.width, height));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+/// One row per disk within `height` rows, with `… N more devices` when they
+/// do not all fit.
+fn device_lines(
+    inventory: Option<&HardwareInventory>,
+    metrics: &SystemMetrics,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if height == 0 {
+        return Vec::new();
+    }
+    let width = usize::from(width);
+    match inventory {
+        None => vec![Line::from("Discovering hardware…")],
+        Some(inventory) if inventory.storage_devices.is_empty() => {
+            vec![Line::from("No disks detected")]
+        }
+        Some(inventory) => {
+            let devices = &inventory.storage_devices;
+            let overflow = devices.len() > height;
+            let limit = if overflow { height - 1 } else { devices.len() };
+            let mut counts = [0_usize; 5];
+            let rows: Vec<_> = devices
+                .iter()
+                .take(limit)
+                .map(|device| {
+                    let (label, count_index) = storage_label(device.kind);
+                    let index = counts[count_index];
+                    counts[count_index] += 1;
+                    StorageRow {
+                        description: format_storage_device(label, index, device),
+                        rates: disk_rates(metrics, &device.system_name),
+                        temperature: device_temperature(metrics, device.device_path.as_ref()),
+                    }
+                })
+                .collect();
+            let mut lines = storage_lines(&rows, width);
+            if overflow {
+                lines.push(Line::from(format!(
+                    "… {} more devices",
+                    devices.len() - limit
+                )));
             }
+            lines
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The temperature of the device at `path`, when a sensor belongs to it.
@@ -409,14 +368,6 @@ pub(super) fn line_with_temperatures(
     let mut spans = vec![Span::raw(format!("{}  ", layout::truncate(text, room)))];
     spans.extend(temperatures);
     Line::from(spans)
-}
-
-pub(super) fn section_heading(label: &'static str) -> Line<'static> {
-    Line::from(label).style(
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )
 }
 
 pub(super) fn utilization_bar(percent: Option<f64>, width: usize) -> String {
@@ -659,32 +610,141 @@ mod tests {
         assert!(narrow.starts_with("Used  25%"));
     }
 
-    #[test]
-    fn ram_render_omits_the_redundant_total_row() {
-        let mut app = App::default();
-        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
-            memory: Some(crate::linux::ByteUsage {
-                used: 8 * 1024 * 1024 * 1024,
-                total: 32 * 1024 * 1024 * 1024,
-            }),
-            ..SystemMetrics::default()
-        }));
-        let backend = TestBackend::new(100, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn rows(app: &App, width: u16, height: u16, draw: fn(&mut Frame, &App, Rect)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, frame.area()))
+            .draw(|frame| draw(frame, app, frame.area()))
             .unwrap();
-        let text = terminal
+        terminal
             .backend()
             .buffer()
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
 
-        assert!(text.contains("RAM"));
-        assert!(text.contains("Used"));
-        assert!(!text.contains("Total"));
+    fn memory_app() -> App {
+        let mut app = App::default();
+        for used in [8_u64, 16, 24] {
+            app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+                memory: Some(crate::linux::ByteUsage {
+                    used: used << 30,
+                    total: 32 << 30,
+                }),
+                ..SystemMetrics::default()
+            }));
+        }
+        app
+    }
+
+    #[test]
+    fn the_memory_card_graphs_ram_use_above_its_gauge() {
+        let app = memory_app();
+        let card = rows(&app, 60, 8, |frame, app, area| {
+            render_memory_card(frame, app, area, true)
+        });
+        assert!(card[0].contains(" Memory "), "{card:#?}");
+        // Five graph rows: 75 % of 40 eighths is three full rows and a ▆.
+        assert!(
+            card[2].ends_with("▆│"),
+            "newest sample on the right: {card:#?}"
+        );
+        assert!(card[5].ends_with("███│"), "{card:#?}");
+        assert!(card[6].contains("RAM  75%"), "{card:#?}");
+        assert!(card[7].contains(" 58s "), "58 samples fit: {card:#?}");
+
+        // Compact: the graph moves into the title row.
+        let compact = rows(&app, 60, 3, |frame, app, area| {
+            render_memory_card(frame, app, area, false)
+        });
+        assert!(
+            compact[0].contains(" Memory ") && compact[0].contains('▆'),
+            "{compact:#?}"
+        );
+        assert!(compact[1].contains("RAM  75%"));
+    }
+
+    fn gpu(model: &str, kind: Option<GpuKind>) -> GpuDevice {
+        GpuDevice {
+            model: model.into(),
+            kind,
+            vram_bytes: Some(16 << 30),
+            device_path: None,
+        }
+    }
+
+    #[test]
+    fn the_gpu_card_is_about_the_discrete_gpu_and_lists_the_others() {
+        let mut app = App::default();
+        let card = |app: &App| {
+            rows(app, 60, 6, |frame, app, area| {
+                render_gpu_card(frame, app, area)
+            })
+        };
+        assert!(card(&app)[1].contains("Discovering hardware…"));
+
+        app.update(crate::action::Action::HardwareDiscovered(
+            HardwareInventory::default(),
+        ));
+        assert!(card(&app)[1].contains("No GPU detected"));
+
+        app.update(crate::action::Action::HardwareDiscovered(
+            HardwareInventory {
+                gpus: vec![
+                    gpu("Intel UHD Graphics 770", Some(GpuKind::Integrated)),
+                    gpu("NVIDIA GeForce RTX 5070 Ti", Some(GpuKind::Discrete)),
+                ],
+                ..HardwareInventory::default()
+            },
+        ));
+        let rows = card(&app);
+        assert!(
+            rows[0].contains(" GPU  NVIDIA GeForce RTX 5070 Ti "),
+            "{rows:#?}"
+        );
+        assert!(rows[1].contains("dGPU  16 GiB VRAM"), "{rows:#?}");
+        assert!(
+            rows[2].contains("Intel UHD Graphics 770  iGPU"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn storage_lists_mounts_and_disks_side_by_side_on_a_wide_card() {
+        let mut app = App::default();
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+            root_filesystem: Some(crate::linux::ByteUsage {
+                used: 50 << 30,
+                total: 100 << 30,
+            }),
+            ..SystemMetrics::default()
+        }));
+        app.update(crate::action::Action::HardwareDiscovered(
+            HardwareInventory {
+                storage_devices: vec![StorageDevice {
+                    system_name: "nvme0n1".into(),
+                    kind: StorageKind::Nvme,
+                    model: Some("Test Disk".into()),
+                    capacity_bytes: Some(1_000_000_000_000),
+                    device_path: None,
+                }],
+                ..HardwareInventory::default()
+            },
+        ));
+        let draw: fn(&mut Frame, &App, Rect) =
+            |frame, app, area| render_storage_card(frame, app, area);
+
+        let wide = rows(&app, 120, 4, draw);
+        assert!(wide[0].contains(" Storage "));
+        assert!(
+            wide[1].contains("/  50%") && wide[1].contains("NVMe0  Test Disk"),
+            "{wide:#?}"
+        );
+
+        let narrow = rows(&app, 60, 5, draw);
+        assert!(narrow[1].contains("/  50%"), "{narrow:#?}");
+        assert!(narrow[2].contains("NVMe0  Test Disk"), "{narrow:#?}");
     }
 
     #[test]
@@ -929,104 +989,6 @@ mod tests {
     }
 
     #[test]
-    fn ram_and_network_trends_appear_when_there_is_room() {
-        use crate::action::Action;
-        use ratatui::{backend::TestBackend, Terminal};
-
-        let mut app = App::default();
-        for used in [1_u64, 2, 3] {
-            app.update(Action::SystemMetricsUpdated(SystemMetrics {
-                memory: Some(crate::linux::ByteUsage {
-                    used: used << 30,
-                    total: 4 << 30,
-                }),
-                ..SystemMetrics::default()
-            }));
-        }
-        for rx in [0.0, 512.0, 2048.0] {
-            app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
-                interfaces: vec![crate::linux::NetworkInterfaceInfo {
-                    name: "enp6s0".into(),
-                    operstate: crate::linux::OperState::Up,
-                    mac_address: None,
-                    mtu: Some(1500),
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    rx_bytes: 0,
-                    tx_bytes: 0,
-                    rx_packets: 0,
-                    tx_packets: 0,
-                    rx_errors: 0,
-                    tx_errors: 0,
-                    rx_dropped: 0,
-                    tx_dropped: 0,
-                    rx_rate_bytes_per_sec: Some(rx),
-                    tx_rate_bytes_per_sec: Some(0.0),
-                }],
-                error: None,
-            }));
-        }
-        let rows = |height| {
-            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
-            terminal
-                .draw(|frame| render(frame, &app, frame.area()))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            (0..height)
-                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-                .collect::<Vec<_>>()
-        };
-
-        let tall = rows(40);
-        let trends: Vec<&String> = tall.iter().filter(|row| row.contains("Trend ")).collect();
-        assert_eq!(trends.len(), 2, "{tall:#?}");
-        assert!(
-            trends[0].contains("▃▅▆"),
-            "RAM at 25/50/75 %: {}",
-            trends[0]
-        );
-        assert!(
-            trends[1].contains("▁▃█"),
-            "network scaled to its peak: {}",
-            trends[1]
-        );
-        assert!(trends[1].contains("peak 2.0 KiB/s"), "{}", trends[1]);
-
-        // The CPU and RAM sparklines start in the same column.
-        let column = |row: &String, marker: char| row.chars().position(|c| c == marker);
-        let cpu = tall.iter().find(|row| row.contains("Util")).unwrap();
-        assert_eq!(
-            column(cpu, '—'),
-            column(trends[0], '▃'),
-            "{cpu}\n{}",
-            trends[0]
-        );
-
-        // A trend never displaces the row it summarizes.
-        for height in 8..40 {
-            let panel = rows(height);
-            let at = |text: &str| panel.iter().position(|row| row.contains(text));
-            let trend_rows: Vec<usize> = panel
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| row.contains("Trend "))
-                .map(|(index, _)| index)
-                .collect();
-            for trend in trend_rows {
-                let owner = if at("NETWORK").is_some_and(|network| trend > network) {
-                    at("enp6s0")
-                } else {
-                    at("Used")
-                };
-                assert!(
-                    owner.is_some_and(|owner| owner < trend),
-                    "{height}: {panel:#?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn long_storage_names_can_be_safely_truncated() {
         let device = StorageDevice {
             system_name: "nvme0n1".into(),
@@ -1039,64 +1001,5 @@ mod tests {
 
         assert_eq!(line.chars().count(), 24);
         assert!(line.ends_with('…'));
-    }
-
-    #[test]
-    fn section_height_allocation_never_exceeds_the_available_area() {
-        for height in 0..60 {
-            let (allocated, spacing) = allocate_section_heights(height, 9, 20, [4, 4, 5, 5], |h| h);
-            let gaps = allocated
-                .iter()
-                .filter(|height| **height > 0)
-                .count()
-                .saturating_sub(1);
-            let used = allocated.into_iter().sum::<u16>() + spacing * gaps as u16;
-            assert!(used <= height, "height {height}: {allocated:?} + {spacing}");
-        }
-    }
-
-    #[test]
-    fn lower_sections_get_a_value_row_or_are_omitted() {
-        for height in 0..60 {
-            let (allocated, _) = allocate_section_heights(height, 9, 20, [4, 4, 5, 5], |h| h);
-            let lower = &allocated[1..];
-            assert!(lower.iter().all(|height| *height == 0 || *height >= 2));
-            let shown = lower.iter().take_while(|height| **height > 0).count();
-            assert!(
-                lower[shown..].iter().all(|height| *height == 0),
-                "{allocated:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unused_cpu_rows_become_section_gaps() {
-        let (allocated, spacing) = allocate_section_heights(40, 9, 25, [4, 4, 5, 5], |h| h.min(18));
-        assert_eq!(allocated, [18, 4, 4, 5, 5]);
-        assert_eq!(spacing, 1);
-    }
-
-    #[test]
-    fn cpu_priority_comes_first_and_extra_rows_wait_for_lower_sections() {
-        assert_eq!(
-            allocate_section_heights(6, 9, 20, [4, 4, 5, 5], |h| h).0,
-            [6, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            allocate_section_heights(17, 9, 20, [4, 4, 5, 5], |h| h).0,
-            [9, 2, 2, 2, 2]
-        );
-        assert_eq!(
-            allocate_section_heights(27, 9, 20, [4, 4, 5, 5], |h| h).0,
-            [9, 4, 4, 5, 5]
-        );
-        assert_eq!(
-            allocate_section_heights(30, 9, 20, [4, 4, 5, 5], |h| h),
-            ([12, 4, 4, 5, 5], 0)
-        );
-        assert_eq!(
-            allocate_section_heights(44, 9, 20, [4, 4, 5, 5], |h| h),
-            ([20, 4, 4, 5, 5], 1)
-        );
     }
 }

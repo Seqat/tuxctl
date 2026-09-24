@@ -29,28 +29,17 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 
 ### Overview
 
-- Responsive **System** and **Hardware** dashboard.
-- System information:
-  - Hostname and kernel version.
-  - Uptime.
-  - Process, running-process, and zombie counts.
-  - Root filesystem usage.
-  - Pinned processes (pin them with `P` on the Processes tab) with live CPU and memory.
-- Live CPU monitoring:
-  - Aggregate CPU utilization.
-  - Bounded CPU utilization history.
-  - 1-minute, 5-minute, and 15-minute load averages.
-  - Per-logical-CPU utilization.
-  - Responsive logical-CPU grid for different terminal sizes.
-- Live RAM usage with used/total capacity and a usage trend.
+- A system summary in the top border: hostname, kernel, uptime, and process, running-process, and zombie counts (zombies are highlighted when there are any). It shortens on narrow terminals: the kernel goes first, then the counts are abbreviated (`397p · 2r · 0z`), then the uptime goes.
+- Cards for **CPU**, **GPU**, **Memory**, **Network**, **Storage**, and **Pinned** processes. Each card names its component in its title with the model and temperature (`CPU  Ryzen 5 7500F · 45°C`); the model is shortened first when the title does not fit.
+  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid.
+  - **GPU:** the discrete GPU (or the only one), its kind and VRAM, and a row per other GPU.
+  - **Memory:** a graph of RAM use and the RAM gauge, plus RAM modules via EDAC sysfs when available.
+  - **Network:** the main physical interface with its state and temperature, a traffic graph with its peak, and a row per other interface.
+  - **Storage:** root filesystem usage, and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
+  - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU and memory.
+  - Graphs cover the last 60 samples; the bottom border of each card states the time span they cover.
 - Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
-- Hardware inventory:
-  - CPU model information.
-  - RAM module information via EDAC sysfs when available.
-  - GPU devices using DRM/NVIDIA sysfs metadata.
-  - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
-- Compact physical network interface summary with live RX/TX rates and a combined traffic trend with its peak.
-- Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
+- Responsive layout by terminal width: 150 columns and more show a 2×2 grid (CPU | GPU, Memory | Network), Storage below it and Pinned as a column on the right; 100–149 columns show the grid with Storage and Pinned side by side below it; narrower terminals stack the cards (CPU, Memory, Pinned, Network, Storage, GPU) with each graph in its card's title row.
 
 #### Temperatures
 
@@ -470,7 +459,7 @@ The normal interface requires a terminal size of at least:
 
 Below either dimension, `tuxctl` displays a terminal-too-small warning instead of attempting to render the normal interface.
 
-Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview sections that do not fit are omitted rather than shown as empty headings; the CPU grid always reports how many logical CPUs are not shown. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
+Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview cards that do not fit are omitted in priority order rather than drawn empty. A short CPU card gives up its per-CPU grid first; when part of the grid is shown, it reports how many logical CPUs are not. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
 
 ---
 

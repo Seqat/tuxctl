@@ -280,6 +280,14 @@ pub fn tables(mode: InputMode) -> &'static [&'static [Binding]] {
 }
 
 /// The action of the first binding in `table` that matches `key`.
+/// The character key bound to `action` in `table`, for hints that name it.
+pub fn key_for(table: &[Binding], action: Action) -> Option<char> {
+    table.iter().find_map(|binding| match binding.key.code {
+        KeyCode::Char(key) if binding.action == action => Some(key),
+        _ => None,
+    })
+}
+
 pub fn find(table: &[Binding], key: KeyEvent) -> Option<Action> {
     table
         .iter()
@@ -295,6 +303,12 @@ pub fn lookup(mode: InputMode, key: KeyEvent) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints_can_name_the_key_of_an_action() {
+        assert_eq!(key_for(PROCESSES, Action::TogglePin), Some('P'));
+        assert_eq!(key_for(PROCESSES, Action::Quit), None);
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)

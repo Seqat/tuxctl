@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Overview is a set of cards that uses the whole terminal: CPU, GPU,
+  Memory, Network, Storage and Pinned, each with its model and temperature
+  in the title and, for CPU, Memory and Network, a graph as wide as the
+  card. At 150 columns and more they form a 2×2 grid with Storage below and
+  Pinned on the right; at 100–149 columns Storage and Pinned sit side by
+  side under the grid; narrower terminals stack the cards in priority order.
+  Hostname, kernel, uptime and process counts moved into the top border.
+
 ## [0.3.3] - 2026-09-24
 
 Component temperatures on the Overview, a greyed-out background behind

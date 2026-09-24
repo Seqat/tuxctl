@@ -1,3 +1,4 @@
+mod cards;
 mod hardware;
 mod hardware_cpu;
 mod hardware_network_summary;
@@ -9,6 +10,7 @@ mod overview;
 mod processes;
 mod sanitize;
 mod services;
+mod sparkline;
 mod status;
 mod theme;
 
@@ -26,7 +28,6 @@ use ratatui::{
 use crate::{
     action::{InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
-    linux::ByteUsage,
 };
 
 #[derive(Debug, Default)]
@@ -418,7 +419,10 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     let outer = Block::default().borders(Borders::ALL).title(TITLE);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
-    let interval_buttons = render_top_right(frame, app, area);
+    let (interval_buttons, corner_x) = render_top_right(frame, app, area);
+    if app.active_tab() == Tab::Overview {
+        render_overview_header(frame, app, area, corner_x);
+    }
 
     let screen = layout::screen(inner);
     let tab_areas = layout::tab_areas(screen.tabs);
@@ -540,11 +544,23 @@ const INTERVAL_BUTTONS: [(IntervalStep, &str); 2] = [
     (IntervalStep::Longer, "[+]"),
 ];
 
+/// The system summary after the title on the Overview, in the part of the top
+/// border left of `corner_x` (where the right corner starts), with a gap.
+fn render_overview_header(frame: &mut Frame, app: &App, area: Rect, corner_x: u16) {
+    let x = area.x.saturating_add(1 + TITLE.len() as u16);
+    let room = corner_x.saturating_sub(1).saturating_sub(x);
+    if let Some(line) = overview::header_line(app, usize::from(room)) {
+        let width = (line.width() as u16).min(room);
+        frame.render_widget(Paragraph::new(line), Rect::new(x, area.y, width, 1));
+    }
+}
+
 /// Draws the right end of the top border: the stale marker (collectors behind
 /// this screen that stopped updating), the sampling interval and its `[-]`/`[+]`
 /// buttons. Space is given up in that order: stale names become a bare marker,
-/// then the buttons go. Returns the drawn buttons for hit testing.
-fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalStep, Rect)> {
+/// then the buttons go. Returns the drawn buttons for hit testing and the
+/// column where the corner starts.
+fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> (Vec<(IntervalStep, Rect)>, u16) {
     // Keep both corners and a gap after the title free.
     let room = usize::from(area.width).saturating_sub(TITLE.len() + 3);
     let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
@@ -571,11 +587,12 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
         .flat_map(|buttons| stale_options.iter().map(move |stale| (stale, buttons)))
         .find(|(stale, buttons)| width_of(stale, *buttons) <= room)
     else {
-        return Vec::new();
+        return (Vec::new(), area.right().saturating_sub(1));
     };
 
     let width = width_of(stale, buttons) as u16;
     let mut x = area.right().saturating_sub(1 + width);
+    let corner_x = x;
     let mut spans = Vec::with_capacity(4);
     if let Some(stale) = stale {
         spans.push(Span::styled(
@@ -592,10 +609,10 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
     frame.render_widget(Clear, corner);
     frame.render_widget(Paragraph::new(Line::from(spans)), corner);
     if !buttons {
-        return Vec::new();
+        return (Vec::new(), corner_x);
     }
     x = x.saturating_add(width - buttons_width as u16);
-    INTERVAL_BUTTONS
+    let buttons = INTERVAL_BUTTONS
         .iter()
         .map(|&(step, label)| {
             let button = Rect::new(x, area.y, label.len() as u16, 1);
@@ -608,7 +625,8 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
             x = x.saturating_add(button.width + 1);
             (step, button)
         })
-        .collect()
+        .collect();
+    (buttons, corner_x)
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -722,14 +740,6 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     .alignment(Alignment::Center);
     frame.render_widget(content, layout::centered_rows(area, 3));
     ContentRender::None
-}
-
-pub(super) fn format_usage(usage: ByteUsage) -> String {
-    format!(
-        "{} / {}",
-        format_bytes(usage.used),
-        format_bytes(usage.total)
-    )
 }
 
 pub(super) fn format_bytes(bytes: u64) -> String {
@@ -1362,7 +1372,7 @@ mod tests {
         let regions = rendered_regions(&mut terminal, &app);
         let top = top_row(&terminal);
 
-        assert!(top.starts_with("┌ tuxctl ─"), "{top}");
+        assert!(top.starts_with("┌ tuxctl "), "{top}");
         assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
         assert_eq!(regions.interval_buttons.len(), 2);
         for (step, area) in &regions.interval_buttons {
@@ -1392,6 +1402,25 @@ mod tests {
     }
 
     #[test]
+    fn the_system_summary_sits_in_the_top_border_on_the_overview_only() {
+        let mut app = App::default();
+        let mut metrics = SystemMetrics::default();
+        metrics.system_identity.hostname = Some("build-host".into());
+        app.update(Action::SystemMetricsUpdated(metrics));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        rendered_regions(&mut terminal, &app);
+        let top = top_row(&terminal);
+        assert!(top.starts_with("┌ tuxctl · build-host · "), "{top}");
+        assert!(top.contains(" zombie ─"), "a gap before the corner: {top}");
+        assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
+
+        app.update(Action::SelectTab(Tab::Processes));
+        rendered_regions(&mut terminal, &app);
+        assert!(!top_row(&terminal).contains("build-host"));
+    }
+
+    #[test]
     fn the_top_right_corner_gives_up_space_without_touching_the_title() {
         let mut app = App::default().with_collector_periods(
             crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(1)),
@@ -1410,7 +1439,7 @@ mod tests {
                 continue;
             }
             let top = top_row(&terminal);
-            assert!(top.starts_with("┌ tuxctl ─"), "{width}: {top}");
+            assert!(top.starts_with("┌ tuxctl "), "{width}: {top}");
             assert!(top.ends_with('┐'), "{width}: {top}");
             assert!(top.contains(" stale "), "{width}: {top}");
             assert!(top.contains("250ms"), "{width}: {top}");
@@ -1541,30 +1570,23 @@ mod tests {
         app
     }
 
-    /// Content rows inside the Hardware panel, located by its title.
-    fn hardware_panel_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    /// Rows of the Overview below the tabs, inside the outer border.
+    fn overview_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let rows: Vec<Vec<&str>> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
-        let Some((top, left)) = rows.iter().enumerate().find_map(|(y, row)| {
-            let line: String = row.concat();
-            let title = line.find(" Hardware ")?;
-            let title_column = line[..title].chars().count();
-            let left = (0..title_column).rev().find(|&x| row[x] == "┌")?;
-            Some((y, left))
-        }) else {
-            return Vec::new();
-        };
-        let right = (left + 1..width).find(|&x| rows[top][x] == "┐").unwrap();
-        rows[top + 1..]
-            .iter()
-            .take_while(|row| row[left] != "└")
-            .map(|row| row[left + 1..right].concat())
+        let width = buffer.area.width;
+        (2..buffer.area.height.saturating_sub(1))
+            .map(|y| (1..width - 1).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    /// Every card border that starts below the tabs has a row inside it.
+    fn cards_have_content(terminal: &Terminal<TestBackend>) -> bool {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (2..area.height.saturating_sub(1)).all(|y| {
+            (1..area.width - 1)
+                .all(|x| buffer[(x, y)].symbol() != "┌" || buffer[(x, y + 1)].symbol() != "└")
+        })
     }
 
     fn shown_cpu_labels(rows: &[String]) -> Vec<u32> {
@@ -1585,11 +1607,9 @@ mod tests {
     fn more_cpus(rows: &[String]) -> usize {
         rows.iter()
             .find_map(|row| {
-                row.trim()
-                    .strip_prefix("… ")?
-                    .strip_suffix(" more logical CPUs")?
-                    .parse()
-                    .ok()
+                let (_, rest) = row.split_once("… ")?;
+                let (count, _) = rest.split_once(" more logical CPUs")?;
+                count.parse().ok()
             })
             .unwrap_or(0)
     }
@@ -1598,26 +1618,29 @@ mod tests {
     fn overview_resize_sweep_keeps_cpu_counts_and_sections_consistent() {
         for cpu_count in [12, 64] {
             let app = overview_sweep_app(cpu_count);
-            for width in [40, 50, 60, 89, 90, 120, 160] {
+            for width in [40, 50, 60, 89, 99, 100, 120, 149, 150, 200] {
                 let mut previous_shown = 0;
                 for height in layout::MIN_TERMINAL_HEIGHT..=60 {
                     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                     rendered_regions(&mut terminal, &app);
-                    let rows = hardware_panel_rows(&terminal);
+                    let rows = overview_rows(&terminal);
                     let context =
                         format!("{cpu_count} CPUs at {width}x{height}:\n{}", rows.join("\n"));
-                    if rows.is_empty() {
-                        continue;
-                    }
+                    assert!(
+                        cards_have_content(&terminal),
+                        "card without content; {context}"
+                    );
 
                     let shown = shown_cpu_labels(&rows);
                     let mut distinct = shown.clone();
                     distinct.sort_unstable();
                     distinct.dedup();
                     assert_eq!(distinct.len(), shown.len(), "{context}");
-                    assert_eq!(
-                        shown.len() + more_cpus(&rows),
-                        cpu_count as usize,
+                    // The grid is the first thing a short card gives up; when
+                    // any of it is shown, it accounts for every CPU.
+                    let grid_hidden = shown.is_empty() && more_cpus(&rows) == 0;
+                    assert!(
+                        grid_hidden || shown.len() + more_cpus(&rows) == cpu_count as usize,
                         "shown + overflow must equal the CPU count; {context}"
                     );
                     assert!(
@@ -1625,16 +1648,6 @@ mod tests {
                         "visible CPUs decreased as height grew; {context}"
                     );
                     previous_shown = shown.len();
-
-                    for (index, row) in rows.iter().enumerate() {
-                        if ["RAM", "GPU", "STORAGE", "NETWORK", "CPU"].contains(&row.trim()) {
-                            let next = rows.get(index + 1).map_or("", |next| next.trim());
-                            assert!(
-                                !next.is_empty(),
-                                "section heading without content; {context}"
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -1645,7 +1658,7 @@ mod tests {
         let app = overview_sweep_app(12);
         let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
         rendered_regions(&mut terminal, &app);
-        let rows = hardware_panel_rows(&terminal);
+        let rows = overview_rows(&terminal);
         let row = |text: &str| {
             rows.iter()
                 .find(|row| row.contains(text))
@@ -1653,8 +1666,8 @@ mod tests {
                 .clone()
         };
 
-        assert!(row("Test Processor").contains("Test Processor  54°C"));
-        assert!(row("Test Graphics").contains("Test Graphics  100°C"));
+        assert!(row("Test Processor").contains("Test Processor · 54°C"));
+        assert!(row("Test Graphics").contains("Test Graphics · 100°C"));
         assert!(row("Test Disk").contains("1 TB  –"), "{}", row("Test Disk"));
         assert!(row("eth0").contains("47°C"));
 
@@ -1690,7 +1703,7 @@ mod tests {
                             width.min(frame.area().width),
                             height.min(frame.area().height),
                         );
-                        hardware::render(frame, &app, area);
+                        overview::render(frame, &app, area);
                     })
                     .unwrap();
             }
@@ -1703,7 +1716,7 @@ mod tests {
         for height in layout::MIN_TERMINAL_HEIGHT..=60 {
             let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
             rendered_regions(&mut terminal, &app);
-            for row in hardware_panel_rows(&terminal) {
+            for row in overview_rows(&terminal) {
                 let mut rest = row.as_str();
                 while let Some(position) = rest.find("CPU") {
                     rest = &rest[position + 3..];
@@ -1902,17 +1915,12 @@ mod tests {
             .chunks(120)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
-        let heading = lines
+        let row = lines
             .iter()
-            .position(|line| line.contains("Filesystem"))
-            .expect("filesystem heading");
-        let row = &lines[heading + 1];
-        let usage = format_usage(ByteUsage {
-            used: 50 << 30,
-            total: 100 << 30,
-        });
+            .find(|line| line.contains("/  50%"))
+            .expect("filesystem row in the Storage card");
         assert!(row.contains("/  50%  █"), "row: {row}");
-        assert!(row.contains(&format!("░  {usage}")), "row: {row}");
+        assert!(row.contains("░  50.0 GiB / 100.0 GiB"), "row: {row}");
     }
 
     #[test]
@@ -2167,18 +2175,24 @@ mod tests {
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
                 .collect::<Vec<_>>();
 
-            // Row 0 is outer border, Row 1 is tab bar, Row 2 begins System content directly below tabs.
+            // Row 0 is the outer border with the system summary, row 1 the
+            // tabs, row 2 the top border of the first card directly below them.
+            let context = format!("{width}x{height}:\n{}", rows.join("\n"));
             assert!(rows[1].contains("Overview") || rows[1].contains(" Ovr "));
-            assert!(rows[2].contains("System"));
+            if width >= 60 {
+                assert!(rows[0].contains("· build-host · "), "{context}");
+            }
+            assert!(rows[2].contains(" CPU "), "{context}");
             assert!(!rows[2].contains("Overview"));
-            assert!(!rows[2].trim().is_empty());
             assert!(!rows[3].trim().is_empty());
 
-            let content_width = width.saturating_sub(2);
-            if content_width >= 90 {
-                assert!(rows[2].contains("Hardware"));
+            if width - 2 >= overview::MEDIUM_MIN_WIDTH {
+                assert!(rows[2].contains(" GPU "), "{context}");
             } else {
-                assert!(rows.iter().skip(3).any(|row| row.contains("Hardware")));
+                assert!(
+                    rows.iter().skip(3).any(|row| row.contains(" Memory ")),
+                    "{context}"
+                );
             }
         }
     }

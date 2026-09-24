@@ -14,9 +14,10 @@ mod system;
 mod temperature;
 
 #[cfg(test)]
-pub(crate) use hardware::{CpuPackage, GpuDevice, NetworkDevice};
+pub(crate) use hardware::{CpuPackage, NetworkDevice};
 pub use hardware::{
-    GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
+    GpuDevice, GpuKind, HardwareCollector, HardwareInventory, MemoryModule, StorageDevice,
+    StorageKind,
 };
 pub use journal::{priority_label, JournalBatch, JournalCollector, JournalEntry};
 #[cfg(test)]
@@ -33,6 +34,8 @@ pub use service::{
 };
 #[cfg(test)]
 pub(crate) use system::DiskIo;
+#[cfg(test)]
+pub(crate) use system::LoadAverage;
 #[cfg(test)]
 pub(crate) use system::LogicalCpuId;
 pub use system::{ByteUsage, LogicalCpuMetrics, SystemMetrics, SystemMetricsCollector};

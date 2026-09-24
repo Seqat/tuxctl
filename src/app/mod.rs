@@ -78,6 +78,11 @@ impl MetricHistory {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&mut self, value: f64) {
+        self.push(value);
+    }
+
     fn push_percent(&mut self, percent: f64) -> bool {
         percent.is_finite() && self.push(percent.clamp(0.0, 100.0))
     }

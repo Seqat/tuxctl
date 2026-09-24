@@ -6,13 +6,15 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, MetricHistory},
-    linux::{HardwareInventory, LogicalCpuMetrics, SystemMetrics, TemperatureKey},
+    app::App,
+    linux::{LogicalCpuMetrics, SystemMetrics, TemperatureKey},
 };
 
 use super::{
-    hardware::{line_with_temperatures, section_heading, temperature_span, utilization_bar},
+    cards::{self, CardGraph, CardTitle, TitleOrder},
+    hardware::{temperature_span, utilization_bar},
     layout,
+    overview::CardHeight,
 };
 
 const PREFERRED_CPU_CELL_WIDTH: usize = 20;
@@ -22,11 +24,6 @@ const MIN_USEFUL_CPU_GAUGE_WIDTH: usize = 6;
 const CPU_CELL_GAP: usize = 2;
 /// Dense cells already separate label and value, so one space between cells suffices.
 const DENSE_CPU_CELL_GAP: usize = 1;
-/// Heading, model, utilization history and load average.
-const SUMMARY_LINES: usize = 4;
-/// Grid rows the CPU section claims before lower sections get their minimum.
-const PRIORITY_GRID_ROWS: usize = 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CpuGridLayout {
     columns: usize,
@@ -45,40 +42,15 @@ fn grid_layout(metrics: &SystemMetrics, width: usize, max_rows: usize) -> CpuGri
     cpu_grid_layout(metrics.logical_cpus.len(), max_cpu_id, width, max_rows)
 }
 
-/// Height the CPU section claims first: its summary plus a few rows of the
-/// densest grid, with an overflow line when that cannot show every CPU.
-pub(super) fn priority_height(metrics: &SystemMetrics, width: usize) -> u16 {
-    let count = metrics.logical_cpus.len();
-    if count == 0 {
-        return SUMMARY_LINES as u16;
-    }
-    let densest_columns = grid_layout(metrics, width, 1).columns.max(1);
-    let rows_for_all = count.div_ceil(densest_columns);
-    let rows = rows_for_all.min(PRIORITY_GRID_ROWS);
-    let height = SUMMARY_LINES + rows + usize::from(rows_for_all > rows);
-    u16::try_from(height).unwrap_or(u16::MAX)
+/// Rows the grid needs to show every CPU at `width`.
+fn full_grid_rows(metrics: &SystemMetrics, width: u16) -> u16 {
+    let grid = grid_layout(metrics, usize::from(width), metrics.logical_cpus.len());
+    u16::try_from(grid.rows).unwrap_or(u16::MAX)
 }
 
-/// Height at which every CPU fits in the preferred grid with breathing room.
-pub(super) fn comfortable_height(metrics: &SystemMetrics, width: usize) -> u16 {
-    let grid = grid_layout(metrics, width, metrics.logical_cpus.len());
-    u16::try_from(SUMMARY_LINES + 2 + grid.rows).unwrap_or(u16::MAX)
-}
-
-/// The model line is dropped in a minimal section so the overflow line still fits.
-fn shows_model_line(metrics: &SystemMetrics, height: usize) -> bool {
-    height > SUMMARY_LINES || metrics.logical_cpus.is_empty()
-}
-
-/// Chooses the grid from the height the section actually received, reserving a
-/// row for the overflow line whenever not every CPU fits.
-pub(super) fn grid_for_height(
-    metrics: &SystemMetrics,
-    width: usize,
-    height: usize,
-) -> CpuGridLayout {
-    let header = SUMMARY_LINES - usize::from(!shows_model_line(metrics, height));
-    let rows = height.saturating_sub(header);
+/// The grid within `rows`, keeping the last one for `… N more logical CPUs`
+/// whenever not every CPU fits.
+fn grid_for_rows(metrics: &SystemMetrics, width: usize, rows: usize) -> CpuGridLayout {
     let grid = grid_layout(metrics, width, rows);
     if grid.visible < metrics.logical_cpus.len() {
         grid_layout(metrics, width, rows.saturating_sub(1))
@@ -87,83 +59,80 @@ pub(super) fn grid_for_height(
     }
 }
 
-pub(super) fn render(
-    frame: &mut Frame,
-    app: &App,
-    inventory: Option<&HardwareInventory>,
-    metrics: &SystemMetrics,
-    area: Rect,
-) {
-    if area.height == 0 {
+pub(super) fn card_height(metrics: &SystemMetrics, inner_width: u16, graphs: bool) -> CardHeight {
+    CardHeight::new(1, full_grid_rows(metrics, inner_width), graphs)
+}
+
+/// CPU: the model and package temperature in the title, a graph of total
+/// utilization, utilization and load, then the per-CPU grid, which is the
+/// first thing to go when the card is short.
+pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool) {
+    let metrics = app.system_metrics();
+    let title = CardTitle {
+        name: "CPU",
+        model: app
+            .hardware()
+            .and_then(|inventory| inventory.cpus.first())
+            .map_or("", |cpu| cpu.model.as_str()),
+        parts: package_temperatures(metrics).into_iter().collect(),
+        order: TitleOrder::ModelFirst,
+    };
+    let graph = CardGraph {
+        history: app.aggregate_cpu_history(),
+        scale: 100.0,
+        interval: app.cpu_history_interval(),
+    };
+    let grid_rows = full_grid_rows(metrics, area.width.saturating_sub(2));
+    let (rows, grid_limit) =
+        cards::render_graph_card(frame, area, &title, Some(graph), graphs, 1, grid_rows);
+    if rows.width == 0 || rows.height == 0 {
         return;
     }
-    let width = usize::from(area.width);
-    let height = usize::from(area.height);
-    let grid = grid_for_height(metrics, width, height);
-    let show_model = shows_model_line(metrics, height);
-    let grid_lines = cpu_grid_lines(&metrics.logical_cpus, width, grid);
-    let has_overflow = grid.visible < metrics.logical_cpus.len();
-    let content_height = (SUMMARY_LINES - usize::from(!show_model))
-        .saturating_add(grid_lines.len())
-        .saturating_add(usize::from(has_overflow));
-    let spacing = height.saturating_sub(content_height).min(2);
-    let mut lines = vec![section_heading("CPU")];
-
-    if show_model && lines.len() < height {
-        let model = match inventory {
-            None => "Discovering hardware…",
-            Some(inventory) => inventory
-                .cpus
-                .first()
-                .map(|cpu| cpu.model.as_str())
-                .unwrap_or("Unavailable / none detected"),
-        };
-        lines.push(line_with_temperatures(
-            model,
-            package_temperatures(metrics),
-            width,
-        ));
-    }
-    if spacing >= 1 && lines.len() < height {
-        lines.push(Line::from(""));
-    }
-    if lines.len() < height {
-        let percent = format_percent(metrics.cpu_percent);
-        let prefix = format!("Util  {percent:>4}  ");
-        lines.push(Line::from(layout::truncate(
-            &format!(
-                "{prefix}{}",
-                utilization_history(app, width.saturating_sub(prefix.chars().count()))
-            ),
-            width,
-        )));
-    }
-    if lines.len() < height {
-        let load = metrics.load_average.map_or_else(
-            || "Load  1m N/A  5m N/A  15m N/A".into(),
-            |load| {
-                format!(
-                    "Load  1m {:.2}  5m {:.2}  15m {:.2}",
-                    load.one, load.five, load.fifteen
-                )
-            },
-        );
-        lines.push(Line::from(layout::truncate(&load, width)));
-    }
-    if spacing >= 2 && lines.len() < height {
-        lines.push(Line::from(""));
-    }
-
-    let remaining = height.saturating_sub(lines.len());
-    lines.extend(grid_lines.into_iter().take(remaining).map(Line::from));
-    if has_overflow && lines.len() < height {
+    let width = usize::from(rows.width);
+    let mut lines = vec![Line::from(summary_line(metrics, width))];
+    let grid = grid_for_rows(metrics, width, usize::from(grid_limit));
+    lines.extend(
+        cpu_grid_lines(&metrics.logical_cpus, width, grid)
+            .into_iter()
+            .map(Line::from),
+    );
+    if grid_limit > 0 && grid.visible < metrics.logical_cpus.len() {
         lines.push(Line::from(format!(
             "… {} more logical CPUs",
             metrics.logical_cpus.len() - grid.visible
         )));
     }
+    frame.render_widget(Paragraph::new(lines), rows);
+}
 
-    frame.render_widget(Paragraph::new(lines), area);
+/// `Util  12%   Load  1m 0.52  5m 0.44  15m 0.29`, or a compact form.
+fn summary_line(metrics: &SystemMetrics, width: usize) -> String {
+    let percent = format_percent(metrics.cpu_percent);
+    let (full, compact) = metrics.load_average.map_or_else(
+        || {
+            (
+                format!("Util {percent:>4}   Load  N/A"),
+                format!("Util {percent}  Load N/A"),
+            )
+        },
+        |load| {
+            (
+                format!(
+                    "Util {percent:>4}   Load  1m {:.2}  5m {:.2}  15m {:.2}",
+                    load.one, load.five, load.fifteen
+                ),
+                format!(
+                    "Util {percent}  Load {:.2} {:.2} {:.2}",
+                    load.one, load.five, load.fifteen
+                ),
+            )
+        },
+    );
+    if full.chars().count() <= width {
+        full
+    } else {
+        layout::truncate(&compact, width)
+    }
 }
 
 /// `54°C` for one package, `P0 54°C  P1 56°C` for several; `None` without
@@ -250,15 +219,6 @@ fn columns_that_fit(width: usize, cell_width: usize, gap: usize) -> usize {
     width.saturating_add(gap) / cell_width.saturating_add(gap)
 }
 
-/// Rows the section actually draws at `height`: content plus at most two
-/// spacer lines. Rows beyond that are better used as gaps between sections.
-pub(super) fn fitted_height(metrics: &SystemMetrics, width: usize, height: u16) -> u16 {
-    let grid = grid_for_height(metrics, width, usize::from(height));
-    let header = SUMMARY_LINES - usize::from(!shows_model_line(metrics, usize::from(height)));
-    let content = header + grid.rows + usize::from(grid.visible < metrics.logical_cpus.len());
-    height.min(u16::try_from(content + 2).unwrap_or(u16::MAX))
-}
-
 fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
     if grid.columns == 0 || grid.visible == 0 {
         return Vec::new();
@@ -277,10 +237,12 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
         .map(|cpu| format!("CPU{}", cpu.id.index()).chars().count())
         .max()
         .unwrap_or(3);
-    cpus[..grid.visible]
-        .chunks(grid.columns)
+    // Column-major: CPU0, CPU1, … run down the first column.
+    let rows = grid.visible.div_ceil(grid.columns);
+    (0..rows)
         .map(|row| {
-            row.iter()
+            (0..grid.columns)
+                .filter_map(|column| cpus[..grid.visible].get(column * rows + row))
                 .map(|cpu| {
                     let text = if grid.dense {
                         dense_cpu_cell(cpu, cell_width, label_width)
@@ -322,44 +284,8 @@ fn dense_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize
     )
 }
 
-/// The CPU sparkline followed by the time span it covers, e.g. `▂▃▅  60s`.
-fn utilization_history(app: &App, width: usize) -> String {
-    history_line(
-        app.aggregate_cpu_history(),
-        app.cpu_history_interval(),
-        width,
-        100.0,
-    )
-}
-
-/// A metric's sparkline followed by the time span it covers, e.g. `▂▃▅  60s`;
-/// `scale` is the value drawn as a full block. The span counts only the
-/// samples that fit, so it shrinks on narrow panels.
-pub(super) fn history_line(
-    history: &MetricHistory,
-    interval: std::time::Duration,
-    width: usize,
-    scale: f64,
-) -> String {
-    const LABEL_GAP: &str = "  ";
-    const MIN_SPARKLINE_WIDTH: usize = 4;
-    let widest_label = format_window(interval.saturating_mul(history.capacity() as u32));
-    let sparkline_width = width
-        .saturating_sub(LABEL_GAP.len() + widest_label.chars().count())
-        .min(history.capacity());
-    if sparkline_width < MIN_SPARKLINE_WIDTH {
-        return history_sparkline(history.iter(), width, scale);
-    }
-    let sparkline = history_sparkline(history.iter(), sparkline_width, scale);
-    let window = format_window(interval.saturating_mul(sparkline_width as u32));
-    format!(
-        "{}{LABEL_GAP}{window}",
-        pad_cell(&sparkline, sparkline_width)
-    )
-}
-
 /// Compact span: `15s`, `90s`, `2m`, `2m30s`, `1h`; sub-second parts as `4.8s`.
-fn format_window(window: std::time::Duration) -> String {
+pub(super) fn format_window(window: std::time::Duration) -> String {
     let millis = window.as_millis();
     let seconds = window.as_secs();
     if !millis.is_multiple_of(1000) {
@@ -372,35 +298,6 @@ fn format_window(window: std::time::Duration) -> String {
         format!("{}m", seconds / 60)
     } else {
         format!("{}m{}s", seconds / 60, seconds % 60)
-    }
-}
-
-fn history_sparkline(
-    samples: impl ExactSizeIterator<Item = f64>,
-    width: usize,
-    scale: f64,
-) -> String {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if width == 0 {
-        return String::new();
-    }
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    let skip = samples.len().saturating_sub(width);
-    let result = samples
-        .skip(skip)
-        .map(|sample| {
-            let index = ((sample / scale).clamp(0.0, 1.0) * 7.0).round() as usize;
-            LEVELS[index.min(LEVELS.len() - 1)]
-        })
-        .collect::<String>();
-    if result.is_empty() {
-        "—".into()
-    } else {
-        result
     }
 }
 
@@ -498,96 +395,169 @@ mod tests {
         }
     }
 
-    fn util_line(interval_secs: u64, width: u16) -> String {
-        let app = App::default().with_collector_periods(
-            crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(
-                interval_secs,
-            )),
-        );
-        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+    fn cpus(count: u32) -> Vec<LogicalCpuMetrics> {
+        (0..count)
+            .map(|index| LogicalCpuMetrics {
+                id: crate::linux::LogicalCpuId::for_test(index),
+                utilization_percent: Some(48.0),
+            })
+            .collect()
+    }
+
+    fn app_with(cpu_count: u32, temperatures: Vec<crate::linux::Temperature>) -> App {
+        let mut app = App::default();
+        app.update(crate::action::Action::HardwareDiscovered(
+            crate::linux::HardwareInventory {
+                cpus: vec![crate::linux::CpuPackage {
+                    physical_id: Some(0),
+                    model: "AMD Ryzen 9 7950X 16-Core Processor".into(),
+                }],
+                ..crate::linux::HardwareInventory::default()
+            },
+        ));
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+            cpu_percent: Some(12.0),
+            logical_cpus: cpus(cpu_count),
+            load_average: Some(crate::linux::LoadAverage {
+                one: 0.52,
+                five: 0.44,
+                fifteen: 0.29,
+            }),
+            temperatures,
+            ..SystemMetrics::default()
+        }));
+        app
+    }
+
+    fn card_rows(app: &App, width: u16, height: u16, graphs: bool) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, None, app.system_metrics(), frame.area()))
+            .draw(|frame| render_card(frame, app, frame.area(), graphs))
             .unwrap();
         terminal
             .backend()
             .buffer()
             .content()
             .chunks(usize::from(width))
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .find(|row| row.starts_with("Util"))
-            .expect("utilization line")
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn package(id: u32, celsius: i16) -> crate::linux::Temperature {
+        crate::linux::Temperature {
+            key: TemperatureKey::CpuPackage(id),
+            celsius: Some(celsius),
+            max: None,
+            crit: None,
+        }
     }
 
     #[test]
-    fn history_label_states_the_window_it_covers() {
-        assert!(util_line(1, 100).trim_end().ends_with("  60s"));
-        assert!(util_line(5, 100).trim_end().ends_with("  5m"));
-        // Only 23 samples fit next to the label at 40 columns.
+    fn the_title_names_the_model_and_package_temperatures() {
+        let one = card_rows(&app_with(2, vec![package(0, 54)]), 60, 12, true);
         assert!(
-            util_line(1, 40).trim_end().ends_with("  23s"),
+            one[0].contains(" CPU  AMD Ryzen 9 7950X 16-Core Processor · 54°C "),
             "{}",
-            util_line(1, 40)
+            one[0]
+        );
+        let two = card_rows(
+            &app_with(2, vec![package(1, 56), package(0, 54)]),
+            70,
+            12,
+            true,
+        );
+        assert!(
+            two[0].contains("Processor · P0 54°C  P1 56°C "),
+            "{}",
+            two[0]
+        );
+        let narrow = card_rows(&app_with(2, vec![package(0, 54)]), 30, 12, true);
+        assert!(
+            narrow[0].contains(" CPU  Ryzen 9 7950X · 54°C "),
+            "{}",
+            narrow[0]
+        );
+        let none = card_rows(&app_with(2, Vec::new()), 60, 12, true);
+        assert!(
+            none[0].contains("Processor ─"),
+            "no sensor, no part: {}",
+            none[0]
         );
     }
 
     #[test]
-    fn history_label_is_dropped_when_there_is_no_room() {
-        let line = util_line(1, 16);
-        assert!(!line.contains('s'), "{line}");
+    fn the_bottom_border_states_the_time_span_of_the_graph() {
+        let app = app_with(2, Vec::new());
+        assert!(card_rows(&app, 100, 12, true)[11].contains(" 60s "));
+        // 38 samples fit in a 40-column card.
+        assert!(card_rows(&app, 40, 12, true)[11].contains(" 38s "));
     }
 
     #[test]
-    fn history_sparkline_keeps_the_newest_samples_that_fit() {
-        let samples = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 100.0];
+    fn the_grid_gives_way_before_the_graph_shrinks() {
+        let app = app_with(12, Vec::new());
+        let shown = |rows: &[String]| rows.iter().filter(|row| row.contains("CPU0")).count();
+        let summary_row =
+            |rows: &[String]| rows.iter().position(|row| row.contains("Util")).unwrap();
 
-        assert_eq!(history_sparkline(samples.into_iter(), 4, 100.0), "▅▆▇█");
-        assert_eq!(history_sparkline(samples.into_iter(), 0, 100.0), "");
-        assert_eq!(history_sparkline([].into_iter(), 4, 100.0), "—");
+        // Two columns of six rows at 60 columns: 2 borders + 4 graph + 1 + 6.
+        let full = card_rows(&app, 60, 13, true);
+        assert_eq!(summary_row(&full), 5, "four graph rows first");
+        assert!(
+            full[11].contains("CPU5") && full[11].contains("CPU11"),
+            "{full:#?}"
+        );
+
+        // Two grid rows: one row of dense cells and the overflow line.
+        let partial = card_rows(&app, 60, 9, true);
+        assert_eq!(summary_row(&partial), 5);
+        assert_eq!(shown(&partial), 1);
+        let labels = partial[6].matches("CPU").count();
+        assert!(
+            partial[7].contains(&format!("… {} more logical CPUs", 12 - labels)),
+            "{partial:#?}"
+        );
+
+        let no_grid = card_rows(&app, 60, 7, true);
+        assert_eq!(summary_row(&no_grid), 5);
+        assert_eq!(shown(&no_grid), 0);
+
+        let one_graph_row = card_rows(&app, 60, 4, true);
+        assert_eq!(summary_row(&one_graph_row), 2);
+
+        // Without a graph area the grid follows the summary directly.
+        let compact = card_rows(&app, 60, 9, false);
+        assert_eq!(summary_row(&compact), 1);
+        assert!(compact[2].contains("CPU0"));
     }
 
     #[test]
-    fn sparklines_scale_to_the_given_maximum() {
-        let rates = [0.0, 256.0, 512.0, 1024.0];
-        assert_eq!(history_sparkline(rates.into_iter(), 4, 1024.0), "▁▃▅█");
-        // Values above the scale are capped; a zero or invalid scale is safe.
-        assert_eq!(history_sparkline([2048.0].into_iter(), 1, 1024.0), "█");
-        assert_eq!(history_sparkline([0.0, 5.0].into_iter(), 2, 0.0), "▁█");
-        assert_eq!(history_sparkline([1.0].into_iter(), 1, f64::NAN), "█");
+    fn the_summary_line_has_a_compact_form() {
+        let app = app_with(1, Vec::new());
+        let metrics = app.system_metrics();
+        assert_eq!(
+            summary_line(metrics, 60),
+            "Util  12%   Load  1m 0.52  5m 0.44  15m 0.29"
+        );
+        assert_eq!(summary_line(metrics, 34), "Util 12%  Load 0.52 0.44 0.29");
+        assert_eq!(summary_line(metrics, 10).chars().count(), 10);
     }
 
     #[test]
-    fn cpu_summary_uses_available_vertical_breathing_room() {
-        let mut app = App::default();
-        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
-            cpu_percent: Some(12.0),
-            logical_cpus: vec![LogicalCpuMetrics {
-                id: crate::linux::LogicalCpuId::for_test(0),
-                utilization_percent: Some(8.0),
-            }],
-            ..SystemMetrics::default()
-        }));
-        let backend = TestBackend::new(60, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render(frame, &app, None, app.system_metrics(), frame.area());
-            })
-            .unwrap();
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(60)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-
-        assert!(rows[0].starts_with("CPU"));
-        assert!(rows[1].starts_with("Discovering hardware"));
-        assert!(rows[2].trim().is_empty());
-        assert!(rows[3].starts_with("Util"));
-        assert!(rows[4].starts_with("Load"));
-        assert!(rows[5].trim().is_empty());
-        assert!(rows[6].starts_with("CPU0"));
+    fn grid_cells_run_down_the_columns() {
+        let cpus = cpus(10);
+        let grid = cpu_grid_layout(10, 9, 120, 6);
+        assert_eq!(grid.columns, 4);
+        let lines = cpu_grid_lines(&cpus, 120, grid);
+        assert_eq!(lines.len(), 3);
+        let labels = |line: &str| {
+            line.split_whitespace()
+                .filter(|word| word.starts_with("CPU"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&lines[0]), ["CPU0", "CPU3", "CPU6", "CPU9"]);
+        assert_eq!(labels(&lines[2]), ["CPU2", "CPU5", "CPU8"]);
     }
 
     #[test]
@@ -605,7 +575,7 @@ mod tests {
         let lines = cpu_grid_lines(&cpus, 120, grid);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].matches(['█', '░']).count() >= 4 * MIN_USEFUL_CPU_GAUGE_WIDTH);
-        assert!(lines[2].contains("CPU10"));
+        assert!(lines[2].contains("CPU8"));
         assert!(lines[2].contains("CPU11"));
     }
 
@@ -666,86 +636,5 @@ mod tests {
         assert!(cells[0].contains("  1%"));
         assert!(cells[1].contains(" 10%"));
         assert!(cells[2].contains("100%"));
-    }
-
-    fn model_line(temperatures: Vec<crate::linux::Temperature>, width: u16) -> String {
-        let app = App::default();
-        let inventory = crate::linux::HardwareInventory {
-            cpus: vec![crate::linux::CpuPackage {
-                physical_id: Some(0),
-                model: "AMD Ryzen 9 7950X 16-Core Processor".into(),
-            }],
-            ..crate::linux::HardwareInventory::default()
-        };
-        let metrics = SystemMetrics {
-            temperatures,
-            ..SystemMetrics::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
-        terminal
-            .draw(|frame| render(frame, &app, Some(&inventory), &metrics, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..width)
-            .map(|x| buffer[(x, 1)].symbol())
-            .collect::<String>()
-    }
-
-    fn package(id: u32, celsius: i16) -> crate::linux::Temperature {
-        crate::linux::Temperature {
-            key: TemperatureKey::CpuPackage(id),
-            celsius: Some(celsius),
-            max: None,
-            crit: None,
-        }
-    }
-
-    #[test]
-    fn cpu_model_line_shows_package_temperatures() {
-        assert_eq!(
-            model_line(vec![package(0, 54)], 60).trim_end(),
-            "AMD Ryzen 9 7950X 16-Core Processor  54°C"
-        );
-        assert_eq!(
-            model_line(vec![package(1, 56), package(0, 54)], 60).trim_end(),
-            "AMD Ryzen 9 7950X 16-Core Processor  P0 54°C  P1 56°C"
-        );
-        assert_eq!(
-            model_line(vec![package(0, 54)], 24).trim_end(),
-            "AMD Ryzen 9 7950X…  54°C",
-            "the model gives way first"
-        );
-        assert_eq!(
-            model_line(Vec::new(), 60).trim_end(),
-            "AMD Ryzen 9 7950X 16-Core Processor",
-            "no CPU sensor, nothing shown"
-        );
-    }
-
-    #[test]
-    fn cpu_model_shows_unavailable_when_inventory_has_no_cpus() {
-        let app = App::default();
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let inventory = crate::linux::HardwareInventory::default();
-        let metrics = SystemMetrics::default();
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    &app,
-                    Some(&inventory),
-                    &metrics,
-                    Rect::new(0, 0, 80, 20),
-                );
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let content = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(content.contains("Unavailable / none detected"));
     }
 }
