@@ -98,11 +98,20 @@ class Tui:
         return None
 
     def quit(self):
-        """Quits with `q`; returns the exit code (None if tuxctl did not exit)."""
-        if self.alive():
-            os.write(self.fd, b"q")
-            return self.wait_exit()
-        return None
+        """Quits with `q`; returns the exit code (None if tuxctl did not exit).
+
+        Since v0.3.3 the first `q` opens the exit menu and a second one quits;
+        older versions quit on the first, so the second is only sent while
+        tuxctl is still running.
+        """
+        if not self.alive():
+            return None
+        os.write(self.fd, b"q")
+        code = self.wait_exit(timeout=0.5)
+        if code is not None:
+            return code
+        os.write(self.fd, b"q")
+        return self.wait_exit()
 
     def cpu_ticks(self):
         fields = open(f"/proc/{self.pid}/stat").read().rsplit(")", 1)[1].split()
