@@ -120,7 +120,7 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
-    /// `--nvidia-temperature`, shown in Help.
+    /// Whether NVML may be loaded for NVIDIA GPUs, shown in Help.
     nvidia_temperature: bool,
     aggregate_cpu_history: MetricHistory,
     memory_history: MetricHistory,

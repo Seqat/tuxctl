@@ -27,15 +27,15 @@ before quitting. There were no 0.3.1 or 0.3.2 releases.
   the driver. Sensors are read at most every 2 seconds, whatever the
   sampling interval, and rediscovered (at most every 30 s) when one stops
   working.
-- `--nvidia-temperature` shows temperatures of NVIDIA GPUs on the
-  proprietary driver through NVML, loaded at run time from the driver's
-  `libnvidia-ml.so.1`. It is off by default because NVML adds about 20 MiB
-  of private memory (RSS +24.7 MiB) and a thread. NVML stays initialized
-  only when the GPU cannot runtime-suspend; with RTD3 it is initialized for
-  each reading and only while the GPU is awake. The static release
-  binaries cannot load NVML and refuse the flag with a message; use a
-  glibc build such as one built with `cargo install`. Help shows whether
-  it is on.
+- Temperatures of NVIDIA GPUs on the proprietary driver come from NVML,
+  loaded at run time from the driver's `libnvidia-ml.so.1` when such a GPU
+  is found. NVML adds about 20 MiB of private memory (RSS +24.7 MiB) and a
+  thread; `--no-nvidia-temperature` leaves it unloaded. NVML stays
+  initialized only when the GPU cannot runtime-suspend; with RTD3 it is
+  initialized for each reading and only while the GPU is awake. The static
+  release binaries cannot load NVML and show no temperature for these
+  GPUs; use a glibc build such as one built with `cargo install`. Help
+  shows whether NVML is used.
 - The screen behind a popup (main menu, About, Help, details, signal
   confirmation) is greyed out so the popup stands out.
 

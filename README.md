@@ -64,14 +64,14 @@ A temperature appears next to a component only when the kernel provides a sensor
 | AMD GPU | `amdgpu` (the `edge` sensor) or `radeon` hwmon |
 | Intel GPU | `i915` / `xe` hwmon, when the GPU has its own sensor; integrated GPUs usually do not |
 | NVIDIA GPU, `nouveau` | `nouveau` hwmon |
-| NVIDIA GPU, proprietary driver | NVML (`libnvidia-ml.so.1`, installed with the driver), only with `--nvidia-temperature` |
+| NVIDIA GPU, proprietary driver | NVML (`libnvidia-ml.so.1`, installed with the driver); not in the static release binaries |
 | NVMe | `nvme` hwmon (`Composite`) |
 | SATA / SAS | `drivetemp` hwmon, only when that module is loaded (`modprobe drivetemp`) |
 | Network adapter | A hwmon sensor on the adapter or on its PHY |
 
 RAM (SPD) sensors are not shown.
 
-**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML. It is off by default because NVML is expensive in memory: on the reference machine below, `--nvidia-temperature` adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. The static release binaries cannot load NVML and refuse the flag with a message; use a glibc build, such as one built with `cargo install`.
+**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML, which `tuxctl` loads only when it finds a GPU using the `nvidia` driver. NVML is expensive in memory: on the reference machine below it adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. `--no-nvidia-temperature` leaves NVML unloaded. The static release binaries cannot load NVML at all, so they show no temperature for these GPUs; use a glibc build, such as one built with `cargo install`.
 
 **Runtime power management.** `tuxctl` never wakes a sleeping GPU: it reads `power/runtime_status` first and shows `–` while the GPU is suspended. NVML stays initialized only when the GPU cannot runtime-suspend anyway (`power/control` is `on`, or the driver reports `Runtime D3 status` as not supported or disabled). With RTD3 enabled, as on many hybrid laptops, NVML is initialized for each reading and shut down right after, and only while every NVIDIA GPU is awake, so `tuxctl` never keeps the GPU powered.
 
@@ -288,13 +288,13 @@ cargo build --release --locked
 ### Command-Line Options
 
 ```text
-tuxctl [--interval <DURATION>] [--nvidia-temperature]
+tuxctl [--interval <DURATION>] [--no-nvidia-temperature]
 ```
 
 | Option | Description |
 | --- | --- |
 | `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. `+` and `-` change the interval while `tuxctl` runs. |
-| `--nvidia-temperature` | Show temperatures of NVIDIA GPUs on the proprietary driver through NVML. Off by default because NVML adds about 20 MiB of private memory; needs a glibc build (see [Temperatures](#temperatures)). The Help overlay shows whether it is on. |
+| `--no-nvidia-temperature` | Do not load NVML for NVIDIA GPUs on the proprietary driver. NVML shows their temperature but adds about 20 MiB of private memory (see [Temperatures](#temperatures)); static builds never load it. The Help overlay shows whether it is on. |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print the version. |
 
@@ -467,7 +467,7 @@ Within supported dimensions, layouts adapt to available space. On narrow termina
 
 - **Linux only:** `tuxctl` relies directly on Linux `/proc`, `/sys`, systemd utilities, and Linux-specific process signaling.
 - **systemd dependency:** Services and Logs require access to `systemctl` and `journalctl`.
-- **NVIDIA temperatures:** GPUs on the proprietary driver need `--nvidia-temperature` and a glibc build.
+- **NVIDIA temperatures:** GPUs on the proprietary driver need a glibc build; the static release binaries cannot load NVML.
 - **Hardware hotplug:** Hardware inventory is discovered at startup. Newly attached hardware is not dynamically re-enumerated until `tuxctl` is restarted.
 - **Process permissions:** Signaling another user's or privileged processes is subject to normal Linux permissions.
 - **pidfd availability:** Process signaling requires safe pidfd support. `tuxctl` intentionally does not fall back to PID-only signaling if that safety guarantee is unavailable.

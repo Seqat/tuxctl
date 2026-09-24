@@ -822,14 +822,14 @@ fn help_lines(nvidia_temperature: bool) -> Vec<Line<'static>> {
     ]
 }
 
-/// Whether NVIDIA temperatures are on, and how to turn them on.
+/// Whether NVIDIA temperatures are on, and how to change that.
 fn nvidia_help(enabled: bool) -> &'static str {
     if enabled {
-        "  NVIDIA GPUs         on (NVML, about 20 MiB of memory)"
+        "  NVIDIA GPUs         NVML; off: --no-nvidia-temperature"
     } else if crate::cli::NVML_AVAILABLE {
-        "  NVIDIA GPUs         off; start with --nvidia-temperature"
+        "  NVIDIA GPUs         off (--no-nvidia-temperature)"
     } else {
-        "  NVIDIA GPUs         off; --nvidia-temperature needs glibc"
+        "  NVIDIA GPUs         off; NVML needs a glibc build"
     }
 }
 
@@ -2449,7 +2449,7 @@ mod tests {
             "v kernel threads",
             "Ctrl+C",
             "Space",
-            "--nvidia-temperature",
+            "NVIDIA GPUs",
         ] {
             assert!(all.contains(binding), "Help does not mention {binding:?}");
         }
