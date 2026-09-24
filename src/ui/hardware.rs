@@ -663,6 +663,15 @@ mod tests {
             "{compact:#?}"
         );
         assert!(compact[1].contains("RAM  75%"));
+        // " Memory " is 8 columns: the graph area runs from column 9 to 57
+        // and is blank where it has no samples yet; a blank cell keeps it off
+        // the corner, and the time span matches its width.
+        assert_eq!(
+            compact[0],
+            format!("┌ Memory {}▂▄▆ ┐", " ".repeat(46)),
+            "{compact:#?}"
+        );
+        assert!(compact[2].contains(" 49s "), "{compact:#?}");
     }
 
     fn gpu(model: &str, kind: Option<GpuKind>) -> GpuDevice {

@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Clear},
     Frame,
 };
 
@@ -227,9 +227,17 @@ pub(super) fn render_graph_card(
     let inner_height = area.height.saturating_sub(2);
     let (graph_rows, optional_rows) =
         split_rows(inner_height, fixed, optional, graphs && graph.is_some());
-    // The time span of the columns that fit: the graph is as wide as the card.
-    let footer = graph.as_ref().map(|graph| {
-        let samples = usize::from(inner_width).min(graph.history.capacity());
+    let title_graph = (graph.is_some() && !graphs)
+        .then(|| title_graph_area(area, title))
+        .flatten();
+    let graph_width = if graph_rows > 0 {
+        inner_width
+    } else {
+        title_graph.map_or(0, |rect| rect.width)
+    };
+    // The time span of the columns the graph actually has.
+    let footer = graph.as_ref().filter(|_| graph_width > 0).map(|graph| {
+        let samples = usize::from(graph_width).min(graph.history.capacity());
         format_window(graph.interval.saturating_mul(samples as u32))
     });
     let inner = render_card(frame, area, title, footer.as_deref());
@@ -239,8 +247,12 @@ pub(super) fn render_graph_card(
                 Graph::new(graph.history, graph.scale),
                 Rect::new(inner.x, inner.y, inner.width, graph_rows.min(inner.height)),
             );
-        } else if !graphs {
-            render_title_graph(frame, area, title, graph.history, graph.scale);
+        } else if let Some(rect) = title_graph {
+            // The graph's cells and one before the corner are blank, so the
+            // graph never reads as part of the border (the title already
+            // ends with a space).
+            frame.render_widget(Clear, Rect::new(rect.x, rect.y, rect.width + 1, 1));
+            frame.render_widget(Graph::new(graph.history, graph.scale), rect);
         }
     }
     let rows = Rect::new(
@@ -277,22 +289,15 @@ pub(super) fn render_card(
     inner
 }
 
-/// A one-row graph drawn into the top border after the title, for compact
-/// cards; left out when too little of the border is free.
-pub(super) fn render_title_graph(
-    frame: &mut Frame,
-    area: Rect,
-    title: &CardTitle,
-    history: &MetricHistory,
-    scale: f64,
-) {
+/// Where a compact card draws its one-row graph: in the top border, right
+/// after the title and up to a blank cell before the corner. `None` when too
+/// little of the border is free.
+fn title_graph_area(area: Rect, title: &CardTitle) -> Option<Rect> {
     let title_width = title_line(title, usize::from(area.width.saturating_sub(2))).width() as u16;
-    // Corner, title, a gap, the graph, a gap, corner.
-    let x = area.x.saturating_add(1 + title_width + 1);
+    // Corner, title (ending with a space), the graph, a blank cell, corner.
+    let x = area.x.saturating_add(1 + title_width);
     let width = area.right().saturating_sub(2).saturating_sub(x);
-    if width >= MIN_INLINE_GRAPH_WIDTH && area.height > 0 {
-        frame.render_widget(Graph::new(history, scale), Rect::new(x, area.y, width, 1));
-    }
+    (width >= MIN_INLINE_GRAPH_WIDTH && area.height > 0).then(|| Rect::new(x, area.y, width, 1))
 }
 
 #[cfg(test)]
