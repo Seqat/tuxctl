@@ -23,7 +23,7 @@ tar xzf tuxctl-$(uname -m)-unknown-linux-musl.tar.gz
 ./tuxctl-$(uname -m)-unknown-linux-musl/tuxctl
 ```
 
-Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked`. See [Installation](#installation) for checksums and other options.
+Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.3 --locked`. See [Installation](#installation) for checksums and other options.
 
 ## Features
 
@@ -259,7 +259,7 @@ The static binaries cannot load NVIDIA's NVML library, so they cannot show tempe
 Install a tagged version directly with Cargo:
 
 ```sh
-cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked
+cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.3 --locked
 ```
 
 Or from a clone of the repository:

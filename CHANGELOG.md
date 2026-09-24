@@ -7,8 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-24
+
+Component temperatures on the Overview, a greyed-out background behind
+popups, and safer keys: **`SIGTERM` now needs `Shift+T`**, and `q` asks
+before quitting. There were no 0.3.1 or 0.3.2 releases.
+
 ### Added
 
+- Component temperatures on the Overview: CPU packages on the CPU model
+  line, GPUs and network adapters at the end of their rows, and a column
+  before the read/write rates on storage rows. Sources are the kernel's
+  hwmon drivers (`coretemp`, `k10temp`, `zenpower`, `amdgpu`, `radeon`,
+  `nouveau`, `i915`, `xe`, `nvme`, `drivetemp`, network adapters and their
+  PHYs), plus CPU thermal zones on systems without a CPU hwmon driver.
+  Components without a sensor show nothing; `–` marks a known sensor
+  without a value, such as a runtime-suspended GPU, which is never woken to
+  be read. A value is highlighted only when it reaches a limit reported by
+  the driver. Sensors are read at most every 2 seconds, whatever the
+  sampling interval, and rediscovered (at most every 30 s) when one stops
+  working.
+- `--nvidia-temperature` shows temperatures of NVIDIA GPUs on the
+  proprietary driver through NVML, loaded at run time from the driver's
+  `libnvidia-ml.so.1`. It is off by default because NVML adds about 20 MiB
+  of private memory (RSS +24.7 MiB) and a thread. NVML stays initialized
+  only when the GPU cannot runtime-suspend; with RTD3 it is initialized for
+  each reading and only while the GPU is awake. The static release
+  binaries cannot load NVML and refuse the flag with a message; use a
+  glibc build such as one built with `cargo install`. Help shows whether
+  it is on.
 - The screen behind a popup (main menu, About, Help, details, signal
   confirmation) is greyed out so the popup stands out.
 
@@ -21,9 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `q` no longer quits straight away: it opens the main menu with Exit
   selected, and `Enter` or `q` again quits (`Esc` cancels). `Ctrl+C` still
   quits immediately. A pending signal confirmation is cancelled.
+
+### Fixed
+
+- Overview storage rows no longer cut a device label short (for example to
+  `NVMe…`) at the one width where only the label would have fit.
+
+### Internal
+
 - Key bindings live in one table per input mode (`src/keymap.rs`), and UI
   colors are named by meaning in one place (`src/ui/theme.rs`), as groundwork
   for configurable keys and themes.
+- The hardware inventory records the canonical sysfs path of GPUs, disks and
+  network adapters; temperatures are matched to components by that path.
+- Temperature discovery is tested against fake sysfs trees, and NVML sits
+  behind a small trait so the sampler's decisions are tested without the
+  library or the hardware.
 
 ## [0.3.0] - 2026-09-23
 
@@ -257,7 +297,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Seqat/tuxctl/compare/v0.3.0...v0.3.3
 [0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
 [0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5
