@@ -204,6 +204,8 @@ struct Sensor {
     source: Source,
     max: Option<i16>,
     crit: Option<i16>,
+    /// Where the value comes from, for `tuxctl --check`: `k10temp Tctl`.
+    origin: String,
 }
 
 pub(super) struct TemperatureSampler<N> {
@@ -276,6 +278,23 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
     /// Telemetry of each GPU, as of the last [`Self::sample`].
     pub(super) fn gpus(&self) -> &[GpuTelemetry] {
         &self.gpus
+    }
+
+    /// Where each temperature comes from, such as `k10temp Tctl` or `NVML`.
+    pub(super) fn origin(&self, key: &TemperatureKey) -> Option<&str> {
+        self.sensors
+            .iter()
+            .find(|sensor| sensor.key == *key)
+            .map(|sensor| sensor.origin.as_str())
+    }
+
+    /// Where CPU package power is read from, if anywhere.
+    pub(super) fn cpu_power_origin(&self) -> Option<&'static str> {
+        match self.cpu_power {
+            CpuPowerSource::None => None,
+            CpuPowerSource::Hwmon(_) => Some("zenpower"),
+            CpuPowerSource::Rapl(_) => Some("RAPL"),
+        }
     }
 
     /// CPU package power, where this user can read it.
@@ -589,6 +608,15 @@ impl Hwmon {
             source: Source::Files(vec![temp.input.clone()]),
             max: temp.max,
             crit: temp.crit,
+            origin: self.origin(temp),
+        }
+    }
+
+    /// `k10temp Tctl`, or `nvme temp1` for an unlabeled input.
+    fn origin(&self, temp: &HwmonTemp) -> String {
+        match &temp.label {
+            Some(label) => format!("{} {label}", self.name),
+            None => format!("{} temp{}", self.name, temp.index),
         }
     }
 }
@@ -632,6 +660,7 @@ fn discover(roots: &SysfsRoots, nvidia: bool) -> Discovery {
                 },
                 max: None,
                 crit: None,
+                origin: "NVML".into(),
             });
         }
     }
@@ -683,6 +712,11 @@ fn discover(roots: &SysfsRoots, nvidia: bool) -> Discovery {
 /// RAPL package domains (`intel-rapl:N` named `package-*`, also on AMD)
 /// whose energy counter this user can read. Their subdomains (`intel-rapl:N:M`)
 /// are parts of the package and not added.
+/// Whether the machine has RAPL domains at all, readable or not.
+pub(super) fn rapl_present(root: &Path) -> bool {
+    !read_sorted_directories(root, |name| name.starts_with("intel-rapl:")).is_empty()
+}
+
 fn readable_rapl_packages(root: &Path) -> Vec<(PathBuf, u64)> {
     read_sorted_directories(root, |name| {
         name.strip_prefix("intel-rapl:")
@@ -809,7 +843,7 @@ fn cpu_sensors(hwmons: &[Hwmon]) -> Vec<Sensor> {
                         .ok()
                 })
                 .unwrap_or(0);
-            sensors.extend(core_maximum(hwmon.temps.iter(), package));
+            sensors.extend(core_maximum(&hwmon.name, hwmon.temps.iter(), package));
         } else {
             for (id, temp) in packages {
                 sensors.push(hwmon.sensor(TemperatureKey::CpuPackage(id), temp));
@@ -819,6 +853,7 @@ fn cpu_sensors(hwmons: &[Hwmon]) -> Vec<Sensor> {
 
     // VIA CPUs are single-socket: all their core sensors form package 0.
     sensors.extend(core_maximum(
+        "via_cputemp",
         hwmons
             .iter()
             .filter(|hwmon| hwmon.name == "via_cputemp")
@@ -859,7 +894,11 @@ fn cpu_sensors(hwmons: &[Hwmon]) -> Vec<Sensor> {
 }
 
 /// One sensor reporting the hottest of `temps` for `package`.
-fn core_maximum<'a>(temps: impl Iterator<Item = &'a HwmonTemp>, package: u32) -> Option<Sensor> {
+fn core_maximum<'a>(
+    driver: &str,
+    temps: impl Iterator<Item = &'a HwmonTemp>,
+    package: u32,
+) -> Option<Sensor> {
     let cores: Vec<&HwmonTemp> = temps
         .filter(|temp| {
             temp.label
@@ -875,6 +914,7 @@ fn core_maximum<'a>(temps: impl Iterator<Item = &'a HwmonTemp>, package: u32) ->
         source: Source::Files(cores.iter().map(|temp| temp.input.clone()).collect()),
         max: cores.iter().filter_map(|temp| temp.max).min(),
         crit: cores.iter().filter_map(|temp| temp.crit).min(),
+        origin: format!("{driver} (hottest core)"),
     })
 }
 
@@ -896,6 +936,7 @@ fn thermal_zone_sensor(root: &Path) -> Option<Sensor> {
         source: Source::Files(files),
         max: None,
         crit: None,
+        origin: "thermal zones".into(),
     })
 }
 
@@ -961,6 +1002,7 @@ fn device_sensors(
                 },
                 max: temp.max,
                 crit: temp.crit,
+                origin: hwmon.origin(temp),
             })
             .into_iter()
             .collect();

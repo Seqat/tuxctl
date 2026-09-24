@@ -1,6 +1,7 @@
 mod about;
 mod action;
 mod app;
+mod check;
 mod cli;
 mod event;
 mod keymap;
@@ -38,6 +39,13 @@ fn main() -> io::Result<()> {
             interval,
             nvidia_temperature,
         }) => (interval, nvidia_temperature),
+        Ok(cli::Command::Check { nvidia_temperature }) => {
+            print!(
+                "{}",
+                check::report_text(&linux::sensor_report(nvidia_temperature))
+            );
+            return Ok(());
+        }
         Ok(cli::Command::Help) => {
             print!("{}", cli::help_text());
             return Ok(());

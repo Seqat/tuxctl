@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub const USAGE: &str =
-    "Usage: tuxctl [--interval <DURATION>] [--no-nvidia-temperature]  (see --help)";
+    "Usage: tuxctl [--interval <DURATION>] [--no-nvidia-temperature] [--check]  (see --help)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -19,6 +19,11 @@ pub enum Command {
         /// NVIDIA GPU is read).
         nvidia_temperature: bool,
     },
+    /// Print which sensors are found, and what would enable the missing
+    /// ones, then exit.
+    Check {
+        nvidia_temperature: bool,
+    },
     Help,
     Version,
 }
@@ -27,6 +32,7 @@ pub enum Command {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut interval = DEFAULT_SAMPLING_INTERVAL;
     let mut nvidia_temperature = NVML_AVAILABLE;
+    let mut check = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -39,11 +45,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 interval = parse_interval(&value)?;
             }
             "--no-nvidia-temperature" => nvidia_temperature = false,
+            "--check" => check = true,
             _ => match arg.strip_prefix("--interval=") {
                 Some(value) => interval = parse_interval(value)?,
                 None => return Err(format!("unexpected argument '{arg}'")),
             },
         }
+    }
+    if check {
+        return Ok(Command::Check { nvidia_temperature });
     }
     Ok(Command::Run {
         interval,
@@ -94,6 +104,8 @@ Options:
                              Do not load NVML for NVIDIA GPUs on the proprietary driver.
                              It shows their temperature and adds about 20 MiB of private
                              memory. Static (musl) builds never load it.
+      --check                Print which sensors tuxctl finds on this machine and what
+                             would enable the missing ones (drivetemp, CPU power, NVML).
   -h, --help                 Print help
   -V, --version              Print version
 
@@ -172,6 +184,24 @@ mod tests {
         for arg in ["--nvidia-temperature", "--no-nvidia-temperature=1"] {
             assert!(parse_args(&[arg]).is_err(), "{arg}");
         }
+    }
+
+    #[test]
+    fn check_reports_instead_of_running_and_keeps_the_nvml_choice() {
+        assert_eq!(
+            parse_args(&["--check"]),
+            Ok(Command::Check {
+                nvidia_temperature: NVML_AVAILABLE
+            })
+        );
+        assert_eq!(
+            parse_args(&["--no-nvidia-temperature", "--check"]),
+            Ok(Command::Check {
+                nvidia_temperature: false
+            })
+        );
+        assert_eq!(parse_args(&["--check", "--version"]), Ok(Command::Version));
+        assert!(help_text().contains("--check"));
     }
 
     #[test]

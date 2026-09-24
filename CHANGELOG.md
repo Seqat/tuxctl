@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filesystem instead of only `/`: one line per block device (btrfs
   subvolumes appear once), at most 8, leaving out network, FUSE and loop
   mounts.
+- `tuxctl --check` prints which sensors `tuxctl` finds (value and origin,
+  such as `k10temp Tctl` or `NVML`) and what would enable the missing ones:
+  `drivetemp` for SATA disks, readable RAPL counters for CPU power, or a
+  glibc build for NVIDIA GPUs. The README gathers these steps under
+  "Optional setup".
 - The CPU card shows package power where this user can read it: from the
   out-of-tree `zenpower`, or from RAPL energy counters, which are root-only
   unless an administrator makes them readable (the README shows a narrow

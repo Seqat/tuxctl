@@ -1,3 +1,4 @@
+mod check;
 mod control;
 mod gpu;
 mod hardware;
@@ -14,6 +15,7 @@ mod service;
 mod system;
 mod temperature;
 
+pub use check::{sensor_report, CpuPowerAccess, NvidiaAccess, SensorReport};
 pub use gpu::GpuTelemetry;
 #[cfg(test)]
 pub(crate) use hardware::{CpuPackage, NetworkDevice};

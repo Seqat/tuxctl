@@ -22,9 +22,9 @@ use super::{
 /// NVIDIA temperatures come from NVML where it can be loaded; static musl
 /// builds know NVIDIA GPUs but cannot read them.
 #[cfg(not(target_env = "musl"))]
-type Nvidia = super::nvml::NvmlReader;
+pub(super) type Nvidia = super::nvml::NvmlReader;
 #[cfg(target_env = "musl")]
-type Nvidia = super::temperature::NoNvidia;
+pub(super) type Nvidia = super::temperature::NoNvidia;
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";

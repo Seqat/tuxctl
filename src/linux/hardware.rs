@@ -115,7 +115,7 @@ impl HardwareCollector {
     }
 }
 
-fn discover() -> HardwareInventory {
+pub(super) fn discover() -> HardwareInventory {
     HardwareInventory {
         cpus: fs::read_to_string(CPUINFO)
             .ok()
