@@ -64,6 +64,9 @@ before quitting. There were no 0.3.1 or 0.3.2 releases.
 - Temperature discovery is tested against fake sysfs trees, and NVML sits
   behind a small trait so the sampler's decisions are tested without the
   library or the hardware.
+- `measure.py` and `rss.py` quit through the new exit menu (`q` `q`), and
+  the startup RSS limit of `measure.py --check` is 35 MiB, since `tuxctl`
+  uses about 30 MiB when it loads NVML.
 
 ## [0.3.0] - 2026-09-23
 

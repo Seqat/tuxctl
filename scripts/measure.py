@@ -44,7 +44,8 @@ IDLE_GUARDS = ["overview idle", "processes idle"]
 INTERVALS = {"250ms": 0.25, "500ms": 0.5, "1s": 1.0, "2s": 2.0, "5s": 5.0,
              "10s": 10.0, "30s": 30.0, "60s": 60.0}
 # Catastrophe limits only; absolute numbers are compared locally.
-MAX_STARTUP_RSS_KIB = 16 * 1024
+# About 30 MiB with NVML loaded for an NVIDIA GPU (about 5 MiB without).
+MAX_STARTUP_RSS_KIB = 35 * 1024
 MAX_STORM_LATENCY_MS = 1000
 
 
