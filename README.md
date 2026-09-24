@@ -30,18 +30,18 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 ### Overview
 
 - A system summary in the top border: hostname, kernel, uptime, and process, running-process, and zombie counts (zombies are highlighted when there are any). It shortens on narrow terminals: the kernel goes first, then the counts are abbreviated (`397p · 2r · 0z`), then the uptime goes.
-- Cards for **CPU**, **GPU**, **Memory**, **Network**, **Storage**, and **Pinned** processes. Each card names its component in its title with the model and temperature (`CPU  Ryzen 5 7500F · 45°C`); the model is shortened first when the title does not fit.
-  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid.
-  - **GPU:** the discrete GPU (or the only one), its kind and VRAM, and a row per other GPU.
-  - **Memory:** a graph of RAM use and the RAM gauge, plus RAM modules via EDAC sysfs when available.
-  - **Network:** the main physical interface with its state and temperature, a traffic graph with its peak, and a row per other interface.
-  - **Storage:** root filesystem usage, and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
+- Cards for **CPU**, **GPU**, **Memory**, **Network**, **Storage**, and **Pinned** processes. Each card names its component in its title with the model, temperature and power where known (`GPU  RTX 5070 Ti · 43°C · 28W`); the model is shortened first when the title does not fit.
+  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid. Package power appears only where a driver reports it without root: the out-of-tree `zenpower` driver (AMD Zen 1–3). Intel and AMD RAPL energy counters are readable by root only, so `tuxctl` does not show them.
+  - **GPU:** the discrete GPU (or the only one) with a utilization graph, utilization, VRAM use and fan speed where the driver reports them, and a row per other GPU. NVIDIA GPUs of the proprietary driver report through NVML; `amdgpu` through sysfs (`gpu_busy_percent`, `mem_info_vram_*`, hwmon power and fan); `nouveau` reports power and fan; Intel GPUs report none of these. A runtime-suspended GPU is never woken to be read.
+  - **Memory:** a graph of RAM use, the RAM and swap gauges, plus RAM modules via EDAC sysfs when available.
+  - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak, and a row per other interface.
+  - **Storage:** usage of every local filesystem (one line per device, so btrfs subvolumes appear once; network, FUSE and loop mounts are left out), and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
   - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU and memory.
-  - Graphs cover the last 60 samples; the bottom border of each card states the time span they cover.
+  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes.
 
 #### Colors
 
-Utilization values (total and per-CPU utilization, RAM) and the columns of the CPU and memory graphs take a color band: light blue below 10 %, green below 65 %, yellow below 80 %, orange below 95 %, and red from 95 %. The network graph shows throughput, not a percentage, and stays neutral. Temperatures use the same bands as a share of their critical limit.
+Utilization values (total and per-CPU utilization, RAM, GPU utilization and VRAM) and the columns of the CPU, memory and GPU graphs take a color band: light blue below 10 %, green below 65 %, yellow below 80 %, orange below 95 %, and red from 95 %. The network graph shows throughput, not a percentage, and stays neutral. Temperatures use the same bands as a share of their critical limit.
 
 `tuxctl` reads `COLORTERM` and `TERM` once at startup: `truecolor`/`24bit` get the full palette, `*256color` terminals the nearest 256-color entries, and anything else the 16 basic colors (where orange becomes bright red).
 - Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
@@ -51,7 +51,7 @@ Utilization values (total and per-CPU utilization, RAM) and the columns of the C
 
 A temperature appears next to a component only when the kernel provides a sensor for it; components without one show nothing. `–` means the sensor exists but has no value right now, for example while a GPU is runtime-suspended. Sensors are read at most every 2 seconds, whatever the sampling interval.
 
-The number takes the color band of its share of the component's critical temperature (see [Colors](#colors)): the limit the driver reports (`temp*_crit`, else `temp*_max`), or, when it reports none, an assumed limit per component type. The value itself is always shown, so the color never carries meaning alone.
+The number takes the color band of its share of the component's critical temperature (see [Colors](#colors)): the limit the driver reports (`temp*_crit`, else `temp*_max`; for NVIDIA GPUs the slowdown temperature NVML reports), or, when it reports none, an assumed limit per component type. The value itself is always shown, so the color never carries meaning alone.
 
 | Component | Assumed critical temperature |
 | --- | --- |
@@ -76,7 +76,7 @@ The number takes the color band of its share of the component's critical tempera
 
 RAM (SPD) sensors are not shown.
 
-**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML, which `tuxctl` loads only when it finds a GPU using the `nvidia` driver. NVML is expensive in memory: on the reference machine below it adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. `--no-nvidia-temperature` leaves NVML unloaded. The static release binaries cannot load NVML at all, so they show no temperature for these GPUs; use a glibc build, such as one built with `cargo install`.
+**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML, which `tuxctl` loads only when it finds a GPU using the `nvidia` driver. NVML is expensive in memory: on the reference machine below it adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. Reading an NVIDIA GPU through NVML also costs CPU time in the driver: utilization and power are read on every sample and temperature, VRAM and fan every 2 seconds, which adds about 0.35 % of one core at the default 1 s interval and about 0.65 % at 250 ms on the reference machine (the fan query alone takes about 4 ms). `--no-nvidia-temperature` leaves NVML unloaded. The static release binaries cannot load NVML at all, so they show no temperature for these GPUs; use a glibc build, such as one built with `cargo install`.
 
 **Runtime power management.** `tuxctl` never wakes a sleeping GPU: it reads `power/runtime_status` first and shows `–` while the GPU is suspended. NVML stays initialized only when the GPU cannot runtime-suspend anyway (`power/control` is `on`, or the driver reports `Runtime D3 status` as not supported or disabled). With RTD3 enabled, as on many hybrid laptops, NVML is initialized for each reading and shut down right after, and only while every NVIDIA GPU is awake, so `tuxctl` never keeps the GPU powered.
 

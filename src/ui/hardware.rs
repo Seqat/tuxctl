@@ -11,8 +11,8 @@ use ratatui::{
 use crate::{
     app::App,
     linux::{
-        GpuDevice, GpuKind, HardwareInventory, MemoryModule, StorageDevice, StorageKind,
-        SystemMetrics, Temperature, TemperatureKey,
+        GpuDevice, GpuKind, GpuTelemetry, HardwareInventory, MemoryModule, StorageDevice,
+        StorageKind, SystemMetrics, Temperature, TemperatureKey,
     },
 };
 
@@ -71,14 +71,15 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
         return;
     }
     let width = usize::from(rows.width);
-    let usage = app.system_metrics().memory.map_or_else(
-        || Line::from(layout::truncate("RAM  N/A", width)),
-        |memory| usage_bar("RAM  ", memory, width, true),
-    );
-    let mut lines = vec![usage];
-    if let Some(swap) = app.system_metrics().swap {
-        lines.push(usage_bar("Swap ", swap, width, false));
-    }
+    let metrics = app.system_metrics();
+    let mut lines = match metrics.memory {
+        Some(memory) => {
+            let mut gauges = vec![Gauge::usage("RAM  ", memory, true)];
+            gauges.extend(metrics.swap.map(|swap| Gauge::usage("Swap ", swap, false)));
+            gauge_lines(&gauges, width)
+        }
+        None => vec![Line::from(layout::truncate("RAM  N/A", width))],
+    };
     if let Some(inventory) = app.hardware() {
         lines.extend(
             inventory
@@ -97,39 +98,73 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
     frame.render_widget(Paragraph::new(lines), rows);
 }
 
-/// `<label>N%  [bar]  used / total`, dropping the bar when it would be too
-/// narrow. With `banded`, the percentage and the bar take the utilization
-/// band of the value.
-pub(super) fn usage_bar(
-    label: &str,
-    usage: crate::linux::ByteUsage,
-    width: usize,
-    banded: bool,
-) -> Line<'static> {
-    let percent = usage.percent();
-    let style = band_style(Some(percent), banded);
-    let percent_text = format!("{percent:.0}%");
-    let usage = format_usage_compact(usage.used, usage.total);
-    let fixed_width =
-        label.chars().count() + percent_text.chars().count() + 4 + usage.chars().count();
-    if fixed_width > width {
-        return Line::from(layout::truncate(
-            &format!("{label}{percent_text}  {usage}"),
-            width,
-        ));
+/// One gauge row: `<label>N%  [bar]  <text>`.
+pub(super) struct Gauge {
+    pub label: String,
+    pub percent: f64,
+    /// Such as `8.8 GiB / 30.6 GiB`.
+    pub text: Option<String>,
+    /// Takes the utilization band of `percent`.
+    pub banded: bool,
+}
+
+impl Gauge {
+    pub(super) fn usage(label: &str, usage: crate::linux::ByteUsage, banded: bool) -> Self {
+        Self {
+            label: label.to_owned(),
+            percent: usage.percent(),
+            text: Some(format_usage_compact(usage.used, usage.total)),
+            banded,
+        }
     }
-    let mut spans = vec![
-        Span::raw(label.to_owned()),
-        Span::styled(percent_text, style),
-        Span::raw("  "),
-    ];
-    let gauge_width = (width - fixed_width).min(MAX_RAM_GAUGE_WIDTH);
-    if gauge_width >= 4 {
-        spans.extend(bar_spans(Some(percent), gauge_width, style));
-        spans.push(Span::raw("  "));
-    }
-    spans.push(Span::raw(usage));
-    Line::from(spans)
+}
+
+/// Gauge rows whose bars share one width and start column, so the rows of a
+/// card line up; the bars are left out when they would be too narrow.
+pub(super) fn gauge_lines(gauges: &[Gauge], width: usize) -> Vec<Line<'static>> {
+    let label_width = gauges
+        .iter()
+        .map(|gauge| gauge.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let text_width = gauges
+        .iter()
+        .filter_map(|gauge| gauge.text.as_ref())
+        .map(|text| text.chars().count())
+        .max();
+    // Label, `NNN%`, two spaces, the bar, then two spaces and the text.
+    let fixed = label_width + 4 + 2 + text_width.map_or(0, |width| 2 + width);
+    let gauge_width = width.saturating_sub(fixed).min(MAX_RAM_GAUGE_WIDTH);
+    gauges
+        .iter()
+        .map(|gauge| {
+            let style = band_style(Some(gauge.percent), gauge.banded);
+            let label = format!("{:<label_width$}", gauge.label);
+            let percent = format!("{:>3.0}%", gauge.percent);
+            let text = gauge.text.clone().unwrap_or_default();
+            if gauge_width < 4 {
+                let plain = format!("{label}{percent}  {text}");
+                if plain.trim_end().chars().count() > width {
+                    return Line::from(layout::truncate(plain.trim_end(), width));
+                }
+                return Line::from(vec![
+                    Span::raw(label),
+                    Span::styled(percent, style),
+                    Span::raw(format!("  {text}").trim_end().to_owned()),
+                ]);
+            }
+            let mut spans = vec![
+                Span::raw(label),
+                Span::styled(percent, style),
+                Span::raw("  "),
+            ];
+            spans.extend(bar_spans(Some(gauge.percent), gauge_width, style));
+            if !text.is_empty() {
+                spans.push(Span::raw(format!("  {text}")));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The utilization band of `percent` when `banded`; unstyled otherwise or
@@ -157,38 +192,109 @@ fn filled_cells(percent: Option<f64>, width: usize) -> usize {
         .min(width)
 }
 
-/// The GPU the card is about: the first discrete one, else the first.
-fn primary_gpu(inventory: &HardwareInventory) -> Option<usize> {
-    inventory
-        .gpus
-        .iter()
-        .position(|gpu| gpu.kind == Some(GpuKind::Discrete))
-        .or((!inventory.gpus.is_empty()).then_some(0))
+/// The GPU the card is about (see [`HardwareInventory::primary_gpu`]) and
+/// its telemetry, if any.
+fn primary_gpu(app: &App) -> Option<(&GpuDevice, Option<&GpuTelemetry>)> {
+    let gpu = app.hardware()?.primary_gpu()?;
+    let telemetry = gpu.device_path.as_ref().and_then(|path| {
+        app.system_metrics()
+            .gpus
+            .iter()
+            .find(|telemetry| telemetry.device_path == *path)
+    });
+    Some((gpu, telemetry))
 }
 
-pub(super) fn gpu_card_height(inventory: Option<&HardwareInventory>) -> CardHeight {
-    let others = inventory.map_or(0, |inventory| inventory.gpus.len().saturating_sub(1));
-    CardHeight::new(1, others as u16, false)
+/// Whether the GPU card has a utilization graph: once the driver reports
+/// utilization, the graph stays while its history lasts.
+fn gpu_has_graph(app: &App) -> bool {
+    primary_gpu(app)
+        .and_then(|(_, telemetry)| telemetry?.utilization)
+        .is_some()
+        || app.gpu_history().iter().len() > 0
 }
 
-/// GPU: the primary GPU in the title with its temperature; its kind and
-/// VRAM, then one row per other GPU.
-pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn gpu_card_height(app: &App, graphs: bool) -> CardHeight {
+    let others = app
+        .hardware()
+        .map_or(0, |inventory| inventory.gpus.len().saturating_sub(1));
+    let details = primary_gpu(app).map_or(1, |(gpu, telemetry)| {
+        gpu_detail_lines(gpu, telemetry, usize::MAX).len()
+    });
+    CardHeight::new(details as u16, others as u16, graphs && gpu_has_graph(app))
+}
+
+/// The primary GPU's rows: utilization, video memory and fan where the
+/// driver reports them, otherwise its kind and memory size.
+fn gpu_detail_lines(
+    gpu: &GpuDevice,
+    telemetry: Option<&GpuTelemetry>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut gauges = Vec::new();
+    if let Some(utilization) = telemetry.and_then(|telemetry| telemetry.utilization) {
+        gauges.push(Gauge {
+            label: "Util ".into(),
+            percent: utilization,
+            text: None,
+            banded: true,
+        });
+    }
+    if let Some(vram) = telemetry.and_then(|telemetry| telemetry.vram) {
+        gauges.push(Gauge::usage("VRAM ", vram, true));
+    }
+    let mut lines = gauge_lines(&gauges, width);
+    if lines.is_empty() {
+        let details = [gpu_kind(gpu), gpu_vram(gpu)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(Line::from(layout::truncate(&details, width)));
+    }
+    if let Some(fan) = telemetry.and_then(|telemetry| telemetry.fan_percent) {
+        lines.push(Line::from(layout::truncate(
+            &format!("Fan  {fan:>3.0}%"),
+            width,
+        )));
+    }
+    lines
+}
+
+/// GPU: the primary GPU with its temperature and power in the title, a
+/// graph of its utilization, its utilization, memory and fan, then one row
+/// per other GPU.
+pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool) {
     let metrics = app.system_metrics();
     let inventory = app.hardware();
-    let primary = inventory
-        .and_then(|inventory| primary_gpu(inventory).map(|index| (index, &inventory.gpus[index])));
+    let primary = primary_gpu(app);
+    let mut parts = Vec::new();
+    if let Some((gpu, telemetry)) = primary {
+        if let Some(temperature) = device_temperature(metrics, gpu.device_path.as_ref()) {
+            parts.push(vec![temperature_span(temperature, GPU_DEFAULT_LIMIT)]);
+        }
+        if let Some(watts) = telemetry.and_then(|telemetry| telemetry.power_watts) {
+            parts.push(vec![Span::raw(format_watts(watts))]);
+        }
+    }
     let title = CardTitle {
         name: "GPU",
-        model: primary.map_or("", |(_, gpu)| gpu.model.as_str()),
-        parts: primary
-            .and_then(|(_, gpu)| device_temperature(metrics, gpu.device_path.as_ref()))
-            .map(|temperature| vec![vec![temperature_span(temperature, GPU_DEFAULT_LIMIT)]])
-            .unwrap_or_default(),
+        model: primary.map_or("", |(gpu, _)| gpu.model.as_str()),
+        parts,
         order: TitleOrder::ModelFirst,
     };
+    let graph = gpu_has_graph(app).then(|| CardGraph {
+        history: app.gpu_history(),
+        scale: 100.0,
+        interval: app.cpu_history_interval(),
+        banded: true,
+    });
+    let details = primary.map_or(1, |(gpu, telemetry)| {
+        gpu_detail_lines(gpu, telemetry, usize::MAX).len()
+    }) as u16;
     let others = inventory.map_or(0, |inventory| inventory.gpus.len().saturating_sub(1)) as u16;
-    let (rows, other_limit) = cards::render_graph_card(frame, area, &title, None, false, 1, others);
+    let (rows, other_limit) =
+        cards::render_graph_card(frame, area, &title, graph, graphs, details, others);
     if rows.width == 0 || rows.height == 0 {
         return;
     }
@@ -196,19 +302,12 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
     let lines = match (inventory, primary) {
         (None, _) => vec![Line::from("Discovering hardware…")],
         (Some(_), None) => vec![Line::from("No GPU detected")],
-        (Some(inventory), Some((primary, gpu))) => {
-            let details = [gpu_kind(gpu), gpu_vram(gpu)]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("  ");
-            let mut lines = vec![Line::from(layout::truncate(&details, width))];
+        (Some(inventory), Some((primary_gpu, telemetry))) => {
+            let mut lines = gpu_detail_lines(primary_gpu, telemetry, width);
             let mut others: Vec<&GpuDevice> = inventory
                 .gpus
                 .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != primary)
-                .map(|(_, gpu)| gpu)
+                .filter(|gpu| !std::ptr::eq(*gpu, primary_gpu))
                 .collect();
             let overflow = others.len() > usize::from(other_limit);
             others.truncate(usize::from(other_limit.saturating_sub(u16::from(overflow))));
@@ -235,6 +334,15 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
     frame.render_widget(Paragraph::new(lines), rows);
+}
+
+/// `28W`, `3.5W` below 10 W.
+pub(super) fn format_watts(watts: f64) -> String {
+    if watts < 10.0 {
+        format!("{watts:.1}W")
+    } else {
+        format!("{watts:.0}W")
+    }
 }
 
 fn gpu_kind(gpu: &GpuDevice) -> Option<String> {
@@ -320,18 +428,14 @@ fn mount_lines(mounts: &[crate::linux::MountUsage], width: usize) -> Vec<Line<'s
         .max()
         .unwrap_or(0)
         .min(MAX_MOUNT_LABEL);
-    mounts
+    let gauges: Vec<Gauge> = mounts
         .iter()
         .map(|mount| {
             let label = layout::truncate(&mount.mount_point, label_width);
-            usage_bar(
-                &format!("{label:<label_width$}  "),
-                mount.usage,
-                width,
-                false,
-            )
+            Gauge::usage(&format!("{label:<label_width$}  "), mount.usage, false)
         })
-        .collect()
+        .collect();
+    gauge_lines(&gauges, width)
 }
 
 /// One row per disk within `height` rows, with `… N more devices` when they
@@ -681,6 +785,18 @@ mod tests {
 
     use super::*;
 
+    /// A single usage gauge: `<label>N%  [bar]  used / total`.
+    fn usage_bar(
+        label: &str,
+        usage: crate::linux::ByteUsage,
+        width: usize,
+        banded: bool,
+    ) -> Line<'static> {
+        gauge_lines(&[Gauge::usage(label, usage, banded)], width)
+            .pop()
+            .unwrap_or_default()
+    }
+
     #[test]
     fn ram_gauge_expands_but_remains_bounded() {
         let memory = crate::linux::ByteUsage {
@@ -698,7 +814,7 @@ mod tests {
         assert!(gauge < values);
         assert!(wide.chars().count() <= 100);
         assert!(narrow.chars().count() <= 32);
-        assert!(narrow.starts_with("Used  25%"));
+        assert!(narrow.starts_with("Used   25%"));
     }
 
     fn rows(app: &App, width: u16, height: u16, draw: fn(&mut Frame, &App, Rect)) -> Vec<String> {
@@ -748,7 +864,7 @@ mod tests {
             card[5].trim_matches('│').trim().is_empty(),
             "gap row: {card:#?}"
         );
-        assert!(card[6].starts_with("│ RAM  75%"), "{card:#?}");
+        assert!(card[6].starts_with("│ RAM   75%"), "{card:#?}");
         assert!(card[6].ends_with("GiB │"), "{card:#?}");
         assert!(card[7].contains(" 58s "), "58 samples fit: {card:#?}");
 
@@ -760,7 +876,7 @@ mod tests {
             compact[0].contains(" Memory ") && compact[0].contains('▆'),
             "{compact:#?}"
         );
-        assert!(compact[1].contains("RAM  75%"));
+        assert!(compact[1].contains("RAM   75%"));
         // " Memory " is 8 columns: the graph area runs from column 9 to 57
         // and is blank where it has no samples yet; a blank cell keeps it off
         // the corner, and the time span matches its width.
@@ -779,6 +895,36 @@ mod tests {
             vram_bytes: Some(16 << 30),
             device_path: None,
         }
+    }
+
+    #[test]
+    fn gauges_in_a_card_share_their_bar_width() {
+        let gauge = |label: &str, used: u64, total: u64| {
+            Gauge::usage(label, crate::linux::ByteUsage { used, total }, false)
+        };
+        let lines: Vec<String> = gauge_lines(
+            &[
+                gauge("/  ", 303 << 30, 927 << 30),
+                gauge("/boot  ", 1 << 30, 4 << 30),
+            ],
+            70,
+        )
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        // The first column of the bar and its width, in characters.
+        let bar = |line: &str| {
+            let cells: Vec<char> = line.chars().collect();
+            let is_bar = |c: &char| matches!(c, '█' | '░');
+            let start = cells.iter().position(is_bar).unwrap();
+            let end = cells.iter().rposition(is_bar).unwrap();
+            (start, end - start + 1)
+        };
+        assert_eq!(bar(&lines[0]), bar(&lines[1]), "{lines:#?}");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 70),
+            "{lines:#?}"
+        );
     }
 
     #[test]
@@ -802,9 +948,9 @@ mod tests {
             ..SystemMetrics::default()
         }));
         let rows = card(&app);
-        assert!(rows[1].contains("RAM  25%"), "{rows:#?}");
+        assert!(rows[1].contains("RAM   25%"), "{rows:#?}");
         assert!(
-            rows[2].contains("Swap 25%") && rows[2].contains("1.0 GiB / 4.0 GiB"),
+            rows[2].contains("Swap  25%") && rows[2].contains("1.0 GiB / 4.0 GiB"),
             "{rows:#?}"
         );
     }
@@ -829,10 +975,70 @@ mod tests {
         .iter()
         .map(ToString::to_string)
         .collect();
-        assert!(lines[0].starts_with("/                 33%"), "{lines:#?}");
-        assert!(lines[1].starts_with("/mnt/storage      50%"), "{lines:#?}");
-        assert!(lines[2].starts_with("/a/very/long/mo…  5%"), "{lines:#?}");
+        assert!(lines[0].starts_with("/                  33%"), "{lines:#?}");
+        assert!(lines[1].starts_with("/mnt/storage       50%"), "{lines:#?}");
+        assert!(lines[2].starts_with("/a/very/long/mo…    5%"), "{lines:#?}");
         assert!(lines.iter().all(|line| line.chars().count() <= 60));
+    }
+
+    #[test]
+    fn the_gpu_card_graphs_utilization_and_lists_memory_fan_and_power() {
+        use std::{path::Path, sync::Arc};
+        let path: Arc<Path> = Arc::from(Path::new("/sys/devices/gpu"));
+        let mut app = App::default();
+        app.update(crate::action::Action::HardwareDiscovered(
+            HardwareInventory {
+                gpus: vec![GpuDevice {
+                    device_path: Some(Arc::clone(&path)),
+                    ..gpu("NVIDIA GeForce RTX 5070 Ti", Some(GpuKind::Discrete))
+                }],
+                ..HardwareInventory::default()
+            },
+        ));
+        for utilization in [10.0, 50.0, 90.0] {
+            app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+                gpus: vec![GpuTelemetry {
+                    device_path: Arc::clone(&path),
+                    utilization: Some(utilization),
+                    vram: Some(crate::linux::ByteUsage {
+                        used: 4 << 30,
+                        total: 16 << 30,
+                    }),
+                    power_watts: Some(28.04),
+                    fan_percent: Some(40.0),
+                }],
+                temperatures: vec![Temperature {
+                    key: TemperatureKey::Device(Arc::clone(&path)),
+                    celsius: Some(43),
+                    max: Some(90),
+                    crit: None,
+                }],
+                ..SystemMetrics::default()
+            }));
+        }
+        assert_eq!(
+            app.gpu_history().iter().collect::<Vec<_>>(),
+            [10.0, 50.0, 90.0]
+        );
+
+        let card = rows(&app, 60, 11, |frame, app, area| {
+            render_gpu_card(frame, app, area, true)
+        });
+        assert!(
+            card[0].contains(" GPU  NVIDIA GeForce RTX 5070 Ti · 43°C · 28W "),
+            "{card:#?}"
+        );
+        assert!(
+            card[5].ends_with("▄██│"),
+            "utilization graph, newest last: {card:#?}"
+        );
+        assert!(card[7].starts_with("│ Util  90%  █"), "{card:#?}");
+        assert!(
+            card[8].contains("VRAM  25%") && card[8].contains("4.0 GiB / 16.0 GiB"),
+            "{card:#?}"
+        );
+        assert!(card[9].contains("Fan   40%"), "{card:#?}");
+        assert_eq!(format_watts(3.46), "3.5W");
     }
 
     #[test]
@@ -840,7 +1046,7 @@ mod tests {
         let mut app = App::default();
         let card = |app: &App| {
             rows(app, 60, 6, |frame, app, area| {
-                render_gpu_card(frame, app, area)
+                render_gpu_card(frame, app, area, true)
             })
         };
         assert!(card(&app)[1].contains("Discovering hardware…"));
@@ -902,12 +1108,12 @@ mod tests {
         let wide = rows(&app, 120, 4, draw);
         assert!(wide[0].contains(" Storage "));
         assert!(
-            wide[1].contains("/  50%") && wide[1].contains("NVMe0  Test Disk"),
+            wide[1].contains("/   50%") && wide[1].contains("NVMe0  Test Disk"),
             "{wide:#?}"
         );
 
         let narrow = rows(&app, 60, 5, draw);
-        assert!(narrow[1].contains("/  50%"), "{narrow:#?}");
+        assert!(narrow[1].contains("/   50%"), "{narrow:#?}");
         assert!(narrow[2].contains("NVMe0  Test Disk"), "{narrow:#?}");
     }
 
@@ -1172,7 +1378,7 @@ mod tests {
         let percent = banded
             .spans
             .iter()
-            .find(|span| span.content == "85%")
+            .find(|span| span.content == " 85%")
             .unwrap();
         assert_eq!(percent.style.fg, Some(Color::LightRed));
         let fill = banded

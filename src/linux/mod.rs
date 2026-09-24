@@ -1,4 +1,5 @@
 mod control;
+mod gpu;
 mod hardware;
 mod journal;
 mod latest_snapshot;
@@ -13,6 +14,7 @@ mod service;
 mod system;
 mod temperature;
 
+pub use gpu::GpuTelemetry;
 #[cfg(test)]
 pub(crate) use hardware::{CpuPackage, NetworkDevice};
 pub use hardware::{

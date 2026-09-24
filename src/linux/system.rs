@@ -12,6 +12,7 @@ use std::{
 
 use super::{
     control::{run_periodic, CollectorControl},
+    gpu::GpuTelemetry,
     hardware::is_whole_disk,
     latest_snapshot::{self, LatestReceiver},
     rate::CounterSample,
@@ -55,6 +56,11 @@ pub struct SystemMetrics {
     pub disks: Vec<DiskIo>,
     /// One entry per discovered sensor, read at most every 2 s.
     pub temperatures: Vec<Temperature>,
+    /// Utilization, memory, power and fan of each GPU it can read.
+    pub gpus: Vec<GpuTelemetry>,
+    /// CPU package power where a driver reports it (zenpower), read with
+    /// the temperatures.
+    pub cpu_power_watts: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +244,8 @@ impl SystemMetricsSampler {
             system_identity: self.system_identity.clone(),
             disks: self.disks.collect(Path::new(PROC_DISKSTATS), now),
             temperatures: self.temperatures.sample(now).to_vec(),
+            gpus: self.temperatures.gpus().to_vec(),
+            cpu_power_watts: self.temperatures.cpu_power_watts(),
         }
     }
 }

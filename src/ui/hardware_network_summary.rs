@@ -6,8 +6,8 @@ use ratatui::{
 };
 
 use crate::{
-    app::{is_overview_interface, is_physical_interface, App},
-    linux::{HardwareInventory, NetworkInterfaceInfo, OperState, Temperature},
+    app::{overview_interfaces, App},
+    linux::{NetworkInterfaceInfo, OperState, Temperature},
 };
 
 use super::{
@@ -21,7 +21,7 @@ use super::{
 const MAX_OTHER_INTERFACES: u16 = 3;
 
 fn other_interface_rows(app: &App) -> u16 {
-    let count = overview_network_interfaces(app.networks(), app.hardware()).len();
+    let count = overview_interfaces(app.networks(), app.hardware()).len();
     (count.saturating_sub(1) as u16).min(MAX_OTHER_INTERFACES)
 }
 
@@ -37,7 +37,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
     let interfaces = if app.network_error().is_some() {
         Vec::new()
     } else {
-        overview_network_interfaces(app.networks(), inventory)
+        overview_interfaces(app.networks(), inventory)
     };
     let device = |interface: &NetworkInterfaceInfo| {
         inventory.and_then(|inventory| {
@@ -170,18 +170,6 @@ fn rates_line(
     }
 }
 
-fn overview_network_interfaces<'a>(
-    interfaces: &'a [NetworkInterfaceInfo],
-    inventory: Option<&HardwareInventory>,
-) -> Vec<&'a NetworkInterfaceInfo> {
-    let mut relevant = interfaces
-        .iter()
-        .filter(|interface| is_overview_interface(&interface.name, inventory))
-        .collect::<Vec<_>>();
-    relevant.sort_by_key(|interface| !is_physical_interface(&interface.name, inventory));
-    relevant
-}
-
 fn network_summary_line(
     interface: &NetworkInterfaceInfo,
     model: Option<&str>,
@@ -302,6 +290,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+    use crate::linux::HardwareInventory;
 
     fn test_interface(name: &str, state: OperState) -> NetworkInterfaceInfo {
         NetworkInterfaceInfo {
@@ -392,7 +381,7 @@ mod tests {
             ..HardwareInventory::default()
         };
 
-        let selected = overview_network_interfaces(&interfaces, Some(&inventory));
+        let selected = overview_interfaces(&interfaces, Some(&inventory));
         let names = selected
             .iter()
             .map(|interface| interface.name.as_str())

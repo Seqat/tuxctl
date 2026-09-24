@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces the highlight that only appeared at a driver limit. The colors
   follow what the terminal supports (`COLORTERM`, `TERM`): true color, 256
   colors, or the 16 basic colors.
+- The GPU card graphs the GPU's utilization and lists its utilization, VRAM
+  use and fan speed, with its power in the title: through NVML for NVIDIA
+  GPUs of the proprietary driver (read on every sample while NVML stays
+  open, every 2 seconds with RTD3), through sysfs for `amdgpu`, and power
+  and fan for `nouveau`. NVIDIA GPUs use NVML's slowdown temperature as
+  their critical limit. A runtime-suspended GPU is never read. NVIDIA
+  utilization and power are read on every sample, temperature, VRAM and
+  fan every 2 seconds; this costs about 0.35 % of a core at 1 s and 0.65 %
+  at 250 ms on the reference machine (`--no-nvidia-temperature` avoids it).
+- The Memory card shows swap use, and the Storage card every local
+  filesystem instead of only `/`: one line per block device (btrfs
+  subvolumes appear once), at most 8, leaving out network, FUSE and loop
+  mounts.
+- The CPU card shows package power where a driver reports it without root
+  (the out-of-tree `zenpower`); RAPL energy counters are root-only.
+- Graphs keep 240 samples instead of 60 and show as many as fit the card.
+  The Network graph follows the interface in the card's title rather than
+  the sum of all listed interfaces.
 
 ## [0.3.3] - 2026-09-24
 

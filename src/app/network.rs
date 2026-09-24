@@ -20,6 +20,20 @@ pub(crate) fn is_overview_interface(name: &str, inventory: Option<&HardwareInven
     is_physical_interface(name, inventory) || !is_virtual_interface_name(name)
 }
 
+/// The interfaces the Overview lists, physical ones first; the first is the
+/// one its Network card is about.
+pub(crate) fn overview_interfaces<'a>(
+    interfaces: &'a [NetworkInterfaceInfo],
+    inventory: Option<&HardwareInventory>,
+) -> Vec<&'a NetworkInterfaceInfo> {
+    let mut relevant = interfaces
+        .iter()
+        .filter(|interface| is_overview_interface(&interface.name, inventory))
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|interface| !is_physical_interface(&interface.name, inventory));
+    relevant
+}
+
 fn is_virtual_interface_name(name: &str) -> bool {
     name == "lo"
         || [
@@ -123,22 +137,25 @@ impl App {
         visible
     }
 
-    /// Adds the combined RX+TX rate of the Overview's interfaces; nothing
-    /// while no interface has a rate yet (the first sample after a gap).
+    /// Adds the RX+TX rate of the interface the Overview's Network card is
+    /// about; nothing while it has no rate yet (the first sample after a
+    /// gap). The history starts over when that interface changes.
     fn record_network_sample(&mut self, interfaces: &[NetworkInterfaceInfo]) -> bool {
-        let inventory = self.hardware.as_ref();
-        let rates = interfaces
-            .iter()
-            .filter(|interface| is_overview_interface(&interface.name, inventory))
-            .flat_map(|interface| {
-                [
-                    interface.rx_rate_bytes_per_sec,
-                    interface.tx_rate_bytes_per_sec,
-                ]
-            })
-            .flatten();
+        let Some(primary) = overview_interfaces(interfaces, self.hardware.as_ref())
+            .first()
+            .copied()
+        else {
+            return false;
+        };
+        if self.network_history_interface.as_deref() != Some(primary.name.as_str()) {
+            self.network_history.clear();
+            self.network_history_interface = Some(primary.name.clone());
+        }
         let mut total = None;
-        for rate in rates {
+        for rate in [primary.rx_rate_bytes_per_sec, primary.tx_rate_bytes_per_sec]
+            .into_iter()
+            .flatten()
+        {
             *total.get_or_insert(0.0) += rate;
         }
         total.is_some_and(|total| self.network_history.push(total))

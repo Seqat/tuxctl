@@ -10,7 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::hardware::{is_whole_disk, read_sorted_directories, read_trimmed, sorted_drm_cards};
+use super::{
+    gpu::{self, GpuTelemetry},
+    hardware::{is_whole_disk, read_sorted_directories, read_trimmed, sorted_drm_cards},
+    system::ByteUsage,
+};
 
 /// Temperatures are read at most this often, whatever the sampling interval.
 pub(super) const READ_INTERVAL: Duration = Duration::from_secs(2);
@@ -54,11 +58,33 @@ impl Temperature {
 
 /// Reads NVIDIA GPU temperatures (NVML). A seam so the sampler's decisions
 /// can be tested without the library or the hardware.
+/// What NVML reports for one GPU; each value `None` where unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct NvidiaReading {
+    /// Degrees Celsius.
+    pub temperature: Option<i64>,
+    /// The temperature at which the GPU starts to slow itself down.
+    pub slowdown: Option<i64>,
+    /// Busy percentage of the graphics engine.
+    pub utilization: Option<u32>,
+    /// Used and total bytes of video memory.
+    pub memory: Option<(u64, u64)>,
+    pub power_milliwatts: Option<u32>,
+    pub fan_percent: Option<u32>,
+}
+
 pub(super) trait NvidiaSource {
-    /// Degrees Celsius for each PCI bus id, `None` where unavailable. With
-    /// `keep_open` false nothing may stay initialized after the call, so the
-    /// GPUs can runtime-suspend.
-    fn read(&mut self, bus_ids: &[&str], keep_open: bool, now: Instant) -> Vec<Option<i64>>;
+    /// A reading for each PCI bus id. Without `full`, only the cheap values
+    /// (utilization and power) are read: the temperature, memory and fan
+    /// queries cost up to a millisecond. With `keep_open` false nothing may
+    /// stay initialized after the call, so the GPUs can runtime-suspend.
+    fn read(
+        &mut self,
+        bus_ids: &[&str],
+        full: bool,
+        keep_open: bool,
+        now: Instant,
+    ) -> Vec<NvidiaReading>;
     /// Drops any open session.
     fn release(&mut self);
 }
@@ -70,8 +96,14 @@ pub(super) struct NoNvidia;
 
 #[cfg(any(test, target_env = "musl"))]
 impl NvidiaSource for NoNvidia {
-    fn read(&mut self, bus_ids: &[&str], _keep_open: bool, _now: Instant) -> Vec<Option<i64>> {
-        vec![None; bus_ids.len()]
+    fn read(
+        &mut self,
+        bus_ids: &[&str],
+        _full: bool,
+        _keep_open: bool,
+        _now: Instant,
+    ) -> Vec<NvidiaReading> {
+        vec![NvidiaReading::default(); bus_ids.len()]
     }
 
     fn release(&mut self) {}
@@ -120,6 +152,37 @@ enum Source {
     },
 }
 
+/// Where a GPU's utilization, memory, power and fan come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GpuSource {
+    /// Kernel drivers: sysfs and the GPU's own hwmon directory, read only
+    /// while the GPU is awake.
+    Sysfs {
+        path: Arc<Path>,
+        runtime_status: PathBuf,
+        hwmon: Option<PathBuf>,
+    },
+    /// The proprietary NVIDIA driver: read with the GPU's NVML temperature.
+    Nvidia { path: Arc<Path> },
+}
+
+impl GpuSource {
+    fn path(&self) -> &Arc<Path> {
+        match self {
+            Self::Sysfs { path, .. } | Self::Nvidia { path } => path,
+        }
+    }
+}
+
+/// Everything discovery finds.
+#[derive(Debug, Default)]
+struct Discovery {
+    sensors: Vec<Sensor>,
+    gpus: Vec<GpuSource>,
+    /// `power*_input` files of the CPU's hwmon (only zenpower has them).
+    cpu_power: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sensor {
     key: TemperatureKey,
@@ -140,6 +203,11 @@ pub(super) struct TemperatureSampler<N> {
     buffer: String,
     /// `None`: NVIDIA temperatures are off; NVIDIA GPUs get no entry.
     nvidia: Option<N>,
+    gpu_sources: Vec<GpuSource>,
+    /// One entry per GPU source, in the same order.
+    gpus: Vec<GpuTelemetry>,
+    cpu_power: Vec<PathBuf>,
+    cpu_power_watts: Option<f64>,
 }
 
 impl<N: NvidiaSource> TemperatureSampler<N> {
@@ -154,13 +222,20 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             rediscover: false,
             buffer: String::new(),
             nvidia,
+            gpu_sources: Vec::new(),
+            gpus: Vec::new(),
+            cpu_power: Vec::new(),
+            cpu_power_watts: None,
         };
         sampler.discover(now);
         sampler
     }
 
     /// The current temperatures, read from the sensors at most once per
-    /// [`READ_INTERVAL`] and carried over unchanged in between.
+    /// [`READ_INTERVAL`] and carried over unchanged in between. GPU telemetry
+    /// is refreshed on every call where that is cheap: kernel drivers, and
+    /// NVML while it stays open; NVML initialized per reading (RTD3) follows
+    /// the temperature cadence.
     pub(super) fn sample(&mut self, now: Instant) -> &[Temperature] {
         let due = self.last_read.is_none_or(|last| {
             now.saturating_duration_since(last) + READ_TOLERANCE >= READ_INTERVAL
@@ -173,12 +248,33 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
                 self.discover(now);
             }
             self.read(now);
+            self.cpu_power_watts = read_cpu_power(&self.cpu_power);
         }
+        self.read_nvidia(now, due);
+        self.read_gpus();
         &self.readings
     }
 
+    /// Telemetry of each GPU, as of the last [`Self::sample`].
+    pub(super) fn gpus(&self) -> &[GpuTelemetry] {
+        &self.gpus
+    }
+
+    /// Package power from the CPU's hwmon, where a driver reports it.
+    pub(super) fn cpu_power_watts(&self) -> Option<f64> {
+        self.cpu_power_watts
+    }
+
     fn discover(&mut self, now: Instant) {
-        self.sensors = discover(&self.roots, self.nvidia.is_some());
+        let discovery = discover(&self.roots, self.nvidia.is_some());
+        self.gpus = discovery
+            .gpus
+            .iter()
+            .map(|source| GpuTelemetry::unavailable(Arc::clone(source.path())))
+            .collect();
+        self.gpu_sources = discovery.gpus;
+        self.cpu_power = discovery.cpu_power;
+        self.sensors = discovery.sensors;
         self.worked = vec![false; self.sensors.len()];
         self.readings = self
             .sensors
@@ -194,8 +290,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
         self.rediscover = false;
     }
 
-    fn read(&mut self, now: Instant) {
-        let mut nvidia = Vec::new();
+    fn read(&mut self, _now: Instant) {
         for (index, sensor) in self.sensors.iter().enumerate() {
             let result = match &sensor.source {
                 Source::Files(paths) => read_max(paths, &mut self.buffer),
@@ -217,14 +312,8 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
                         Ok(None)
                     }
                 }
-                Source::Nvidia {
-                    bus_id,
-                    runtime_status,
-                    keep_open,
-                } => {
-                    nvidia.push((index, bus_id.as_str(), is_awake(runtime_status), *keep_open));
-                    continue;
-                }
+                // Read by `read_nvidia`.
+                Source::Nvidia { .. } => continue,
             };
             self.readings[index].celsius = match result {
                 Ok(celsius) => {
@@ -237,33 +326,142 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
                 }
             };
         }
+    }
+
+    /// NVIDIA GPUs through NVML: utilization and power on every call while
+    /// NVML stays open; temperatures, memory and fan when `due`. NVML
+    /// initialized per reading is read only when `due`.
+    fn read_nvidia(&mut self, now: Instant, due: bool) {
+        let nvidia: Vec<(usize, &str, bool, bool)> = self
+            .sensors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sensor)| match &sensor.source {
+                Source::Nvidia {
+                    bus_id,
+                    runtime_status,
+                    keep_open,
+                } => Some((index, bus_id.as_str(), is_awake(runtime_status), *keep_open)),
+                _ => None,
+            })
+            .collect();
         // Only discovered while NVIDIA temperatures are on.
         let Some(source) = self.nvidia.as_mut().filter(|_| !nvidia.is_empty()) else {
             return;
         };
-
-        for &(index, ..) in &nvidia {
-            self.readings[index].celsius = None;
-        }
         // NVML attaches to every NVIDIA GPU on init. Keep it open only when
         // none of them can runtime-suspend; otherwise initialize it for one
         // read, and only while all of them are awake, so it never wakes one.
         let keep_open = nvidia.iter().all(|&(.., keep_open)| keep_open);
         let all_awake = nvidia.iter().all(|&(_, _, awake, _)| awake);
-        if !keep_open && !all_awake {
+        if !keep_open && !due {
+            return;
+        }
+        let readings: Vec<NvidiaReading> = if !keep_open && !all_awake {
             source.release();
-            return;
-        }
-        let awake: Vec<_> = nvidia.iter().filter(|&&(_, _, awake, _)| awake).collect();
-        if awake.is_empty() {
-            return;
-        }
-        let bus_ids: Vec<&str> = awake.iter().map(|&&(_, bus_id, ..)| bus_id).collect();
-        let values = source.read(&bus_ids, keep_open, now);
-        for (&&(index, ..), value) in awake.iter().zip(values) {
-            self.readings[index].celsius = value.and_then(valid_celsius);
+            vec![NvidiaReading::default(); nvidia.len()]
+        } else {
+            let bus_ids: Vec<&str> = nvidia
+                .iter()
+                .filter(|&&(_, _, awake, _)| awake)
+                .map(|&(_, bus_id, ..)| bus_id)
+                .collect();
+            let mut values = if bus_ids.is_empty() {
+                Vec::new()
+            } else {
+                source.read(&bus_ids, due, keep_open, now)
+            }
+            .into_iter();
+            nvidia
+                .iter()
+                .map(|&(_, _, awake, _)| {
+                    if awake {
+                        values.next().unwrap_or_default()
+                    } else {
+                        NvidiaReading::default()
+                    }
+                })
+                .collect()
+        };
+        for (&(index, ..), reading) in nvidia.iter().zip(readings) {
+            if due {
+                let temperature = &mut self.readings[index];
+                temperature.celsius = reading.temperature.and_then(valid_celsius);
+                if temperature.max.is_none() {
+                    temperature.max = reading.slowdown.and_then(valid_celsius);
+                }
+            }
+            let TemperatureKey::Device(path) = &self.sensors[index].key else {
+                continue;
+            };
+            if let Some(slot) = self.gpus.iter_mut().find(|gpu| gpu.device_path == *path) {
+                let telemetry = nvidia_telemetry(Arc::clone(path), reading);
+                // Memory and fan are read with the temperatures; in between
+                // they carry over.
+                *slot = if due {
+                    telemetry
+                } else {
+                    GpuTelemetry {
+                        vram: slot.vram,
+                        fan_percent: slot.fan_percent,
+                        ..telemetry
+                    }
+                };
+            }
         }
     }
+
+    /// GPUs of kernel drivers, while they are awake.
+    fn read_gpus(&mut self) {
+        for (source, slot) in self.gpu_sources.iter().zip(&mut self.gpus) {
+            if let GpuSource::Sysfs {
+                path,
+                runtime_status,
+                hwmon,
+            } = source
+            {
+                *slot = if is_awake(runtime_status) {
+                    gpu::read_sysfs(path, hwmon.as_deref())
+                } else {
+                    GpuTelemetry::unavailable(Arc::clone(path))
+                };
+            }
+        }
+    }
+}
+
+fn nvidia_telemetry(device_path: Arc<Path>, reading: NvidiaReading) -> GpuTelemetry {
+    GpuTelemetry {
+        device_path,
+        utilization: reading
+            .utilization
+            .map(|percent| f64::from(percent.min(100))),
+        vram: reading
+            .memory
+            .filter(|&(_, total)| total > 0)
+            .map(|(used, total)| ByteUsage { used, total }),
+        power_watts: reading
+            .power_milliwatts
+            .map(|milliwatts| f64::from(milliwatts) / 1000.0)
+            .filter(|watts| *watts <= 2_000.0),
+        fan_percent: reading
+            .fan_percent
+            .map(|percent| f64::from(percent.min(100))),
+    }
+}
+
+/// The sum of the CPU hwmon's power inputs (microwatts), in watts; `None`
+/// without any or when one cannot be read.
+fn read_cpu_power(files: &[PathBuf]) -> Option<f64> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut microwatts = 0.0;
+    for file in files {
+        microwatts += fs::read_to_string(file).ok()?.trim().parse::<f64>().ok()?;
+    }
+    let watts = microwatts / 1_000_000.0;
+    (0.0..=2_000.0).contains(&watts).then_some(watts)
 }
 
 /// A device that is not runtime-suspended; reading its sensor does not wake it.
@@ -314,9 +512,12 @@ fn valid_celsius(celsius: i64) -> Option<i16> {
 
 #[derive(Debug)]
 struct Hwmon {
+    dir: PathBuf,
     name: String,
     device: Option<PathBuf>,
     temps: Vec<HwmonTemp>,
+    /// `power*_input` files, microwatts.
+    powers: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -350,7 +551,7 @@ struct Gpu {
     driver: Option<String>,
 }
 
-fn discover(roots: &SysfsRoots, nvidia: bool) -> Vec<Sensor> {
+fn discover(roots: &SysfsRoots, nvidia: bool) -> Discovery {
     let hwmons = read_hwmons(&roots.hwmon);
     let mut sensors = cpu_sensors(&hwmons);
     if sensors.is_empty() {
@@ -391,7 +592,35 @@ fn discover(roots: &SysfsRoots, nvidia: bool) -> Vec<Sensor> {
     // One temperature per component: the first source found wins.
     let mut seen = std::collections::HashSet::new();
     sensors.retain(|sensor| seen.insert(sensor.key.clone()));
-    sensors
+
+    let gpu_sources = gpus
+        .iter()
+        .filter_map(|gpu| {
+            let path: Arc<Path> = Arc::from(gpu.path.as_path());
+            if gpu.driver.as_deref() == Some("nvidia") {
+                return nvidia.then_some(GpuSource::Nvidia { path });
+            }
+            Some(GpuSource::Sysfs {
+                runtime_status: gpu.path.join("power/runtime_status"),
+                hwmon: hwmons
+                    .iter()
+                    .find(|hwmon| hwmon.device.as_deref() == Some(gpu.path.as_path()))
+                    .map(|hwmon| hwmon.dir.clone()),
+                path,
+            })
+        })
+        .collect();
+    // zenpower reports core and SoC power; their sum stands for the package.
+    let cpu_power = hwmons
+        .iter()
+        .filter(|hwmon| hwmon.name == "zenpower")
+        .flat_map(|hwmon| hwmon.powers.iter().cloned())
+        .collect();
+    Discovery {
+        sensors,
+        gpus: gpu_sources,
+        cpu_power,
+    }
 }
 
 fn read_hwmons(root: &Path) -> Vec<Hwmon> {
@@ -421,12 +650,23 @@ fn read_hwmons(root: &Path) -> Vec<Hwmon> {
                     })
                     .collect();
                 temps.sort_by_key(|temp| temp.index);
+                let powers = sorted_file_names(&path)
+                    .into_iter()
+                    .filter(|file| {
+                        file.strip_prefix("power")
+                            .and_then(|rest| rest.strip_suffix("_input"))
+                            .is_some_and(|number| number.parse::<u32>().is_ok())
+                    })
+                    .map(|file| path.join(file))
+                    .collect();
                 Some((
                     index,
                     Hwmon {
+                        dir: path.clone(),
                         name,
                         device,
                         temps,
+                        powers,
                     },
                 ))
             })
@@ -1223,6 +1463,7 @@ mod tests {
         tree.power(&gpu, "auto", "active");
         let policy = |tree: &Tree| {
             discover(&tree.roots(), true)
+                .sensors
                 .into_iter()
                 .find_map(|sensor| match sensor.source {
                     Source::Nvidia {
@@ -1374,16 +1615,33 @@ mod tests {
     struct FakeNvidia {
         calls: NvidiaCalls,
         releases: Rc<RefCell<usize>>,
-        value: Option<i64>,
+        reading: Rc<RefCell<NvidiaReading>>,
+        /// Whether each call asked for a full reading.
+        full_reads: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl FakeNvidia {
+        fn reporting(celsius: i64) -> Self {
+            let fake = Self::default();
+            fake.reading.borrow_mut().temperature = Some(celsius);
+            fake
+        }
     }
 
     impl NvidiaSource for FakeNvidia {
-        fn read(&mut self, bus_ids: &[&str], keep_open: bool, _now: Instant) -> Vec<Option<i64>> {
+        fn read(
+            &mut self,
+            bus_ids: &[&str],
+            full: bool,
+            keep_open: bool,
+            _now: Instant,
+        ) -> Vec<NvidiaReading> {
+            self.full_reads.borrow_mut().push(full);
             self.calls.borrow_mut().push((
                 bus_ids.iter().map(|id| (*id).to_owned()).collect(),
                 keep_open,
             ));
-            vec![self.value; bus_ids.len()]
+            vec![*self.reading.borrow(); bus_ids.len()]
         }
 
         fn release(&mut self) {
@@ -1420,16 +1678,13 @@ mod tests {
             TemperatureSampler::new(tree.roots(), None, Instant::now());
 
         assert!(values(&mut sampler).is_empty());
-        assert!(discover(&tree.roots(), false).is_empty());
+        assert!(discover(&tree.roots(), false).sensors.is_empty());
     }
 
     #[test]
     fn nvidia_gpu_that_cannot_suspend_keeps_nvml_open() {
         let (tree, gpu) = nvidia_tree("nvidia-on", "on", "active");
-        let fake = FakeNvidia {
-            value: Some(52),
-            ..FakeNvidia::default()
-        };
+        let fake = FakeNvidia::reporting(52);
         let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), Instant::now());
 
         assert_eq!(values(&mut sampler), [(device_key(&gpu), Some(52))]);
@@ -1442,10 +1697,7 @@ mod tests {
     #[test]
     fn nvidia_gpu_with_rtd3_is_read_per_cycle_and_never_woken() {
         let (tree, gpu) = nvidia_tree("nvidia-rtd3", "auto", "active");
-        let fake = FakeNvidia {
-            value: Some(48),
-            ..FakeNvidia::default()
-        };
+        let fake = FakeNvidia::reporting(48);
         let start = Instant::now();
         let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
 
@@ -1476,10 +1728,7 @@ mod tests {
         let mut unavailable = TemperatureSampler::new(tree.roots(), Some(NoNvidia), Instant::now());
         assert_eq!(values(&mut unavailable), [(device_key(&gpu), None)]);
 
-        let implausible = FakeNvidia {
-            value: Some(4_000),
-            ..FakeNvidia::default()
-        };
+        let implausible = FakeNvidia::reporting(4_000);
         let mut sampler = TemperatureSampler::new(tree.roots(), Some(implausible), Instant::now());
         assert_eq!(values(&mut sampler), [(device_key(&gpu), None)]);
     }
@@ -1495,5 +1744,132 @@ mod tests {
         assert_eq!(temperature(Some(80), Some(90)).limit(), Some(90));
         assert_eq!(temperature(Some(80), None).limit(), Some(80));
         assert_eq!(temperature(None, None).limit(), None);
+    }
+
+    #[test]
+    fn open_nvml_refreshes_telemetry_every_sample_and_temperatures_every_two_seconds() {
+        let (tree, gpu) = nvidia_tree("nvidia-telemetry", "on", "active");
+        let fake = FakeNvidia::default();
+        *fake.reading.borrow_mut() = NvidiaReading {
+            temperature: Some(50),
+            slowdown: Some(90),
+            utilization: Some(30),
+            memory: Some((4 << 30, 16 << 30)),
+            power_milliwatts: Some(120_500),
+            fan_percent: Some(40),
+        };
+        let start = Instant::now();
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+
+        let temperature = sampler.sample(start)[0].clone();
+        assert_eq!(
+            (temperature.celsius, temperature.max),
+            (Some(50), Some(90)),
+            "slowdown as max"
+        );
+        assert_eq!(
+            sampler.gpus(),
+            [GpuTelemetry {
+                device_path: Arc::from(gpu.as_path()),
+                utilization: Some(30.0),
+                vram: Some(ByteUsage {
+                    used: 4 << 30,
+                    total: 16 << 30
+                }),
+                power_watts: Some(120.5),
+                fan_percent: Some(40.0),
+            }]
+        );
+
+        {
+            let mut reading = fake.reading.borrow_mut();
+            reading.temperature = Some(60);
+            reading.utilization = Some(90);
+            reading.fan_percent = Some(70);
+        }
+        assert_eq!(
+            sampler.sample(at(start, 1_000))[0].celsius,
+            Some(50),
+            "temperature carried"
+        );
+        assert_eq!(
+            sampler.gpus()[0].utilization,
+            Some(90.0),
+            "utilization refreshed"
+        );
+        assert_eq!(sampler.gpus()[0].fan_percent, Some(40.0), "fan carried");
+        assert_eq!(sampler.sample(at(start, 2_000))[0].celsius, Some(60));
+        assert_eq!(sampler.gpus()[0].fan_percent, Some(70.0));
+        assert_eq!(fake.calls.borrow().len(), 3);
+        // The costly queries (temperature, memory, fan) only every 2 s.
+        assert_eq!(*fake.full_reads.borrow(), [true, false, true]);
+    }
+
+    #[test]
+    fn nvml_initialized_per_reading_follows_the_temperature_cadence() {
+        let (tree, _) = nvidia_tree("nvidia-rtd3-cadence", "auto", "active");
+        let fake = FakeNvidia::reporting(45);
+        let start = Instant::now();
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+        for millis in [0, 250, 500, 1_000, 1_500, 2_000] {
+            sampler.sample(at(start, millis));
+        }
+        assert_eq!(fake.calls.borrow().len(), 2, "at 0 and 2 s only");
+    }
+
+    #[test]
+    fn kernel_driver_gpus_report_telemetry_while_awake() {
+        let tree = Tree::new("amdgpu-telemetry");
+        let gpu = tree.device("pci0000:00/0000:03:00.0");
+        tree.gpu(0, &gpu, "amdgpu");
+        tree.power(&gpu, "auto", "active");
+        tree.write(&gpu.join("gpu_busy_percent"), "37");
+        let hwmon = tree.hwmon(0, "amdgpu", Some(&gpu), &[(1, Some("edge"), 50_000)]);
+        tree.write(&hwmon.join("power1_average"), "80000000");
+        let start = Instant::now();
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
+
+        sampler.sample(start);
+        assert_eq!(sampler.gpus()[0].utilization, Some(37.0));
+        assert_eq!(sampler.gpus()[0].power_watts, Some(80.0));
+        tree.write(&gpu.join("gpu_busy_percent"), "64");
+        sampler.sample(at(start, 250));
+        assert_eq!(sampler.gpus()[0].utilization, Some(64.0), "every sample");
+
+        tree.write(&gpu.join("power/runtime_status"), "suspended");
+        sampler.sample(at(start, 500));
+        assert_eq!(
+            sampler.gpus(),
+            [GpuTelemetry::unavailable(Arc::from(gpu.as_path()))],
+            "a suspended GPU is not read"
+        );
+    }
+
+    #[test]
+    fn nvidia_gpus_have_no_telemetry_while_nvidia_temperatures_are_off() {
+        let (tree, _) = nvidia_tree("nvidia-off-telemetry", "on", "active");
+        let mut sampler: TemperatureSampler<FakeNvidia> =
+            TemperatureSampler::new(tree.roots(), None, Instant::now());
+        sampler.sample(Instant::now());
+        assert!(sampler.gpus().is_empty());
+    }
+
+    #[test]
+    fn zenpower_reports_package_power_as_core_plus_soc() {
+        let tree = Tree::new("zenpower-power");
+        let node = tree.device("pci0000:00/0000:00:18.3");
+        let hwmon = tree.hwmon(0, "zenpower", Some(&node), &[(1, Some("Tctl"), 45_000)]);
+        tree.write(&hwmon.join("power1_input"), "38250000");
+        tree.write(&hwmon.join("power2_input"), "11750000");
+        let mut sampler = tree.sampler();
+        sampler.sample(Instant::now());
+        assert_eq!(sampler.cpu_power_watts(), Some(50.0));
+
+        let k10temp = Tree::new("k10temp-power");
+        let node = k10temp.device("pci0000:00/0000:00:18.3");
+        k10temp.hwmon(0, "k10temp", Some(&node), &[(1, Some("Tctl"), 45_000)]);
+        let mut sampler = k10temp.sampler();
+        sampler.sample(Instant::now());
+        assert_eq!(sampler.cpu_power_watts(), None, "k10temp has no power");
     }
 }

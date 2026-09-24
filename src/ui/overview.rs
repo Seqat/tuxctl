@@ -103,7 +103,7 @@ fn card_height(app: &App, card: Card, inner_width: u16, mode: WidthMode) -> Card
     let graphs = mode.graphs();
     match card {
         Card::Cpu => hardware_cpu::card_height(app.system_metrics(), inner_width, graphs),
-        Card::Gpu => hardware::gpu_card_height(app.hardware()),
+        Card::Gpu => hardware::gpu_card_height(app, graphs),
         Card::Memory => hardware::memory_card_height(app, graphs),
         Card::Network => hardware_network_summary::card_height(app, graphs),
         Card::Storage => {
@@ -121,7 +121,7 @@ fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, mode: Width
     let graphs = mode.graphs();
     match card {
         Card::Cpu => hardware_cpu::render_card(frame, app, area, graphs),
-        Card::Gpu => hardware::render_gpu_card(frame, app, area),
+        Card::Gpu => hardware::render_gpu_card(frame, app, area, graphs),
         Card::Memory => hardware::render_memory_card(frame, app, area, graphs),
         Card::Network => hardware_network_summary::render_card(frame, app, area, graphs),
         Card::Storage => hardware::render_storage_card(frame, app, area),

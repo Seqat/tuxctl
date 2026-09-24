@@ -25,6 +25,16 @@ pub struct HardwareInventory {
     pub network_devices: Vec<NetworkDevice>,
 }
 
+impl HardwareInventory {
+    /// The GPU the Overview is about: the first discrete one, else the first.
+    pub fn primary_gpu(&self) -> Option<&GpuDevice> {
+        self.gpus
+            .iter()
+            .find(|gpu| gpu.kind == Some(GpuKind::Discrete))
+            .or_else(|| self.gpus.first())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuPackage {
     pub physical_id: Option<u32>,

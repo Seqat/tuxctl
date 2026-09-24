@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     cards::{self, CardGraph, CardTitle, TitleOrder},
-    hardware::{band_style, bar_spans, temperature_span, CPU_DEFAULT_LIMIT},
+    hardware::{band_style, bar_spans, format_watts, temperature_span, CPU_DEFAULT_LIMIT},
     layout,
     overview::CardHeight,
 };
@@ -78,7 +78,14 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
             .hardware()
             .and_then(|inventory| inventory.cpus.first())
             .map_or("", |cpu| cpu.model.as_str()),
-        parts: package_temperatures(metrics).into_iter().collect(),
+        parts: package_temperatures(metrics)
+            .into_iter()
+            .chain(
+                metrics
+                    .cpu_power_watts
+                    .map(|watts| vec![Span::raw(format_watts(watts))]),
+            )
+            .collect(),
         order: TitleOrder::ModelFirst,
     };
     let graph = CardGraph {
@@ -582,7 +589,8 @@ mod tests {
     #[test]
     fn the_bottom_border_states_the_time_span_of_the_graph() {
         let app = app_with(2, Vec::new());
-        assert!(card_rows(&app, 100, 12, true)[11].contains(" 60s "));
+        // 98 of the 240 samples kept fit in a 100-column card.
+        assert!(card_rows(&app, 100, 12, true)[11].contains(" 98s "));
         // 38 samples fit in a 40-column card.
         assert!(card_rows(&app, 40, 12, true)[11].contains(" 38s "));
     }

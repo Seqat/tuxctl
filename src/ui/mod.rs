@@ -1926,9 +1926,9 @@ mod tests {
             .collect();
         let row = lines
             .iter()
-            .find(|line| line.contains("/  50%"))
+            .find(|line| line.contains("/   50%"))
             .expect("filesystem row in the Storage card");
-        assert!(row.contains("/  50%  █"), "row: {row}");
+        assert!(row.contains("/   50%  █"), "row: {row}");
         assert!(row.contains("░  50.0 GiB / 100.0 GiB"), "row: {row}");
     }
 
