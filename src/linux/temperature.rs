@@ -118,6 +118,7 @@ pub(super) struct SysfsRoots {
     pub block: PathBuf,
     pub net: PathBuf,
     pub nvidia_proc: PathBuf,
+    pub powercap: PathBuf,
 }
 
 impl Default for SysfsRoots {
@@ -129,6 +130,7 @@ impl Default for SysfsRoots {
             block: "/sys/block".into(),
             net: "/sys/class/net".into(),
             nvidia_proc: "/proc/driver/nvidia/gpus".into(),
+            powercap: "/sys/class/powercap".into(),
         }
     }
 }
@@ -179,8 +181,21 @@ impl GpuSource {
 struct Discovery {
     sensors: Vec<Sensor>,
     gpus: Vec<GpuSource>,
-    /// `power*_input` files of the CPU's hwmon (only zenpower has them).
-    cpu_power: Vec<PathBuf>,
+    cpu_power: CpuPowerSource,
+}
+
+/// Where CPU package power comes from, if anywhere this user can read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum CpuPowerSource {
+    #[default]
+    None,
+    /// `power*_input` files of the CPU's hwmon, microwatts (zenpower's core
+    /// and SoC power), summed.
+    Hwmon(Vec<PathBuf>),
+    /// RAPL package domains: their energy counters (microjoules) and the
+    /// value at which each wraps. Root-only unless an administrator made
+    /// them readable.
+    Rapl(Vec<(PathBuf, u64)>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +221,9 @@ pub(super) struct TemperatureSampler<N> {
     gpu_sources: Vec<GpuSource>,
     /// One entry per GPU source, in the same order.
     gpus: Vec<GpuTelemetry>,
-    cpu_power: Vec<PathBuf>,
+    cpu_power: CpuPowerSource,
+    /// The previous RAPL counters and when they were read.
+    rapl_previous: Option<(Instant, Vec<u64>)>,
     cpu_power_watts: Option<f64>,
 }
 
@@ -224,7 +241,8 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             nvidia,
             gpu_sources: Vec::new(),
             gpus: Vec::new(),
-            cpu_power: Vec::new(),
+            cpu_power: CpuPowerSource::None,
+            rapl_previous: None,
             cpu_power_watts: None,
         };
         sampler.discover(now);
@@ -248,7 +266,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
                 self.discover(now);
             }
             self.read(now);
-            self.cpu_power_watts = read_cpu_power(&self.cpu_power);
+            self.cpu_power_watts = self.read_cpu_power(now);
         }
         self.read_nvidia(now, due);
         self.read_gpus();
@@ -260,7 +278,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
         &self.gpus
     }
 
-    /// Package power from the CPU's hwmon, where a driver reports it.
+    /// CPU package power, where this user can read it.
     pub(super) fn cpu_power_watts(&self) -> Option<f64> {
         self.cpu_power_watts
     }
@@ -274,6 +292,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             .collect();
         self.gpu_sources = discovery.gpus;
         self.cpu_power = discovery.cpu_power;
+        self.rapl_previous = None;
         self.sensors = discovery.sensors;
         self.worked = vec![false; self.sensors.len()];
         self.readings = self
@@ -411,6 +430,48 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
         }
     }
 
+    /// Package power in watts: zenpower's reading, or the RAPL energy used
+    /// since the previous call (none on the first).
+    fn read_cpu_power(&mut self, now: Instant) -> Option<f64> {
+        let watts = match &self.cpu_power {
+            CpuPowerSource::None => return None,
+            CpuPowerSource::Hwmon(files) => {
+                let mut microwatts = 0.0;
+                for file in files {
+                    microwatts += fs::read_to_string(file).ok()?.trim().parse::<f64>().ok()?;
+                }
+                microwatts / 1_000_000.0
+            }
+            CpuPowerSource::Rapl(domains) => {
+                let energies: Option<Vec<u64>> = domains
+                    .iter()
+                    .map(|(file, _)| fs::read_to_string(file).ok()?.trim().parse().ok())
+                    .collect();
+                let previous = match energies {
+                    Some(energies) => self.rapl_previous.replace((now, energies)),
+                    None => self.rapl_previous.take(),
+                };
+                let ((then, before), (_, current)) = (previous?, self.rapl_previous.as_ref()?);
+                let seconds = now.saturating_duration_since(then).as_secs_f64();
+                if seconds < 0.1 {
+                    return None;
+                }
+                let mut microjoules = 0_u64;
+                for ((&after, &before), &(_, range)) in current.iter().zip(&before).zip(domains) {
+                    // The counter wraps at `range`.
+                    let delta = if after >= before {
+                        after - before
+                    } else {
+                        range.checked_sub(before)?.checked_add(after)?
+                    };
+                    microjoules = microjoules.checked_add(delta)?;
+                }
+                microjoules as f64 / 1_000_000.0 / seconds
+            }
+        };
+        (0.0..=2_000.0).contains(&watts).then_some(watts)
+    }
+
     /// GPUs of kernel drivers, while they are awake.
     fn read_gpus(&mut self) {
         for (source, slot) in self.gpu_sources.iter().zip(&mut self.gpus) {
@@ -448,20 +509,6 @@ fn nvidia_telemetry(device_path: Arc<Path>, reading: NvidiaReading) -> GpuTeleme
             .fan_percent
             .map(|percent| f64::from(percent.min(100))),
     }
-}
-
-/// The sum of the CPU hwmon's power inputs (microwatts), in watts; `None`
-/// without any or when one cannot be read.
-fn read_cpu_power(files: &[PathBuf]) -> Option<f64> {
-    if files.is_empty() {
-        return None;
-    }
-    let mut microwatts = 0.0;
-    for file in files {
-        microwatts += fs::read_to_string(file).ok()?.trim().parse::<f64>().ok()?;
-    }
-    let watts = microwatts / 1_000_000.0;
-    (0.0..=2_000.0).contains(&watts).then_some(watts)
 }
 
 /// A device that is not runtime-suspended; reading its sensor does not wake it.
@@ -611,16 +658,53 @@ fn discover(roots: &SysfsRoots, nvidia: bool) -> Discovery {
         })
         .collect();
     // zenpower reports core and SoC power; their sum stands for the package.
-    let cpu_power = hwmons
+    let zenpower: Vec<PathBuf> = hwmons
         .iter()
         .filter(|hwmon| hwmon.name == "zenpower")
         .flat_map(|hwmon| hwmon.powers.iter().cloned())
         .collect();
+    let cpu_power = if zenpower.is_empty() {
+        let domains = readable_rapl_packages(&roots.powercap);
+        if domains.is_empty() {
+            CpuPowerSource::None
+        } else {
+            CpuPowerSource::Rapl(domains)
+        }
+    } else {
+        CpuPowerSource::Hwmon(zenpower)
+    };
     Discovery {
         sensors,
         gpus: gpu_sources,
         cpu_power,
     }
+}
+
+/// RAPL package domains (`intel-rapl:N` named `package-*`, also on AMD)
+/// whose energy counter this user can read. Their subdomains (`intel-rapl:N:M`)
+/// are parts of the package and not added.
+fn readable_rapl_packages(root: &Path) -> Vec<(PathBuf, u64)> {
+    read_sorted_directories(root, |name| {
+        name.strip_prefix("intel-rapl:")
+            .is_some_and(|index| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+    })
+    .into_iter()
+    .filter(|domain| {
+        read_trimmed(domain.join("name")).is_some_and(|name| name.starts_with("package"))
+    })
+    .filter_map(|domain| {
+        let energy = domain.join("energy_uj");
+        fs::read_to_string(&energy)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let range = read_trimmed(domain.join("max_energy_range_uj"))
+            .and_then(|range| range.parse().ok())
+            .unwrap_or(u64::MAX);
+        Some((energy, range))
+    })
+    .collect()
 }
 
 fn read_hwmons(root: &Path) -> Vec<Hwmon> {
@@ -988,6 +1072,7 @@ mod tests {
                 block: self.0.join("block"),
                 net: self.0.join("class/net"),
                 nvidia_proc: self.0.join("proc/nvidia/gpus"),
+                powercap: self.0.join("class/powercap"),
             }
         }
 
@@ -1871,5 +1956,63 @@ mod tests {
         let mut sampler = k10temp.sampler();
         sampler.sample(Instant::now());
         assert_eq!(sampler.cpu_power_watts(), None, "k10temp has no power");
+    }
+
+    fn rapl_domain(tree: &Tree, domain: &str, name: &str, energy: u64) -> PathBuf {
+        let path = tree.0.join("class/powercap").join(domain);
+        tree.write(&path.join("name"), name);
+        tree.write(&path.join("energy_uj"), &energy.to_string());
+        tree.write(&path.join("max_energy_range_uj"), "262143328850");
+        path.join("energy_uj")
+    }
+
+    #[test]
+    fn readable_rapl_packages_give_power_from_energy_deltas() {
+        let tree = Tree::new("rapl");
+        let energy = rapl_domain(&tree, "intel-rapl:0", "package-0", 1_000_000);
+        // A subdomain is part of the package; counting it would count twice.
+        rapl_domain(&tree, "intel-rapl:0:0", "core", 500_000);
+        let start = Instant::now();
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(NoNvidia), start);
+
+        sampler.sample(start);
+        assert_eq!(
+            sampler.cpu_power_watts(),
+            None,
+            "no delta on the first read"
+        );
+        tree.write(&energy, "51000000");
+        sampler.sample(at(start, 2_000));
+        assert_eq!(sampler.cpu_power_watts(), Some(25.0), "50 J in 2 s");
+
+        // The counter wraps at max_energy_range_uj.
+        tree.write(&energy, &(262_143_328_850_u64 - 1_000_000).to_string());
+        sampler.sample(at(start, 4_000));
+        tree.write(&energy, "9000000");
+        sampler.sample(at(start, 6_000));
+        assert_eq!(sampler.cpu_power_watts(), Some(5.0), "10 J across the wrap");
+    }
+
+    #[test]
+    fn unreadable_rapl_counters_show_no_power_and_zenpower_comes_first() {
+        let tree = Tree::new("rapl-unreadable");
+        let path = tree.0.join("class/powercap/intel-rapl:0");
+        tree.write(&path.join("name"), "package-0");
+        // Standing in for a root-only file: listed, but it cannot be read.
+        fs::create_dir_all(path.join("energy_uj")).unwrap();
+        assert_eq!(
+            discover(&tree.roots(), false).cpu_power,
+            CpuPowerSource::None
+        );
+
+        let both = Tree::new("rapl-and-zenpower");
+        rapl_domain(&both, "intel-rapl:0", "package-0", 1);
+        let node = both.device("pci0000:00/0000:00:18.3");
+        let hwmon = both.hwmon(0, "zenpower", Some(&node), &[(1, Some("Tctl"), 45_000)]);
+        both.write(&hwmon.join("power1_input"), "20000000");
+        assert!(matches!(
+            discover(&both.roots(), false).cpu_power,
+            CpuPowerSource::Hwmon(_)
+        ));
     }
 }

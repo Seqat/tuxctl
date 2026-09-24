@@ -31,7 +31,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 
 - A system summary in the top border: hostname, kernel, uptime, and process, running-process, and zombie counts (zombies are highlighted when there are any). It shortens on narrow terminals: the kernel goes first, then the counts are abbreviated (`397p · 2r · 0z`), then the uptime goes.
 - Cards for **CPU**, **GPU**, **Memory**, **Network**, **Storage**, and **Pinned** processes. Each card names its component in its title with the model, temperature and power where known (`GPU  RTX 5070 Ti · 43°C · 28W`); the model is shortened first when the title does not fit.
-  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid. Package power appears only where a driver reports it without root: the out-of-tree `zenpower` driver (AMD Zen 1–3). Intel and AMD RAPL energy counters are readable by root only, so `tuxctl` does not show them.
+  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid. Package power appears where this user can read it: from the out-of-tree `zenpower` driver (AMD Zen 1–3), or from RAPL energy counters, which are root-only unless an administrator makes them readable (see [CPU power](#cpu-power)).
   - **GPU:** the discrete GPU (or the only one) with a utilization graph, utilization, VRAM use and fan speed where the driver reports them, and a row per other GPU. NVIDIA GPUs of the proprietary driver report through NVML; `amdgpu` through sysfs (`gpu_busy_percent`, `mem_info_vram_*`, hwmon power and fan); `nouveau` reports power and fan; Intel GPUs report none of these. A runtime-suspended GPU is never woken to be read.
   - **Memory:** a graph of RAM use, the RAM and swap gauges, plus RAM modules via EDAC sysfs when available.
   - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak, and a row per other interface.
@@ -90,6 +90,19 @@ echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf
 Restart `tuxctl` afterwards: it looks for new sensors at startup. To undo, delete `/etc/modules-load.d/drivetemp.conf`.
 
 > **Hard disks:** per the [kernel documentation](https://docs.kernel.org/hwmon/drivetemp.html), reading the temperature may reset the spin-down timer on some drives (observed with WD120EFAX). `tuxctl` reads it every 2 seconds, so such a drive would never spin down. SSDs do not spin, so this does not concern them. If you rely on hard disks spinning down, leave `drivetemp` unloaded.
+
+#### CPU power
+
+Intel and AMD CPUs report their package energy through RAPL (`/sys/class/powercap/intel-rapl:N/energy_uj`), but since Linux 5.10 only root can read it: unprivileged access allowed a side-channel attack on the CPU (PLATYPUS, CVE-2020-8694). `tuxctl` asks for no privileges. It shows the package power when the counter is readable, computed from the energy used between two readings 2 seconds apart, and nothing otherwise.
+
+To make only the energy counters readable, now and at every boot:
+
+```sh
+echo 'ACTION=="add", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:[0-9]*", RUN+="/usr/bin/chmod a+r /sys%p/energy_uj"' | sudo tee /etc/udev/rules.d/90-rapl-energy.rules
+sudo udevadm trigger --subsystem-match=powercap --action=add
+```
+
+Restart `tuxctl` afterwards. This lets every local user read the energy counters again, and so reopens that side channel; weigh it on a shared machine. To undo, delete the rule and reboot. Some monitors are instead installed with the `cap_dac_read_search` capability (btop, for example), which lets them read every file on the system regardless of its permissions; `tuxctl` does not need or recommend that.
 
 ### Processes
 

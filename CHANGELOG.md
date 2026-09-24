@@ -38,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filesystem instead of only `/`: one line per block device (btrfs
   subvolumes appear once), at most 8, leaving out network, FUSE and loop
   mounts.
-- The CPU card shows package power where a driver reports it without root
-  (the out-of-tree `zenpower`); RAPL energy counters are root-only.
+- The CPU card shows package power where this user can read it: from the
+  out-of-tree `zenpower`, or from RAPL energy counters, which are root-only
+  unless an administrator makes them readable (the README shows a narrow
+  udev rule and its security trade-off). `tuxctl` asks for no privileges.
 - Graphs keep 240 samples instead of 60 and show as many as fit the card.
   The Network graph follows the interface in the card's title rather than
   the sum of all listed interfaces.
