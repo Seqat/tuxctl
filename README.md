@@ -66,7 +66,7 @@ A temperature appears next to a component only when the kernel provides a sensor
 | NVIDIA GPU, `nouveau` | `nouveau` hwmon |
 | NVIDIA GPU, proprietary driver | NVML (`libnvidia-ml.so.1`, installed with the driver); not in the static release binaries |
 | NVMe | `nvme` hwmon (`Composite`) |
-| SATA / SAS | `drivetemp` hwmon, only when that module is loaded (`modprobe drivetemp`) |
+| SATA / SAS | `drivetemp` hwmon, only when that module is loaded (see the note below) |
 | Network adapter | A hwmon sensor on the adapter or on its PHY |
 
 RAM (SPD) sensors are not shown.
@@ -74,6 +74,17 @@ RAM (SPD) sensors are not shown.
 **NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML, which `tuxctl` loads only when it finds a GPU using the `nvidia` driver. NVML is expensive in memory: on the reference machine below it adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. `--no-nvidia-temperature` leaves NVML unloaded. The static release binaries cannot load NVML at all, so they show no temperature for these GPUs; use a glibc build, such as one built with `cargo install`.
 
 **Runtime power management.** `tuxctl` never wakes a sleeping GPU: it reads `power/runtime_status` first and shows `–` while the GPU is suspended. NVML stays initialized only when the GPU cannot runtime-suspend anyway (`power/control` is `on`, or the driver reports `Runtime D3 status` as not supported or disabled). With RTD3 enabled, as on many hybrid laptops, NVML is initialized for each reading and shut down right after, and only while every NVIDIA GPU is awake, so `tuxctl` never keeps the GPU powered.
+
+**SATA and SAS disks.** Their temperature needs the kernel's `drivetemp` module, which ships with the kernel but is usually not loaded. It is optional: without it `tuxctl` works normally and shows no temperature for these disks. `tuxctl` never loads it for you. To load it now and at every boot:
+
+```sh
+sudo modprobe drivetemp
+echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf
+```
+
+Restart `tuxctl` afterwards: it looks for new sensors at startup. To undo, delete `/etc/modules-load.d/drivetemp.conf`.
+
+> **Hard disks:** per the [kernel documentation](https://docs.kernel.org/hwmon/drivetemp.html), reading the temperature may reset the spin-down timer on some drives (observed with WD120EFAX). `tuxctl` reads it every 2 seconds, so such a drive would never spin down. SSDs do not spin, so this does not concern them. If you rely on hard disks spinning down, leave `drivetemp` unloaded.
 
 ### Processes
 
