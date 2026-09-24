@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     cards::{self, CardGraph, CardTitle, TitleOrder},
-    hardware::{device_temperature, temperature_span},
+    hardware::{device_temperature, temperature_span, NIC_DEFAULT_LIMIT},
     layout, network,
     overview::CardHeight,
 };
@@ -58,7 +58,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         let (state, style) = network::state_display(interface.operstate);
         parts.push(vec![Span::styled(state, style)]);
         if let Some(temperature) = temperature(interface) {
-            parts.push(vec![temperature_span(temperature)]);
+            parts.push(vec![temperature_span(temperature, NIC_DEFAULT_LIMIT)]);
         }
     }
     let title = CardTitle {
@@ -73,6 +73,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         history,
         scale: peak.max(1.0),
         interval: app.cpu_history_interval(),
+        banded: false,
     };
     let (rows, other_limit) = cards::render_graph_card(
         frame,
@@ -244,7 +245,7 @@ fn network_summary_parts(
     let suffix = traffic.unwrap_or_default();
     let occupied = prefix.chars().count() + state.chars().count() + suffix.chars().count();
     let temperature = temperature
-        .map(temperature_span)
+        .map(|temperature| temperature_span(temperature, NIC_DEFAULT_LIMIT))
         .filter(|span| occupied + 2 + span.content.chars().count() <= width);
     let occupied = occupied
         + temperature

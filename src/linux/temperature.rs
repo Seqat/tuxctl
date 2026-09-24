@@ -45,14 +45,10 @@ pub struct Temperature {
 }
 
 impl Temperature {
-    /// True when the driver provides a limit and the value reaches it.
-    pub fn at_limit(&self) -> bool {
-        self.celsius.is_some_and(|celsius| {
-            [self.max, self.crit]
-                .into_iter()
-                .flatten()
-                .any(|limit| celsius >= limit)
-        })
+    /// The limit the driver reports: the critical temperature, else the
+    /// maximum. Never invented here.
+    pub fn limit(&self) -> Option<i16> {
+        self.crit.or(self.max)
     }
 }
 
@@ -1489,17 +1485,15 @@ mod tests {
     }
 
     #[test]
-    fn at_limit_needs_a_driver_limit() {
-        let temperature = |celsius, max, crit| Temperature {
+    fn the_limit_is_the_critical_temperature_else_the_maximum() {
+        let temperature = |max, crit| Temperature {
             key: TemperatureKey::CpuPackage(0),
-            celsius,
+            celsius: Some(50),
             max,
             crit,
         };
-        assert!(!temperature(Some(99), None, None).at_limit());
-        assert!(!temperature(Some(79), Some(80), None).at_limit());
-        assert!(temperature(Some(80), Some(80), None).at_limit());
-        assert!(temperature(Some(90), None, Some(90)).at_limit());
-        assert!(!temperature(None, Some(80), Some(90)).at_limit());
+        assert_eq!(temperature(Some(80), Some(90)).limit(), Some(90));
+        assert_eq!(temperature(Some(80), None).limit(), Some(80));
+        assert_eq!(temperature(None, None).limit(), None);
     }
 }

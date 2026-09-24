@@ -48,6 +48,7 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
         history: app.memory_history(),
         scale: 100.0,
         interval: app.cpu_history_interval(),
+        banded: true,
     };
     let (rows, module_limit) = cards::render_graph_card(
         frame,
@@ -63,10 +64,10 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
     }
     let width = usize::from(rows.width);
     let usage = app.system_metrics().memory.map_or_else(
-        || "RAM  N/A".into(),
-        |memory| usage_bar_line("RAM  ", memory, width),
+        || Line::from(layout::truncate("RAM  N/A", width)),
+        |memory| usage_bar("RAM  ", memory, width, true),
     );
-    let mut lines = vec![Line::from(layout::truncate(&usage, width))];
+    let mut lines = vec![usage];
     if let Some(inventory) = app.hardware() {
         lines.extend(
             inventory
@@ -85,24 +86,64 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
     frame.render_widget(Paragraph::new(lines), rows);
 }
 
-/// Formats `<label>N%  [bar]  used / total`, dropping the bar when it would be too narrow.
-pub(super) fn usage_bar_line(label: &str, usage: crate::linux::ByteUsage, width: usize) -> String {
+/// `<label>N%  [bar]  used / total`, dropping the bar when it would be too
+/// narrow. With `banded`, the percentage and the bar take the utilization
+/// band of the value.
+pub(super) fn usage_bar(
+    label: &str,
+    usage: crate::linux::ByteUsage,
+    width: usize,
+    banded: bool,
+) -> Line<'static> {
     let percent = usage.percent();
+    let style = band_style(Some(percent), banded);
     let percent_text = format!("{percent:.0}%");
     let usage = format_usage_compact(usage.used, usage.total);
     let fixed_width =
         label.chars().count() + percent_text.chars().count() + 4 + usage.chars().count();
-    let gauge_width = width.saturating_sub(fixed_width).min(MAX_RAM_GAUGE_WIDTH);
-    if gauge_width < 4 {
-        return layout::truncate(&format!("{label}{percent_text}  {usage}"), width);
+    if fixed_width > width {
+        return Line::from(layout::truncate(
+            &format!("{label}{percent_text}  {usage}"),
+            width,
+        ));
     }
-    layout::truncate(
-        &format!(
-            "{label}{percent_text}  {}  {usage}",
-            utilization_bar(Some(percent), gauge_width)
-        ),
-        width,
-    )
+    let mut spans = vec![
+        Span::raw(label.to_owned()),
+        Span::styled(percent_text, style),
+        Span::raw("  "),
+    ];
+    let gauge_width = (width - fixed_width).min(MAX_RAM_GAUGE_WIDTH);
+    if gauge_width >= 4 {
+        spans.extend(bar_spans(Some(percent), gauge_width, style));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::raw(usage));
+    Line::from(spans)
+}
+
+/// The utilization band of `percent` when `banded`; unstyled otherwise or
+/// without a value.
+pub(super) fn band_style(percent: Option<f64>, banded: bool) -> Style {
+    match percent {
+        Some(percent) if banded => Style::default().fg(theme::band(percent)),
+        _ => Style::default(),
+    }
+}
+
+/// A gauge as its filled part, in `style`, and its empty part.
+pub(super) fn bar_spans(percent: Option<f64>, width: usize, style: Style) -> [Span<'static>; 2] {
+    let filled = filled_cells(percent, width);
+    [
+        Span::styled("█".repeat(filled), style),
+        Span::raw("░".repeat(width - filled)),
+    ]
+}
+
+fn filled_cells(percent: Option<f64>, width: usize) -> usize {
+    percent
+        .map(|percent| ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize)
+        .unwrap_or(0)
+        .min(width)
 }
 
 /// The GPU the card is about: the first discrete one, else the first.
@@ -131,7 +172,7 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
         model: primary.map_or("", |(_, gpu)| gpu.model.as_str()),
         parts: primary
             .and_then(|(_, gpu)| device_temperature(metrics, gpu.device_path.as_ref()))
-            .map(|temperature| vec![vec![temperature_span(temperature)]])
+            .map(|temperature| vec![vec![temperature_span(temperature, GPU_DEFAULT_LIMIT)]])
             .unwrap_or_default(),
         order: TitleOrder::ModelFirst,
     };
@@ -169,7 +210,7 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect) {
                 line_with_temperatures(
                     &text,
                     device_temperature(metrics, gpu.device_path.as_ref())
-                        .map(|temperature| vec![temperature_span(temperature)]),
+                        .map(|temperature| vec![temperature_span(temperature, GPU_DEFAULT_LIMIT)]),
                     width,
                 )
             }));
@@ -238,7 +279,7 @@ pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
     let mount_line = |width: usize| -> Vec<Line<'static>> {
         metrics
             .root_filesystem
-            .map(|usage| Line::from(usage_bar_line("/  ", usage, width)))
+            .map(|usage| usage_bar("/  ", usage, width, false))
             .into_iter()
             .collect()
     };
@@ -299,6 +340,11 @@ fn device_lines(
                         description: format_storage_device(label, index, device),
                         rates: disk_rates(metrics, &device.system_name),
                         temperature: device_temperature(metrics, device.device_path.as_ref()),
+                        default_limit: if device.kind == StorageKind::Nvme {
+                            NVME_DEFAULT_LIMIT
+                        } else {
+                            DISK_DEFAULT_LIMIT
+                        },
                     }
                 })
                 .collect();
@@ -334,18 +380,28 @@ pub(super) fn temperature_text(temperature: &Temperature) -> String {
 }
 
 /// Highlighted only when the driver reports a limit and the value reaches it.
-pub(super) fn temperature_style(temperature: &Temperature) -> Style {
-    if temperature.at_limit() {
-        Style::default().fg(theme::WARNING)
-    } else {
-        Style::default()
-    }
+/// Critical temperatures assumed, per component type, when the driver
+/// reports no limit (documented in the README). They only color values.
+pub(super) const CPU_DEFAULT_LIMIT: i16 = 95;
+pub(super) const GPU_DEFAULT_LIMIT: i16 = 95;
+pub(super) const NVME_DEFAULT_LIMIT: i16 = 80;
+pub(super) const DISK_DEFAULT_LIMIT: i16 = 60;
+pub(super) const NIC_DEFAULT_LIMIT: i16 = 100;
+
+/// The utilization band of the value as a share of its limit: the driver's
+/// critical or maximum temperature, else `default_limit`. `–` is muted.
+pub(super) fn temperature_style(temperature: &Temperature, default_limit: i16) -> Style {
+    let Some(celsius) = temperature.celsius else {
+        return Style::default().fg(theme::MUTED);
+    };
+    let limit = temperature.limit().unwrap_or(default_limit).max(1);
+    Style::default().fg(theme::band(f64::from(celsius) / f64::from(limit) * 100.0))
 }
 
-pub(super) fn temperature_span(temperature: &Temperature) -> Span<'static> {
+pub(super) fn temperature_span(temperature: &Temperature, default_limit: i16) -> Span<'static> {
     Span::styled(
         temperature_text(temperature),
-        temperature_style(temperature),
+        temperature_style(temperature, default_limit),
     )
 }
 
@@ -376,10 +432,7 @@ pub(super) fn line_with_temperatures(
 }
 
 pub(super) fn utilization_bar(percent: Option<f64>, width: usize) -> String {
-    let filled = percent
-        .map(|percent| ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize)
-        .unwrap_or(0)
-        .min(width);
+    let filled = filled_cells(percent, width);
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
@@ -449,6 +502,8 @@ struct StorageRow<'a> {
     description: String,
     rates: DiskRates,
     temperature: Option<&'a Temperature>,
+    /// The critical temperature assumed for this kind of disk.
+    default_limit: i16,
 }
 
 /// Storage rows: the description, a temperature column and the rates, each
@@ -482,7 +537,10 @@ fn storage_lines(rows: &[StorageRow], width: usize) -> Vec<Line<'static>> {
         .unwrap_or(0);
     let temperatures: Vec<Option<Span<'static>>> = rows
         .iter()
-        .map(|row| row.temperature.map(temperature_span))
+        .map(|row| {
+            row.temperature
+                .map(|temperature| temperature_span(temperature, row.default_limit))
+        })
         .collect();
     let temperature_width = temperatures
         .iter()
@@ -601,8 +659,8 @@ mod tests {
             used: 8 * 1024 * 1024 * 1024,
             total: 32 * 1024 * 1024 * 1024,
         };
-        let wide = usage_bar_line("Used  ", memory, 100);
-        let narrow = usage_bar_line("Used  ", memory, 32);
+        let wide = usage_bar("Used  ", memory, 100, false).to_string();
+        let narrow = usage_bar("Used  ", memory, 32, false).to_string();
 
         assert_eq!(wide.matches(['█', '░']).count(), MAX_RAM_GAUGE_WIDTH);
         let percent = wide.find("25%").unwrap();
@@ -807,6 +865,7 @@ mod tests {
                 description: description.clone(),
                 rates: *rates,
                 temperature: None,
+                default_limit: NVME_DEFAULT_LIMIT,
             })
             .collect();
         storage_lines(&rows, width).iter().map(line_text).collect()
@@ -903,11 +962,13 @@ mod tests {
                 description: "NVMe0  WD Blue SN5100 1TB  1.0 TB".into(),
                 rates: Some((Some(12.3 * MIB), Some(0.0))),
                 temperature: Some(&hot),
+                default_limit: NVME_DEFAULT_LIMIT,
             },
             StorageRow {
                 description: "SATA0  Samsung SSD 870  2.0 TB".into(),
                 rates: Some((Some(0.0), Some(512.0 * 1024.0))),
                 temperature: None,
+                default_limit: NVME_DEFAULT_LIMIT,
             },
         ];
 
@@ -969,32 +1030,84 @@ mod tests {
             description: "NVMe0  disk".into(),
             rates: None,
             temperature: Some(&asleep),
+            default_limit: NVME_DEFAULT_LIMIT,
         }];
         let lines: Vec<String> = storage_lines(&rows, 40).iter().map(line_text).collect();
         assert_eq!(lines, ["NVMe0  disk  –"]);
     }
 
     #[test]
-    fn temperatures_are_highlighted_only_at_a_driver_limit() {
+    fn temperatures_take_the_band_of_their_share_of_the_limit() {
+        use ratatui::style::Color;
+        let color = |temperature: Temperature, default_limit| {
+            temperature_style(&temperature, default_limit).fg
+        };
+        let with_crit = |celsius, crit| Temperature {
+            crit: Some(crit),
+            ..temperature(Some(celsius), None)
+        };
+        // 45 of a 90 °C critical limit is 50 %: green, whatever the default.
+        assert_eq!(color(with_crit(45, 90), 60), Some(Color::Green));
+        // The driver's maximum stands in for a missing critical limit: 94 %.
         assert_eq!(
-            temperature_style(&temperature(Some(99), None)),
-            Style::default()
+            color(temperature(Some(85), Some(90)), 200),
+            Some(Color::LightRed)
+        );
+        // Without either, the default for the component type applies.
+        assert_eq!(
+            color(temperature(Some(50), None), DISK_DEFAULT_LIMIT),
+            Some(Color::LightRed)
         );
         assert_eq!(
-            temperature_style(&temperature(Some(79), Some(80))),
-            Style::default()
+            color(temperature(Some(50), None), CPU_DEFAULT_LIMIT),
+            Some(Color::Green)
         );
         assert_eq!(
-            temperature_style(&temperature(Some(80), Some(80))),
-            Style::default().fg(theme::WARNING)
+            color(temperature(Some(96), None), CPU_DEFAULT_LIMIT),
+            Some(Color::Red)
         );
+        assert_eq!(
+            color(temperature(Some(5), None), CPU_DEFAULT_LIMIT),
+            Some(Color::LightBlue)
+        );
+        // A sensor without a value shows a muted `–`.
+        assert_eq!(color(temperature(None, Some(80)), 60), Some(theme::MUTED));
         assert_eq!(temperature_text(&temperature(Some(-5), None)), "-5°C");
         assert_eq!(temperature_text(&temperature(None, None)), "–");
     }
 
     #[test]
+    fn ram_usage_is_banded_and_filesystem_usage_is_not() {
+        use ratatui::style::Color;
+        let usage = crate::linux::ByteUsage {
+            used: 85 << 30,
+            total: 100 << 30,
+        };
+        let banded = usage_bar("RAM  ", usage, 60, true);
+        let percent = banded
+            .spans
+            .iter()
+            .find(|span| span.content == "85%")
+            .unwrap();
+        assert_eq!(percent.style.fg, Some(Color::LightRed));
+        let fill = banded
+            .spans
+            .iter()
+            .find(|span| span.content.starts_with('█'))
+            .unwrap();
+        assert_eq!(fill.style.fg, Some(Color::LightRed));
+        let plain = usage_bar("/  ", usage, 60, false);
+        assert!(plain.spans.iter().all(|span| span.style.fg.is_none()));
+    }
+
+    #[test]
     fn row_temperatures_outlast_the_text_until_it_would_be_too_short() {
-        let spans = || Some(vec![temperature_span(&temperature(Some(52), None))]);
+        let spans = || {
+            Some(vec![temperature_span(
+                &temperature(Some(52), None),
+                GPU_DEFAULT_LIMIT,
+            )])
+        };
         let model = "NVIDIA GeForce RTX 4070  dGPU  12 GiB VRAM";
         assert_eq!(
             line_text(&line_with_temperatures(model, spans(), 80)),

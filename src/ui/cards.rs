@@ -232,6 +232,20 @@ pub(super) struct CardGraph<'a> {
     pub history: &'a MetricHistory,
     pub scale: f64,
     pub interval: Duration,
+    /// Utilization graphs color each column by its band; throughput graphs
+    /// have no percentage and stay neutral.
+    pub banded: bool,
+}
+
+impl CardGraph<'_> {
+    fn widget(&self) -> Graph<'_> {
+        let graph = Graph::new(self.history, self.scale);
+        if self.banded {
+            graph.banded()
+        } else {
+            graph
+        }
+    }
 }
 
 /// Draws a card with an optional graph, above its rows (and a blank row) when
@@ -271,7 +285,7 @@ pub(super) fn render_graph_card(
     if let Some(graph) = &graph {
         if graph_rows > 0 {
             frame.render_widget(
-                Graph::new(graph.history, graph.scale),
+                graph.widget(),
                 Rect::new(
                     inner.x,
                     inner.y,
@@ -284,7 +298,7 @@ pub(super) fn render_graph_card(
             // graph never reads as part of the border (the title already
             // ends with a space).
             frame.render_widget(Clear, Rect::new(rect.x, rect.y, rect.width + 1, 1));
-            frame.render_widget(Graph::new(graph.history, graph.scale), rect);
+            frame.render_widget(graph.widget(), rect);
         }
     }
     let rows = padded(Rect::new(

@@ -38,12 +38,28 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - **Storage:** root filesystem usage, and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
   - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU and memory.
   - Graphs cover the last 60 samples; the bottom border of each card states the time span they cover.
+
+#### Colors
+
+Utilization values (total and per-CPU utilization, RAM) and the columns of the CPU and memory graphs take a color band: light blue below 10 %, green below 65 %, yellow below 80 %, orange below 95 %, and red from 95 %. The network graph shows throughput, not a percentage, and stays neutral. Temperatures use the same bands as a share of their critical limit.
+
+`tuxctl` reads `COLORTERM` and `TERM` once at startup: `truecolor`/`24bit` get the full palette, `*256color` terminals the nearest 256-color entries, and anything else the 16 basic colors (where orange becomes bright red).
 - Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
 - Responsive layout by terminal width: 150 columns and more show a 2×2 grid (CPU | GPU, Memory | Network), Storage below it and Pinned as a column on the right; 100–149 columns show the grid with Storage and Pinned side by side below it; narrower terminals stack the cards (CPU, Memory, Pinned, Network, Storage, GPU) with each graph in its card's title row.
 
 #### Temperatures
 
-A temperature appears next to a component only when the kernel provides a sensor for it; components without one show nothing. `–` means the sensor exists but has no value right now, for example while a GPU is runtime-suspended. A value is highlighted only when it reaches a limit reported by the driver (`temp*_max` or `temp*_crit`); `tuxctl` does not invent thresholds. Sensors are read at most every 2 seconds, whatever the sampling interval.
+A temperature appears next to a component only when the kernel provides a sensor for it; components without one show nothing. `–` means the sensor exists but has no value right now, for example while a GPU is runtime-suspended. Sensors are read at most every 2 seconds, whatever the sampling interval.
+
+The number takes the color band of its share of the component's critical temperature (see [Colors](#colors)): the limit the driver reports (`temp*_crit`, else `temp*_max`), or, when it reports none, an assumed limit per component type. The value itself is always shown, so the color never carries meaning alone.
+
+| Component | Assumed critical temperature |
+| --- | --- |
+| CPU | 95 °C |
+| GPU | 95 °C |
+| NVMe | 80 °C |
+| SATA / SAS and other disks | 60 °C |
+| Network adapter | 100 °C |
 
 | Component | Source |
 | --- | --- |

@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Pinned on the right; at 100–149 columns Storage and Pinned sit side by
   side under the grid; narrower terminals stack the cards in priority order.
   Hostname, kernel, uptime and process counts moved into the top border.
+- Utilization values, the CPU and memory graphs (column by column) and
+  temperatures are colored by band: light blue below 10 %, green below 65 %,
+  yellow below 80 %, orange below 95 %, red above. Temperatures are placed
+  as a share of the driver's critical or maximum temperature, or of an
+  assumed limit per component type when the driver reports none (CPU and
+  GPU 95 °C, NVMe 80 °C, other disks 60 °C, network adapters 100 °C); this
+  replaces the highlight that only appeared at a driver limit. The colors
+  follow what the terminal supports (`COLORTERM`, `TERM`): true color, 256
+  colors, or the 16 basic colors.
 
 ## [0.3.3] - 2026-09-24
 

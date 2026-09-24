@@ -5,13 +5,17 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::Widget};
 
 use crate::app::MetricHistory;
 
+use super::theme;
+
 const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
 pub(super) struct Graph<'a> {
     history: &'a MetricHistory,
     /// The value drawn as a full column.
     scale: f64,
-    style: Style,
+    /// Each column takes the utilization band of its own value; otherwise the
+    /// graph is neutral (for values without a meaningful percentage).
+    banded: bool,
 }
 
 impl<'a> Graph<'a> {
@@ -19,8 +23,14 @@ impl<'a> Graph<'a> {
         Self {
             history,
             scale,
-            style: Style::default(),
+            banded: false,
         }
+    }
+
+    /// Colors each column by the band of its value as a share of `scale`.
+    pub(super) fn banded(mut self) -> Self {
+        self.banded = true;
+        self
     }
 }
 
@@ -50,6 +60,11 @@ impl Widget for Graph<'_> {
             // Every sample shows at least its baseline, so a quiet metric still
             // reads as measured rather than missing.
             let eighths = ((fraction * (rows * 8) as f64).round() as usize).max(1);
+            let style = if self.banded {
+                Style::default().fg(theme::band(fraction * 100.0))
+            } else {
+                Style::default()
+            };
             let x = first_column + offset as u16;
             for row in 0..rows {
                 let filled = eighths.saturating_sub(row * 8).min(8);
@@ -57,9 +72,7 @@ impl Widget for Graph<'_> {
                     break;
                 }
                 let y = area.bottom() - 1 - row as u16;
-                buf[(x, y)]
-                    .set_symbol(LEVELS[filled - 1])
-                    .set_style(self.style);
+                buf[(x, y)].set_symbol(LEVELS[filled - 1]).set_style(style);
             }
         }
     }
@@ -118,5 +131,33 @@ mod tests {
             ["█"],
             "values above the scale are capped"
         );
+    }
+
+    #[test]
+    fn banded_columns_take_the_color_of_their_own_value() {
+        use ratatui::style::Color;
+        let history = history(&[5.0, 50.0, 70.0, 90.0, 99.0]);
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buffer = Buffer::empty(area);
+        Graph::new(&history, 100.0)
+            .banded()
+            .render(area, &mut buffer);
+        let bottom: Vec<Color> = (0..5).map(|x| buffer[(x, 1)].fg).collect();
+        assert_eq!(
+            bottom,
+            [
+                Color::LightBlue,
+                Color::Green,
+                Color::Yellow,
+                Color::LightRed,
+                Color::Red
+            ]
+        );
+        // Every cell of a column shares its color.
+        assert_eq!(buffer[(4, 0)].fg, Color::Red);
+
+        let mut neutral = Buffer::empty(area);
+        Graph::new(&history, 100.0).render(area, &mut neutral);
+        assert!((0..5).all(|x| neutral[(x, 1)].fg == Color::Reset));
     }
 }

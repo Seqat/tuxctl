@@ -14,6 +14,8 @@ mod sparkline;
 mod status;
 mod theme;
 
+pub use theme::{init_color_depth, ColorDepth};
+
 use std::sync::Arc;
 
 use ratatui::{
@@ -1671,7 +1673,8 @@ mod tests {
         assert!(row("Test Disk").contains("1 TB  –"), "{}", row("Test Disk"));
         assert!(row("eth0").contains("47°C"));
 
-        // The GPU is at its driver limit; nothing else is highlighted.
+        // Temperatures take the band of their share of the limit: the GPU is
+        // past its driver's 95 °C, the CPU at 54 of an assumed 95 °C.
         let buffer = terminal.backend().buffer();
         let style_of = |text: &str| {
             let (y, line) = buffer
@@ -1684,8 +1687,8 @@ mod tests {
             let x = line[..line.find(text).unwrap()].chars().count();
             buffer[(x as u16, y as u16)].fg
         };
-        assert_eq!(style_of("100°C"), theme::WARNING);
-        assert_ne!(style_of("54°C"), theme::WARNING);
+        assert_eq!(style_of("100°C"), ratatui::style::Color::Red);
+        assert_eq!(style_of("54°C"), ratatui::style::Color::Green);
     }
 
     #[test]

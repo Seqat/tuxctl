@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     cards::{self, CardGraph, CardTitle, TitleOrder},
-    hardware::{temperature_span, utilization_bar},
+    hardware::{band_style, bar_spans, temperature_span, CPU_DEFAULT_LIMIT},
     layout,
     overview::CardHeight,
 };
@@ -85,6 +85,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         history: app.aggregate_cpu_history(),
         scale: 100.0,
         interval: app.cpu_history_interval(),
+        banded: true,
     };
     let grid_rows = full_grid_rows(metrics, cards::padded_width(area.width.saturating_sub(2)));
     let (rows, grid_limit) =
@@ -93,13 +94,9 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         return;
     }
     let width = usize::from(rows.width);
-    let mut lines = vec![Line::from(summary_line(metrics, width))];
+    let mut lines = vec![summary_line(metrics, width)];
     let grid = grid_for_rows(metrics, width, usize::from(grid_limit));
-    lines.extend(
-        cpu_grid_lines(&metrics.logical_cpus, width, grid)
-            .into_iter()
-            .map(Line::from),
-    );
+    lines.extend(cpu_grid_lines(&metrics.logical_cpus, width, grid));
     if grid_limit > 0 && grid.visible < metrics.logical_cpus.len() {
         lines.push(Line::from(format!(
             "… {} more logical CPUs",
@@ -109,33 +106,46 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
     frame.render_widget(Paragraph::new(lines), rows);
 }
 
-/// `Util  12%   Load  1m 0.52  5m 0.44  15m 0.29`, or a compact form.
-fn summary_line(metrics: &SystemMetrics, width: usize) -> String {
+/// `Util  12%   Load  1m 0.52  5m 0.44  15m 0.29`, or a compact form; the
+/// utilization takes its band.
+fn summary_line(metrics: &SystemMetrics, width: usize) -> Line<'static> {
     let percent = format_percent(metrics.cpu_percent);
-    let (full, compact) = metrics.load_average.map_or_else(
-        || {
-            (
-                format!("Util {percent:>4}   Load  N/A"),
-                format!("Util {percent}  Load N/A"),
-            )
-        },
+    let style = band_style(metrics.cpu_percent, true);
+    let (full_load, compact_load) = metrics.load_average.map_or_else(
+        || ("   Load  N/A".to_owned(), "  Load N/A".to_owned()),
         |load| {
             (
                 format!(
-                    "Util {percent:>4}   Load  1m {:.2}  5m {:.2}  15m {:.2}",
+                    "   Load  1m {:.2}  5m {:.2}  15m {:.2}",
                     load.one, load.five, load.fifteen
                 ),
                 format!(
-                    "Util {percent}  Load {:.2} {:.2} {:.2}",
+                    "  Load {:.2} {:.2} {:.2}",
                     load.one, load.five, load.fifteen
                 ),
             )
         },
     );
-    if full.chars().count() <= width {
-        full
+    let full = Line::from(vec![
+        Span::raw("Util "),
+        Span::styled(format!("{percent:>4}"), style),
+        Span::raw(full_load),
+    ]);
+    if full.width() <= width {
+        return full;
+    }
+    let compact = Line::from(vec![
+        Span::raw("Util "),
+        Span::styled(percent.clone(), style),
+        Span::raw(compact_load.clone()),
+    ]);
+    if compact.width() <= width {
+        compact
     } else {
-        layout::truncate(&compact, width)
+        Line::from(layout::truncate(
+            &format!("Util {percent}{compact_load}"),
+            width,
+        ))
     }
 }
 
@@ -153,7 +163,7 @@ fn package_temperatures(metrics: &SystemMetrics) -> Option<Vec<Span<'static>>> {
     packages.sort_by_key(|(package, _)| *package);
     match packages.as_slice() {
         [] => None,
-        [(_, temperature)] => Some(vec![temperature_span(temperature)]),
+        [(_, temperature)] => Some(vec![temperature_span(temperature, CPU_DEFAULT_LIMIT)]),
         _ => Some(
             packages
                 .iter()
@@ -162,7 +172,7 @@ fn package_temperatures(metrics: &SystemMetrics) -> Option<Vec<Span<'static>>> {
                     let separator = if index == 0 { "" } else { "  " };
                     [
                         Span::raw(format!("{separator}P{package} ")),
-                        temperature_span(temperature),
+                        temperature_span(temperature, CPU_DEFAULT_LIMIT),
                     ]
                 })
                 .collect(),
@@ -223,7 +233,11 @@ fn columns_that_fit(width: usize, cell_width: usize, gap: usize) -> usize {
     width.saturating_add(gap) / cell_width.saturating_add(gap)
 }
 
-fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
+fn cpu_grid_lines(
+    cpus: &[LogicalCpuMetrics],
+    width: usize,
+    grid: CpuGridLayout,
+) -> Vec<Line<'static>> {
     if grid.columns == 0 || grid.visible == 0 {
         return Vec::new();
     }
@@ -235,7 +249,6 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
     };
     let total_gap = gap_width.saturating_mul(grid.columns.saturating_sub(1));
     let cell_width = width.saturating_sub(total_gap) / grid.columns;
-    let gap = " ".repeat(gap_width);
     let label_width = cpus[..grid.visible]
         .iter()
         .map(|cpu| format!("CPU{}", cpu.id.index()).chars().count())
@@ -245,47 +258,76 @@ fn cpu_grid_lines(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout)
     let rows = grid.visible.div_ceil(grid.columns);
     (0..rows)
         .map(|row| {
-            (0..grid.columns)
-                .filter_map(|column| cpus[..grid.visible].get(column * rows + row))
-                .map(|cpu| {
-                    let text = if grid.dense {
-                        dense_cpu_cell(cpu, cell_width, label_width)
-                    } else {
-                        detailed_cpu_cell(cpu, cell_width, label_width)
-                    };
-                    pad_cell(&layout::truncate(&text, cell_width), cell_width)
-                })
-                .collect::<Vec<_>>()
-                .join(&gap)
+            let mut spans = Vec::new();
+            let cells = (0..grid.columns)
+                .filter_map(|column| cpus[..grid.visible].get(column * rows + row));
+            for (index, cpu) in cells.enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" ".repeat(gap_width)));
+                }
+                let cell = if grid.dense {
+                    dense_cpu_cell(cpu, cell_width, label_width)
+                } else {
+                    detailed_cpu_cell(cpu, cell_width, label_width)
+                };
+                spans.extend(fit_cell(cell, cell_width));
+            }
+            Line::from(spans)
         })
         .collect()
 }
 
-fn detailed_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize) -> String {
-    let label = format!("CPU{}", cpu.id.index());
-    let percent = format_percent(cpu.utilization_percent);
-    let fixed_width = label_width + 6;
-    let gauge_width = cell_width.saturating_sub(fixed_width);
-    if gauge_width < MIN_USEFUL_CPU_GAUGE_WIDTH {
-        return layout::truncate(&format!("{label:<label_width$} {percent:>4}"), cell_width);
+/// A cell's spans padded to exactly `width`; a cell that would not fit
+/// becomes its plain text, truncated.
+fn fit_cell(cell: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let used: usize = cell.iter().map(Span::width).sum();
+    if used > width {
+        let text: String = cell.iter().map(|span| span.content.as_ref()).collect();
+        return vec![Span::raw(pad_cell(&layout::truncate(&text, width), width))];
     }
-    format!(
-        "{label:<label_width$} {percent:>4} {}",
-        utilization_bar(cpu.utilization_percent, gauge_width)
-    )
+    let mut cell = cell;
+    cell.push(Span::raw(" ".repeat(width - used)));
+    cell
 }
 
-fn dense_cpu_cell(cpu: &LogicalCpuMetrics, cell_width: usize, label_width: usize) -> String {
+fn detailed_cpu_cell(
+    cpu: &LogicalCpuMetrics,
+    cell_width: usize,
+    label_width: usize,
+) -> Vec<Span<'static>> {
     let label = format!("CPU{}", cpu.id.index());
     let percent = format_percent(cpu.utilization_percent);
-    if cell_width < dense_cell_width(label_width) {
-        // No room for the level glyph; keep the separator and the value.
-        return format!("{label:<label_width$} {percent:>4}");
+    let style = band_style(cpu.utilization_percent, true);
+    let mut spans = vec![
+        Span::raw(format!("{label:<label_width$} ")),
+        Span::styled(format!("{percent:>4}"), style),
+    ];
+    let gauge_width = cell_width.saturating_sub(label_width + 6);
+    if gauge_width >= MIN_USEFUL_CPU_GAUGE_WIDTH {
+        spans.push(Span::raw(" "));
+        spans.extend(bar_spans(cpu.utilization_percent, gauge_width, style));
     }
-    format!(
-        "{label:<label_width$} {}{percent:>4}",
-        utilization_level(cpu.utilization_percent)
-    )
+    spans
+}
+
+fn dense_cpu_cell(
+    cpu: &LogicalCpuMetrics,
+    cell_width: usize,
+    label_width: usize,
+) -> Vec<Span<'static>> {
+    let label = format!("CPU{}", cpu.id.index());
+    let percent = format_percent(cpu.utilization_percent);
+    let style = band_style(cpu.utilization_percent, true);
+    let mut spans = vec![Span::raw(format!("{label:<label_width$} "))];
+    // The level glyph needs a column more; without it the value stays.
+    if cell_width >= dense_cell_width(label_width) {
+        spans.push(Span::styled(
+            utilization_level(cpu.utilization_percent).to_string(),
+            style,
+        ));
+    }
+    spans.push(Span::styled(format!("{percent:>4}"), style));
+    spans
 }
 
 /// Compact span: `15s`, `90s`, `2m`, `2m30s`, `1h`; sub-second parts as `4.8s`.
@@ -397,6 +439,54 @@ mod tests {
         ] {
             assert_eq!(format_window(window), text);
         }
+    }
+
+    fn cell_text(spans: Vec<Span<'static>>) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn grid_text(cpus: &[LogicalCpuMetrics], width: usize, grid: CpuGridLayout) -> Vec<String> {
+        cpu_grid_lines(cpus, width, grid)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn utilization_values_and_gauges_take_their_band() {
+        use ratatui::style::Color;
+        let cpu = |percent| LogicalCpuMetrics {
+            id: crate::linux::LogicalCpuId::for_test(0),
+            utilization_percent: Some(percent),
+        };
+        let styles = |spans: Vec<Span<'static>>| {
+            spans
+                .into_iter()
+                .filter_map(|span| span.style.fg)
+                .collect::<Vec<_>>()
+        };
+        // Percentage and gauge fill share the band; the label does not.
+        assert_eq!(
+            styles(detailed_cpu_cell(&cpu(50.0), 24, 5)),
+            [Color::Green; 2]
+        );
+        assert_eq!(
+            styles(detailed_cpu_cell(&cpu(97.0), 24, 5)),
+            [Color::Red; 2]
+        );
+        assert_eq!(
+            styles(dense_cpu_cell(&cpu(70.0), 11, 5)),
+            [Color::Yellow; 2]
+        );
+        let unknown = LogicalCpuMetrics {
+            utilization_percent: None,
+            ..cpu(0.0)
+        };
+        assert!(styles(detailed_cpu_cell(&unknown, 24, 5)).is_empty());
+
+        let app = app_with(1, Vec::new());
+        let summary = summary_line(app.system_metrics(), 60);
+        assert_eq!(summary.spans[1].style.fg, Some(Color::Green), "Util 12%");
     }
 
     fn cpus(count: u32) -> Vec<LogicalCpuMetrics> {
@@ -540,11 +630,14 @@ mod tests {
         let app = app_with(1, Vec::new());
         let metrics = app.system_metrics();
         assert_eq!(
-            summary_line(metrics, 60),
+            summary_line(metrics, 60).to_string(),
             "Util  12%   Load  1m 0.52  5m 0.44  15m 0.29"
         );
-        assert_eq!(summary_line(metrics, 34), "Util 12%  Load 0.52 0.44 0.29");
-        assert_eq!(summary_line(metrics, 10).chars().count(), 10);
+        assert_eq!(
+            summary_line(metrics, 34).to_string(),
+            "Util 12%  Load 0.52 0.44 0.29"
+        );
+        assert_eq!(summary_line(metrics, 10).to_string().chars().count(), 10);
     }
 
     #[test]
@@ -552,7 +645,7 @@ mod tests {
         let cpus = cpus(10);
         let grid = cpu_grid_layout(10, 9, 120, 6);
         assert_eq!(grid.columns, 4);
-        let lines = cpu_grid_lines(&cpus, 120, grid);
+        let lines = grid_text(&cpus, 120, grid);
         assert_eq!(lines.len(), 3);
         let labels = |line: &str| {
             line.split_whitespace()
@@ -576,7 +669,7 @@ mod tests {
                 utilization_percent: Some(48.0),
             })
             .collect::<Vec<_>>();
-        let lines = cpu_grid_lines(&cpus, 120, grid);
+        let lines = grid_text(&cpus, 120, grid);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].matches(['█', '░']).count() >= 4 * MIN_USEFUL_CPU_GAUGE_WIDTH);
         assert!(lines[2].contains("CPU8"));
@@ -598,7 +691,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let grid = cpu_grid_layout(2, 1, 44, 2);
-        let line = &cpu_grid_lines(&cpus, 44, grid)[0];
+        let line = &grid_text(&cpus, 44, grid)[0];
         let cell_width = (44 - CPU_CELL_GAP) / 2;
 
         assert_eq!(line.chars().count(), 44);
@@ -621,14 +714,14 @@ mod tests {
     #[test]
     fn logical_cpu_percentages_and_gauges_align() {
         let cells = [1.0, 10.0, 100.0].map(|percent| {
-            detailed_cpu_cell(
+            cell_text(detailed_cpu_cell(
                 &LogicalCpuMetrics {
                     id: crate::linux::LogicalCpuId::for_test(0),
                     utilization_percent: Some(percent),
                 },
                 24,
                 5,
-            )
+            ))
         });
         let gauge_starts = cells.clone().map(|cell| {
             cell.chars()

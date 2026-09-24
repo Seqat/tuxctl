@@ -52,6 +52,10 @@ fn main() -> io::Result<()> {
         }
     };
     let periods = CollectorPeriods::for_sampling_interval(interval);
+    ui::init_color_depth(ui::ColorDepth::detect(
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    ));
     let shutdown = shutdown::Shutdown::install()?;
 
     let main_thread = std::thread::current().id();
