@@ -22,6 +22,29 @@ pub(super) const GRAPH_ROWS: u16 = 4;
 const SEPARATOR: &str = " · ";
 /// An inline graph in a title row is left out when narrower than this.
 const MIN_INLINE_GRAPH_WIDTH: u16 = 6;
+/// Cards at least this wide keep a blank column between their text and
+/// each side border.
+const MIN_PADDED_WIDTH: u16 = 20;
+
+/// The width left for a card's text rows inside `inner_width`.
+pub(super) fn padded_width(inner_width: u16) -> u16 {
+    if inner_width >= MIN_PADDED_WIDTH {
+        inner_width - 2
+    } else {
+        inner_width
+    }
+}
+
+/// The area for a card's text rows: `inner` less a blank column on each side.
+pub(super) fn padded(inner: Rect) -> Rect {
+    let width = padded_width(inner.width);
+    Rect::new(
+        inner.x + (inner.width - width) / 2,
+        inner.y,
+        width,
+        inner.height,
+    )
+}
 
 /// Which optional title parts give way first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,9 +234,10 @@ pub(super) struct CardGraph<'a> {
     pub interval: Duration,
 }
 
-/// Draws a card with an optional graph, above its rows when `graphs` is set
-/// and otherwise in the title row. Returns the area for the `fixed` and
-/// optional rows, and how many optional rows it has room for.
+/// Draws a card with an optional graph, above its rows (and a blank row) when
+/// `graphs` is set and otherwise in the title row. Returns the padded area
+/// for the `fixed` and optional rows, and how many optional rows it has room
+/// for.
 pub(super) fn render_graph_card(
     frame: &mut Frame,
     area: Rect,
@@ -241,11 +265,19 @@ pub(super) fn render_graph_card(
         format_window(graph.interval.saturating_mul(samples as u32))
     });
     let inner = render_card(frame, area, title, footer.as_deref());
+    // A blank row between a graph and the rows below it, while the graph
+    // keeps at least two rows.
+    let gap = u16::from(graph_rows >= 3);
     if let Some(graph) = &graph {
         if graph_rows > 0 {
             frame.render_widget(
                 Graph::new(graph.history, graph.scale),
-                Rect::new(inner.x, inner.y, inner.width, graph_rows.min(inner.height)),
+                Rect::new(
+                    inner.x,
+                    inner.y,
+                    inner.width,
+                    (graph_rows - gap).min(inner.height),
+                ),
             );
         } else if let Some(rect) = title_graph {
             // The graph's cells and one before the corner are blank, so the
@@ -255,12 +287,12 @@ pub(super) fn render_graph_card(
             frame.render_widget(Graph::new(graph.history, graph.scale), rect);
         }
     }
-    let rows = Rect::new(
+    let rows = padded(Rect::new(
         inner.x,
         inner.y.saturating_add(graph_rows),
         inner.width,
         inner.height.saturating_sub(graph_rows),
-    );
+    ));
     (rows, optional_rows)
 }
 
@@ -405,6 +437,13 @@ mod tests {
         assert_eq!(split_rows(0, 1, 3, true), (0, 0));
         assert_eq!(split_rows(9, 1, 3, false), (0, 3));
         assert_eq!(split_rows(3, 1, 3, false), (0, 2));
+    }
+
+    #[test]
+    fn text_rows_keep_a_column_from_the_borders_when_there_is_room() {
+        assert_eq!(padded(Rect::new(1, 1, 40, 5)), Rect::new(2, 1, 38, 5));
+        assert_eq!(padded(Rect::new(1, 1, 19, 5)), Rect::new(1, 1, 19, 5));
+        assert_eq!(padded(Rect::new(0, 0, 0, 0)), Rect::new(0, 0, 0, 0));
     }
 
     #[test]

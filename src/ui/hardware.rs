@@ -214,7 +214,7 @@ pub(super) fn storage_card_height(
     inner_width: u16,
 ) -> CardHeight {
     let (mounts, devices) = storage_row_counts(inventory, metrics);
-    if inner_width >= STORAGE_SIDE_BY_SIDE_WIDTH {
+    if cards::padded_width(inner_width) >= STORAGE_SIDE_BY_SIDE_WIDTH {
         CardHeight::new(1, mounts.max(devices) - 1, false)
     } else {
         CardHeight::new(1, (mounts + devices).saturating_sub(1), false)
@@ -224,7 +224,12 @@ pub(super) fn storage_card_height(
 /// Storage: filesystem usage and the disks, side by side on a wide card and
 /// one after the other otherwise.
 pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
-    let inner = cards::render_card(frame, area, &CardTitle::plain("Storage"), None);
+    let inner = cards::padded(cards::render_card(
+        frame,
+        area,
+        &CardTitle::plain("Storage"),
+        None,
+    ));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -645,13 +650,20 @@ mod tests {
             render_memory_card(frame, app, area, true)
         });
         assert!(card[0].contains(" Memory "), "{card:#?}");
-        // Five graph rows: 75 % of 40 eighths is three full rows and a ▆.
+        // Four graph rows (75 % of 32 eighths is three full rows), then a
+        // blank row, then the gauge a column in from the border.
+        assert!(card[1].trim_matches('│').trim().is_empty(), "{card:#?}");
         assert!(
-            card[2].ends_with("▆│"),
+            card[2].ends_with("█│"),
             "newest sample on the right: {card:#?}"
         );
-        assert!(card[5].ends_with("███│"), "{card:#?}");
-        assert!(card[6].contains("RAM  75%"), "{card:#?}");
+        assert!(card[4].ends_with("███│"), "{card:#?}");
+        assert!(
+            card[5].trim_matches('│').trim().is_empty(),
+            "gap row: {card:#?}"
+        );
+        assert!(card[6].starts_with("│ RAM  75%"), "{card:#?}");
+        assert!(card[6].ends_with("GiB │"), "{card:#?}");
         assert!(card[7].contains(" 58s "), "58 samples fit: {card:#?}");
 
         // Compact: the graph moves into the title row.

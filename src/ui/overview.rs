@@ -343,7 +343,12 @@ pub(super) fn header_line(app: &App, width: usize) -> Option<Line<'static>> {
 }
 
 fn render_pinned_card(frame: &mut Frame, app: &App, area: Rect) {
-    let inner = cards::render_card(frame, area, &CardTitle::plain("Pinned"), None);
+    let inner = cards::padded(cards::render_card(
+        frame,
+        area,
+        &CardTitle::plain("Pinned"),
+        None,
+    ));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -712,7 +717,8 @@ mod tests {
             rows[1].contains("worker") && rows[1].contains("exited"),
             "{rows:#?}"
         );
-        assert_eq!(buffer[(1, 1)].fg, theme::MUTED);
+        // The name starts a column in from the border.
+        assert_eq!(buffer[(2, 1)].fg, theme::MUTED);
     }
 
     #[test]

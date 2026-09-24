@@ -60,7 +60,11 @@ fn grid_for_rows(metrics: &SystemMetrics, width: usize, rows: usize) -> CpuGridL
 }
 
 pub(super) fn card_height(metrics: &SystemMetrics, inner_width: u16, graphs: bool) -> CardHeight {
-    CardHeight::new(1, full_grid_rows(metrics, inner_width), graphs)
+    CardHeight::new(
+        1,
+        full_grid_rows(metrics, cards::padded_width(inner_width)),
+        graphs,
+    )
 }
 
 /// CPU: the model and package temperature in the title, a graph of total
@@ -82,7 +86,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         scale: 100.0,
         interval: app.cpu_history_interval(),
     };
-    let grid_rows = full_grid_rows(metrics, area.width.saturating_sub(2));
+    let grid_rows = full_grid_rows(metrics, cards::padded_width(area.width.saturating_sub(2)));
     let (rows, grid_limit) =
         cards::render_graph_card(frame, area, &title, Some(graph), graphs, 1, grid_rows);
     if rows.width == 0 || rows.height == 0 {
