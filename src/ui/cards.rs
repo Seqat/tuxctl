@@ -19,9 +19,6 @@ use super::{hardware_cpu::format_window, sparkline::Graph, theme};
 /// Graph rows a card gets when there is room; it grows further with spare
 /// height and shrinks to one row before a card gives up its fixed rows.
 pub(super) const GRAPH_ROWS: u16 = 4;
-/// The most rows a card's graph grows to with spare height (8 rows of graph
-/// and the blank row under it); a taller Overview leaves the rest blank.
-pub(super) const MAX_GRAPH_ROWS: u16 = 9;
 const SEPARATOR: &str = " · ";
 /// An inline graph in a title row is left out when narrower than this.
 const MIN_INLINE_GRAPH_WIDTH: u16 = 6;

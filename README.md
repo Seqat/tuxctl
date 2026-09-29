@@ -37,7 +37,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak (on a logarithmic scale, so one spike does not flatten everyday traffic; below 1 KiB/s stays at the baseline), and a row per other interface.
   - **Storage:** usage of every local filesystem (one line per device, so btrfs subvolumes appear once; network, FUSE and loop mounts are left out), and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
   - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU (colored by band; a process using several cores counts as 100 %) and memory. A pinned process that exits stays for a few seconds as `exited`, dimmed.
-  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes. A graph grows with spare height up to 8 rows; a taller terminal leaves the rest blank.
+  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes.
 
 #### Colors
 
