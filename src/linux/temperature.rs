@@ -227,6 +227,9 @@ pub(super) struct TemperatureSampler<N> {
     /// The previous RAPL counters and when they were read.
     rapl_previous: Option<(Instant, Vec<u64>)>,
     cpu_power_watts: Option<f64>,
+    /// While false (nothing shows the values), nothing is read and the last
+    /// values are kept.
+    active: bool,
 }
 
 impl<N: NvidiaSource> TemperatureSampler<N> {
@@ -246,6 +249,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             cpu_power: CpuPowerSource::None,
             rapl_previous: None,
             cpu_power_watts: None,
+            active: true,
         };
         sampler.discover(now);
         sampler
@@ -257,6 +261,9 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
     /// NVML while it stays open; NVML initialized per reading (RTD3) follows
     /// the temperature cadence.
     pub(super) fn sample(&mut self, now: Instant) -> &[Temperature] {
+        if !self.active {
+            return &self.readings;
+        }
         let due = self.last_read.is_none_or(|last| {
             now.saturating_duration_since(last) + READ_TOLERANCE >= READ_INTERVAL
         });
@@ -273,6 +280,17 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
         self.read_nvidia(now, due);
         self.read_gpus();
         &self.readings
+    }
+
+    /// Whether [`Self::sample`] reads anything. The first sample after
+    /// becoming active reads everything at once, so the values shown are
+    /// fresh; a RAPL delta across the pause is not computed.
+    pub(super) fn set_active(&mut self, active: bool) {
+        if active && !self.active {
+            self.last_read = None;
+            self.rapl_previous = None;
+        }
+        self.active = active;
     }
 
     /// Telemetry of each GPU, as of the last [`Self::sample`].
@@ -2056,5 +2074,45 @@ mod tests {
             discover(&both.roots(), false).cpu_power,
             CpuPowerSource::Hwmon(_)
         ));
+    }
+
+    #[test]
+    fn an_inactive_sampler_reads_nothing_and_reads_at_once_when_active_again() {
+        let (tree, gpu) = nvidia_tree("nvidia-inactive", "on", "active");
+        let hwmon = tree.hwmon(0, "k10temp", None, &[(1, Some("Tctl"), 40_000)]);
+        let fake = FakeNvidia::reporting(50);
+        let start = Instant::now();
+        let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+        let values = |sampler: &mut TemperatureSampler<FakeNvidia>, millis| {
+            sampler
+                .sample(at(start, millis))
+                .iter()
+                .map(|temperature| temperature.celsius)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&mut sampler, 0), [Some(40), Some(50)]);
+        assert_eq!(fake.calls.borrow().len(), 1);
+
+        sampler.set_active(false);
+        tree.write(&hwmon.join("temp1_input"), "45000");
+        *fake.reading.borrow_mut() = NvidiaReading {
+            temperature: Some(55),
+            ..NvidiaReading::default()
+        };
+        for millis in [1_000, 2_000, 10_000] {
+            assert_eq!(values(&mut sampler, millis), [Some(40), Some(50)], "kept");
+        }
+        assert_eq!(
+            fake.calls.borrow().len(),
+            1,
+            "NVML untouched while inactive"
+        );
+        assert_eq!(sampler.gpus()[0].device_path, Arc::from(gpu.as_path()));
+
+        // Active again 100 ms after the last inactive call: read at once,
+        // without waiting for the 2 s gate.
+        sampler.set_active(true);
+        assert_eq!(values(&mut sampler, 10_100), [Some(45), Some(55)]);
+        assert_eq!(fake.calls.borrow().len(), 2);
     }
 }

@@ -266,6 +266,11 @@ impl Default for App {
 
 impl App {
     /// Services are only collected while their tab is visible.
+    /// Whether the hardware sensors are shown (only the Overview shows them).
+    pub fn sensors_visible(&self) -> bool {
+        self.active_tab == Tab::Overview
+    }
+
     pub fn services_visible(&self) -> bool {
         self.active_tab == Tab::Services
     }
@@ -577,6 +582,11 @@ impl App {
 
     fn select_tab(&mut self, tab: Tab) -> bool {
         let entering_services = tab == Tab::Services && self.active_tab != Tab::Services;
+        // The GPU is not sampled while the Overview is hidden; a graph spanning
+        // that gap would misstate its time axis.
+        if tab == Tab::Overview && self.active_tab != Tab::Overview {
+            self.gpu_history.clear();
+        }
         // Tab actions are blocked while an overlay is open, so none is open here.
         let changed = self.active_tab != tab
             || self.process_searching
@@ -1578,6 +1588,58 @@ mod tests {
             error: None,
         }));
         assert_eq!(app.network_history().iter().collect::<Vec<_>>(), [10.0]);
+    }
+
+    #[test]
+    fn sensors_are_visible_only_on_the_overview_and_the_gpu_graph_restarts_there() {
+        use std::{path::Path, sync::Arc};
+        let path: Arc<Path> = Arc::from(Path::new("/sys/devices/gpu"));
+        let mut app = App::default();
+        assert!(app.sensors_visible());
+        app.update(Action::HardwareDiscovered(
+            crate::linux::HardwareInventory {
+                gpus: vec![crate::linux::GpuDevice {
+                    model: "GPU".into(),
+                    kind: Some(crate::linux::GpuKind::Discrete),
+                    vram_bytes: None,
+                    device_path: Some(Arc::clone(&path)),
+                }],
+                ..crate::linux::HardwareInventory::default()
+            },
+        ));
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            gpus: vec![crate::linux::GpuTelemetry {
+                device_path: Arc::clone(&path),
+                utilization: Some(40.0),
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }],
+            ..SystemMetrics::default()
+        }));
+        assert_eq!(app.gpu_history().iter().len(), 1);
+
+        for tab in [Tab::Processes, Tab::Services, Tab::Logs, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            assert!(!app.sensors_visible(), "{tab:?}");
+        }
+        assert_eq!(app.gpu_history().iter().len(), 1, "kept while away");
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(app.sensors_visible());
+        assert_eq!(app.gpu_history().iter().len(), 0, "restarted on return");
+        // Selecting the Overview again while on it keeps the history.
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            gpus: vec![crate::linux::GpuTelemetry {
+                device_path: Arc::clone(&path),
+                utilization: Some(50.0),
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }],
+            ..SystemMetrics::default()
+        }));
+        app.update(Action::SelectTab(Tab::Overview));
+        assert_eq!(app.gpu_history().iter().len(), 1);
     }
 
     #[test]

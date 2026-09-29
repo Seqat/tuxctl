@@ -90,6 +90,7 @@ fn main() -> io::Result<()> {
     };
     // Services only collect while their tab is visible; journalctl starts on
     // the first visit to Logs.
+    let mut sensors_active = app.sensors_visible();
     let mut services_paused = !app.services_visible();
     let services = match linux::ServiceCollector::start(periods.services, services_paused) {
         Ok(services) => services,
@@ -145,6 +146,10 @@ fn main() -> io::Result<()> {
             // to exactly one collection.
             if let Some(generation) = app.take_service_refresh_request() {
                 services.request_refresh(generation);
+            }
+            if sensors_active != app.sensors_visible() {
+                sensors_active = !sensors_active;
+                metrics.set_sensors_active(sensors_active);
             }
             if services_paused == app.services_visible() {
                 services_paused = !services_paused;

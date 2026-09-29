@@ -5,7 +5,10 @@ use std::{
     io::{self, Read},
     mem::MaybeUninit,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -130,6 +133,10 @@ pub struct LoadAverage {
 pub struct SystemMetricsCollector {
     receiver: LatestReceiver<SystemMetrics>,
     control: Arc<CollectorControl>,
+    /// Whether the hardware sensors (temperatures, GPUs, CPU power, mounts)
+    /// are read; only the Overview shows them.
+    sensors_active: Arc<AtomicBool>,
+    refresh_generation: AtomicU64,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -140,11 +147,14 @@ impl SystemMetricsCollector {
         let (metrics_tx, receiver) = latest_snapshot::channel();
         let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
+        let sensors_active = Arc::new(AtomicBool::new(true));
+        let worker_sensors_active = Arc::clone(&sensors_active);
         let worker = thread::Builder::new()
             .name("system-metrics".into())
             .spawn(move || {
                 let identity = collect_system_identity();
-                let mut sampler = SystemMetricsSampler::new(identity, nvidia_temperature);
+                let mut sampler =
+                    SystemMetricsSampler::new(identity, nvidia_temperature, worker_sensors_active);
 
                 run_periodic(
                     &worker_control,
@@ -156,12 +166,26 @@ impl SystemMetricsCollector {
         Ok(Self {
             receiver,
             control,
+            sensors_active,
+            refresh_generation: AtomicU64::new(0),
             worker: Some(worker),
         })
     }
 
     pub fn latest(&self) -> Option<SystemMetrics> {
         self.receiver.take_latest()
+    }
+
+    /// Reads the hardware sensors only while `active` (the Overview is
+    /// visible): they cost CPU time, NVML queries above all. Becoming active
+    /// asks for a sample at once, so the Overview does not show old values
+    /// for up to a sampling interval.
+    pub fn set_sensors_active(&self, active: bool) {
+        let was_active = self.sensors_active.swap(active, Ordering::Relaxed);
+        if active && !was_active {
+            let generation = self.refresh_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.control.request_refresh(generation);
+        }
     }
 
     /// Applies a new sampling period to the running worker.
@@ -196,11 +220,18 @@ struct SystemMetricsSampler {
     system_identity: SystemIdentity,
     disks: DiskIoSampler,
     temperatures: TemperatureSampler<Nvidia>,
+    sensors_active: Arc<AtomicBool>,
+    /// Kept while the sensors are inactive.
+    mounts: Vec<MountUsage>,
 }
 
 impl SystemMetricsSampler {
     /// Created on the worker thread: temperature discovery runs here.
-    fn new(system_identity: SystemIdentity, nvidia_temperature: bool) -> Self {
+    fn new(
+        system_identity: SystemIdentity,
+        nvidia_temperature: bool,
+        sensors_active: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             previous_cpu: None,
             system_identity,
@@ -210,6 +241,8 @@ impl SystemMetricsSampler {
                 nvidia_temperature.then(Nvidia::default),
                 Instant::now(),
             ),
+            sensors_active,
+            mounts: Vec::new(),
         }
     }
 
@@ -226,6 +259,13 @@ impl SystemMetricsSampler {
             self.previous_cpu = current_cpu;
         }
 
+        let sensors_active = self.sensors_active.load(Ordering::Relaxed);
+        self.temperatures.set_active(sensors_active);
+        if sensors_active {
+            self.mounts = fs::read_to_string(PROC_MOUNTS)
+                .map(|contents| mount_usage(&parse_mounts(&contents)))
+                .unwrap_or_default();
+        }
         let meminfo = fs::read_to_string(PROC_MEMINFO).ok();
         SystemMetrics {
             cpu_percent,
@@ -238,9 +278,7 @@ impl SystemMetricsSampler {
             load_average: fs::read_to_string(PROC_LOADAVG)
                 .ok()
                 .and_then(|contents| parse_load_average(&contents)),
-            mounts: fs::read_to_string(PROC_MOUNTS)
-                .map(|contents| mount_usage(&parse_mounts(&contents)))
-                .unwrap_or_default(),
+            mounts: self.mounts.clone(),
             system_identity: self.system_identity.clone(),
             disks: self.disks.collect(Path::new(PROC_DISKSTATS), now),
             temperatures: self.temperatures.sample(now).to_vec(),

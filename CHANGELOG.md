@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   utilization and power are read on every sample, temperature, VRAM and
   fan every 2 seconds; this costs about 0.35 % of a core at 1 s and 0.65 %
   at 250 ms on the reference machine (`--no-nvidia-temperature` avoids it).
+- Temperatures, GPU telemetry, CPU power and filesystem use are read only
+  while the Overview is visible; other tabs keep the last values, and
+  returning to the Overview reads them at once and restarts the GPU graph.
 - The Memory card shows swap use, and the Storage card every local
   filesystem instead of only `/`: one line per block device (btrfs
   subvolumes appear once), at most 8, leaving out network, FUSE and loop
