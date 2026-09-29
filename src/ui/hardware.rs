@@ -528,7 +528,6 @@ pub(super) fn temperature_text(temperature: &Temperature) -> String {
         .map_or_else(|| "–".into(), |celsius| format!("{celsius}°C"))
 }
 
-/// Highlighted only when the driver reports a limit and the value reaches it.
 /// Critical temperatures assumed, per component type, when the driver
 /// reports no limit (documented in the README). They only color values.
 pub(super) const CPU_DEFAULT_LIMIT: i16 = 95;
