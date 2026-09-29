@@ -93,6 +93,7 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         scale: 100.0,
         interval: app.cpu_history_interval(),
         banded: true,
+        log_unit: None,
     };
     let grid_rows = full_grid_rows(metrics, cards::padded_width(area.width.saturating_sub(2)));
     let (rows, grid_limit) =

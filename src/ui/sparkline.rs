@@ -16,6 +16,9 @@ pub(super) struct Graph<'a> {
     /// Each column takes the utilization band of its own value; otherwise the
     /// graph is neutral (for values without a meaningful percentage).
     banded: bool,
+    /// Heights follow `ln(1 + value / unit)`, so one spike does not flatten
+    /// the rest; values well below `unit` stay near the baseline.
+    log_unit: Option<f64>,
 }
 
 impl<'a> Graph<'a> {
@@ -24,7 +27,14 @@ impl<'a> Graph<'a> {
             history,
             scale,
             banded: false,
+            log_unit: None,
         }
+    }
+
+    /// Draws heights on a logarithmic scale of `unit` (see `log_unit`).
+    pub(super) fn logarithmic(mut self, unit: f64) -> Self {
+        self.log_unit = (unit.is_finite() && unit > 0.0).then_some(unit);
+        self
     }
 
     /// Colors each column by the band of its value as a share of `scale`.
@@ -51,9 +61,13 @@ impl Widget for Graph<'_> {
         let shown = samples.len().min(width);
         let samples = samples.skip(self.history.iter().len() - shown);
         let first_column = area.x + (width - shown) as u16;
+        let fraction_of = |value: f64| match self.log_unit {
+            Some(unit) => (value / unit).max(0.0).ln_1p() / (scale / unit).ln_1p(),
+            None => value / scale,
+        };
         for (offset, value) in samples.enumerate() {
             let fraction = if value.is_finite() {
-                (value / scale).clamp(0.0, 1.0)
+                fraction_of(value).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -130,6 +144,27 @@ mod tests {
             draw(&[500.0], 100.0, 1, 1),
             ["█"],
             "values above the scale are capped"
+        );
+    }
+
+    #[test]
+    fn a_logarithmic_graph_keeps_everyday_values_visible_beside_a_spike() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let values = [0.0, 512.0, 10.0 * 1024.0, MIB];
+        let history = history(&values);
+        let area = Rect::new(0, 0, 4, 1);
+        let text = |graph: Graph| {
+            let mut buffer = Buffer::empty(area);
+            graph.render(area, &mut buffer);
+            (0..4).map(|x| buffer[(x, 0)].symbol()).collect::<String>()
+        };
+        assert_eq!(text(Graph::new(&history, MIB)), "▁▁▁█");
+        // 10 KiB/s reaches about a third; below 1 KiB/s stays at the baseline.
+        assert_eq!(text(Graph::new(&history, MIB).logarithmic(1024.0)), "▁▁▃█");
+        assert_eq!(
+            text(Graph::new(&history, MIB).logarithmic(0.0)),
+            "▁▁▁█",
+            "an invalid unit keeps the linear scale"
         );
     }
 

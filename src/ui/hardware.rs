@@ -57,6 +57,7 @@ pub(super) fn render_memory_card(frame: &mut Frame, app: &App, area: Rect, graph
         scale: 100.0,
         interval: app.cpu_history_interval(),
         banded: true,
+        log_unit: None,
     };
     let (rows, module_limit) = cards::render_graph_card(
         frame,
@@ -288,6 +289,7 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect, graphs: 
         scale: 100.0,
         interval: app.cpu_history_interval(),
         banded: true,
+        log_unit: None,
     });
     let details = primary.map_or(1, |(gpu, telemetry)| {
         gpu_detail_lines(gpu, telemetry, usize::MAX).len()

@@ -74,6 +74,9 @@ pub(super) fn render_card(frame: &mut Frame, app: &App, area: Rect, graphs: bool
         scale: peak.max(1.0),
         interval: app.cpu_history_interval(),
         banded: false,
+        // One KiB/s and less stays at the baseline; a spike leaves the
+        // everyday traffic readable.
+        log_unit: Some(1024.0),
     };
     let (rows, other_limit) = cards::render_graph_card(
         frame,

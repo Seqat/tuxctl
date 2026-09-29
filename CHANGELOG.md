@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short Storage card now says how many filesystems or disks it leaves
   out), and only then whole cards.
 - Graphs keep 240 samples instead of 60 and show as many as fit the card.
+  They grow with spare height up to 8 rows. The Network graph uses a
+  logarithmic scale, so one spike no longer flattens everyday traffic.
+  Cards side by side are equally wide, so their graphs span the same time,
+  and a tall narrow terminal draws the graphs inside the cards rather than
+  in their titles.
   The Network graph follows the interface in the card's title rather than
   the sum of all listed interfaces.
 

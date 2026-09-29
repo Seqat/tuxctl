@@ -34,10 +34,10 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid. Package power appears where this user can read it: from the out-of-tree `zenpower` driver (AMD Zen 1–3), or from RAPL energy counters, which are root-only unless an administrator makes them readable (see [CPU power](#cpu-power) under Optional setup).
   - **GPU:** the discrete GPU (or the only one) with a utilization graph, utilization, VRAM use and fan speed where the driver reports them, and a row per other GPU. NVIDIA GPUs of the proprietary driver report through NVML; `amdgpu` through sysfs (`gpu_busy_percent`, `mem_info_vram_*`, hwmon power and fan); `nouveau` reports power and fan; Intel GPUs report none of these. A runtime-suspended GPU is never woken to be read.
   - **Memory:** a graph of RAM use, the RAM and swap gauges, plus RAM modules via EDAC sysfs when available.
-  - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak, and a row per other interface.
+  - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak (on a logarithmic scale, so one spike does not flatten everyday traffic; below 1 KiB/s stays at the baseline), and a row per other interface.
   - **Storage:** usage of every local filesystem (one line per device, so btrfs subvolumes appear once; network, FUSE and loop mounts are left out), and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
   - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU (colored by band; a process using several cores counts as 100 %) and memory. A pinned process that exits stays for a few seconds as `exited`, dimmed.
-  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes.
+  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes. A graph grows with spare height up to 8 rows; a taller terminal leaves the rest blank.
 
 #### Colors
 
@@ -45,7 +45,7 @@ Utilization values (total and per-CPU utilization, RAM, GPU utilization and VRAM
 
 `tuxctl` reads `COLORTERM` and `TERM` once at startup: `truecolor`/`24bit` get the full palette, `*256color` terminals the nearest 256-color entries, and anything else the 16 basic colors (where orange becomes bright red).
 - Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
-- Responsive layout by terminal width: 150 columns and more show a 2×2 grid (CPU | GPU, Memory | Network), Storage below it and Pinned as a column on the right; 100–149 columns show the grid with Storage and Pinned side by side below it; narrower terminals stack the cards (CPU, Memory, Pinned, Network, Storage, GPU) with each graph in its card's title row.
+- Responsive layout by terminal width: 150 columns and more show a 2×2 grid (CPU | GPU, Memory | Network), Storage below it and Pinned as a column on the right; 100–149 columns show the grid with Storage and Pinned side by side below it; narrower terminals stack the cards (CPU, Memory, Pinned, Network, Storage, GPU) with each graph in its card's title row, or above the card's rows when the terminal is tall enough for every card that way. Cards side by side are equally wide, so their graphs span the same time.
 
 #### Temperatures
 

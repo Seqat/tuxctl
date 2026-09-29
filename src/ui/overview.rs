@@ -25,7 +25,8 @@ pub(super) const CARD_MIN_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WidthMode {
-    /// One column; graphs sit in the card titles.
+    /// One column; graphs sit in the card titles unless every card fits
+    /// with its graph above its rows.
     Narrow,
     /// A 2×2 grid, then Storage and Pinned side by side.
     Medium,
@@ -42,11 +43,6 @@ impl WidthMode {
         } else {
             Self::Narrow
         }
-    }
-
-    /// Wide and medium cards draw their graph above their rows.
-    pub(super) fn graphs(self) -> bool {
-        self != Self::Narrow
     }
 }
 
@@ -75,6 +71,9 @@ pub(super) struct CardHeight {
     pub graphed: u16,
     /// With everything, the optional rows included.
     pub desired: u16,
+    /// With the graph at its tallest ([`cards::MAX_GRAPH_ROWS`]); spare rows
+    /// go to graphs up to this height and the rest stays blank.
+    pub tallest: u16,
 }
 
 impl CardHeight {
@@ -89,11 +88,18 @@ impl CardHeight {
         };
         let min = (2 + fixed + min_graph).max(CARD_MIN_HEIGHT);
         let graphed = (2 + fixed + graph_rows).max(CARD_MIN_HEIGHT);
+        let desired = (graphed + optional).max(CARD_MIN_HEIGHT);
+        let growth = if graph {
+            cards::MAX_GRAPH_ROWS - cards::GRAPH_ROWS
+        } else {
+            0
+        };
         Self {
             min,
             listed: min,
             graphed,
-            desired: (graphed + optional).max(CARD_MIN_HEIGHT),
+            desired,
+            tallest: desired + growth,
         }
     }
 
@@ -106,6 +112,7 @@ impl CardHeight {
             listed,
             graphed: listed,
             desired: listed,
+            tallest: listed,
         }
     }
 }
@@ -116,16 +123,38 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
     let mode = WidthMode::for_width(area.width);
     let show_pinned = mode == WidthMode::Wide || app.pinned_processes().next().is_some();
+    // The narrow column draws graphs above the rows, as wider modes do, once
+    // every card fits whole that way.
+    let graphs = mode != WidthMode::Narrow || {
+        let inner_width = area.width.saturating_sub(2);
+        narrow_cards(show_pinned)
+            .map(|card| u32::from(card_height(app, card, inner_width, true).desired))
+            .sum::<u32>()
+            <= u32::from(area.height)
+    };
     let placed = overview_layout(area, mode, show_pinned, |card, width| {
-        card_height(app, card, width.saturating_sub(2), mode)
+        card_height(app, card, width.saturating_sub(2), graphs)
     });
     for (card, rect) in placed {
-        render_card(frame, app, card, rect, mode);
+        render_card(frame, app, card, rect, graphs);
     }
 }
 
-fn card_height(app: &App, card: Card, inner_width: u16, mode: WidthMode) -> CardHeight {
-    let graphs = mode.graphs();
+/// The narrow column's cards in priority order.
+fn narrow_cards(show_pinned: bool) -> impl Iterator<Item = Card> {
+    [
+        Some(Card::Cpu),
+        Some(Card::Memory),
+        show_pinned.then_some(Card::Pinned),
+        Some(Card::Network),
+        Some(Card::Storage),
+        Some(Card::Gpu),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+fn card_height(app: &App, card: Card, inner_width: u16, graphs: bool) -> CardHeight {
     match card {
         Card::Cpu => hardware_cpu::card_height(app.system_metrics(), inner_width, graphs),
         Card::Gpu => hardware::gpu_card_height(app, graphs),
@@ -138,8 +167,7 @@ fn card_height(app: &App, card: Card, inner_width: u16, mode: WidthMode) -> Card
     }
 }
 
-fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, mode: WidthMode) {
-    let graphs = mode.graphs();
+fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, graphs: bool) {
     match card {
         Card::Cpu => hardware_cpu::render_card(frame, app, area, graphs),
         Card::Gpu => hardware::render_gpu_card(frame, app, area, graphs),
@@ -154,7 +182,9 @@ fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, mode: Width
 /// order (top to bottom; in the narrow column CPU → Memory → Pinned →
 /// Network → Storage → GPU); a row that does not fit is left out with every
 /// row after it. When every row is shown, rows grow step by step (see
-/// [`CardHeight`]), and what is left goes to the rows with graphs.
+/// [`CardHeight`]), and what is left goes to the rows with graphs, up to
+/// their tallest. Cards side by side get the same width: an odd column goes
+/// to the Pinned column or is left blank on the right.
 pub(super) fn overview_layout(
     area: Rect,
     mode: WidthMode,
@@ -163,15 +193,16 @@ pub(super) fn overview_layout(
 ) -> Vec<(Card, Rect)> {
     let mut placed = Vec::new();
     let mut grid = area;
+    let mut pinned_column = None;
     let rows: Vec<Vec<(Card, u16)>> = match mode {
         WidthMode::Wide => {
-            let pinned_width = area.width / 4;
+            let mut pinned_width = area.width / 4;
+            // Even, so the grid's halves are equally wide and their graphs
+            // span the same time.
+            pinned_width += (area.width - pinned_width) % 2;
             grid.width -= pinned_width;
             if show_pinned && area.height >= CARD_MIN_HEIGHT && pinned_width > 0 {
-                placed.push((
-                    Card::Pinned,
-                    Rect::new(grid.right(), area.y, pinned_width, area.height),
-                ));
+                pinned_column = Some(pinned_width);
             }
             vec![
                 halves(Card::Cpu, Card::Gpu, grid.width),
@@ -180,30 +211,22 @@ pub(super) fn overview_layout(
             ]
         }
         WidthMode::Medium => {
+            grid.width -= area.width % 2;
             let bottom = if show_pinned {
-                let pinned = area.width / 3;
-                vec![(Card::Storage, area.width - pinned), (Card::Pinned, pinned)]
+                let pinned = grid.width / 3;
+                vec![(Card::Storage, grid.width - pinned), (Card::Pinned, pinned)]
             } else {
-                vec![(Card::Storage, area.width)]
+                vec![(Card::Storage, grid.width)]
             };
             vec![
-                halves(Card::Cpu, Card::Gpu, area.width),
-                halves(Card::Memory, Card::Network, area.width),
+                halves(Card::Cpu, Card::Gpu, grid.width),
+                halves(Card::Memory, Card::Network, grid.width),
                 bottom,
             ]
         }
-        WidthMode::Narrow => [
-            Some(Card::Cpu),
-            Some(Card::Memory),
-            show_pinned.then_some(Card::Pinned),
-            Some(Card::Network),
-            Some(Card::Storage),
-            Some(Card::Gpu),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|card| vec![(card, area.width)])
-        .collect(),
+        WidthMode::Narrow => narrow_cards(show_pinned)
+            .map(|card| vec![(card, area.width)])
+            .collect(),
     };
 
     let row_heights: Vec<CardHeight> = rows
@@ -219,12 +242,11 @@ pub(super) fn overview_layout(
                 listed: tallest(|height| height.listed),
                 graphed: tallest(|height| height.graphed),
                 desired: tallest(|height| height.desired),
+                tallest: tallest(|height| height.tallest),
             }
         })
         .collect();
-    let allocated = allocate_rows(grid.height, &row_heights, |index| {
-        mode.graphs() && index < 2
-    });
+    let allocated = allocate_rows(grid.height, &row_heights);
 
     let mut y = grid.y;
     for (row, height) in rows.iter().zip(allocated) {
@@ -238,6 +260,17 @@ pub(super) fn overview_layout(
         }
         y += height;
     }
+    if let Some(width) = pinned_column {
+        // As tall as the cards beside it, or the whole height when none fit.
+        let height = match y - grid.y {
+            0 => area.height,
+            used => used,
+        };
+        placed.insert(
+            0,
+            (Card::Pinned, Rect::new(grid.right(), area.y, width, height)),
+        );
+    }
     placed
 }
 
@@ -249,8 +282,9 @@ fn halves(left: Card, right: Card, width: u16) -> Vec<(Card, u16)> {
 /// Heights for `rows` within `total`: minimums in order (a row that does not
 /// fit and every later one get 0); then, once every row is shown, growth in
 /// order toward each step of [`CardHeight`] in turn, and the rest shared
-/// evenly by the rows `grows` selects.
-fn allocate_rows(total: u16, rows: &[CardHeight], grows: impl Fn(usize) -> bool) -> Vec<u16> {
+/// evenly by the rows that grow further (those with graphs), up to their
+/// tallest.
+fn allocate_rows(total: u16, rows: &[CardHeight]) -> Vec<u16> {
     let mut heights = vec![0; rows.len()];
     let mut remaining = total;
     let mut shown = 0;
@@ -278,13 +312,17 @@ fn allocate_rows(total: u16, rows: &[CardHeight], grows: impl Fn(usize) -> bool)
             remaining -= addition;
         }
     }
-    let growing: Vec<usize> = (0..shown).filter(|&index| grows(index)).collect();
-    if !growing.is_empty() {
-        let share = remaining / growing.len() as u16;
-        let mut extra = remaining % growing.len() as u16;
-        for index in growing {
-            heights[index] += share + u16::from(extra > 0);
-            extra = extra.saturating_sub(1);
+    while remaining > 0 {
+        let mut grew = false;
+        for (height, row) in heights.iter_mut().zip(rows) {
+            if remaining > 0 && *height < row.tallest {
+                *height += 1;
+                remaining -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
         }
     }
     heights
@@ -455,18 +493,28 @@ fn pinned_cpu(percent: Option<f64>) -> Span<'static> {
 mod tests {
     use super::*;
 
-    /// A height that grows from `min` to `desired` in its last step.
-    fn staged(min: u16, desired: u16) -> CardHeight {
+    /// A height that grows from `min` to `desired` in its last step, and
+    /// `graph` rows further with spare height.
+    fn staged(min: u16, desired: u16, graph: u16) -> CardHeight {
         CardHeight {
             min,
             listed: min,
             graphed: min,
             desired,
+            tallest: desired + graph,
         }
     }
 
+    /// Graph cards grow 20 rows past `desired`; Storage and Pinned do not.
     fn fixed(min: u16, desired: u16) -> impl Fn(Card, u16) -> CardHeight {
-        move |_, _| staged(min, desired)
+        move |card, _| {
+            let graph = if matches!(card, Card::Storage | Card::Pinned) {
+                0
+            } else {
+                20
+            };
+            staged(min, desired, graph)
+        }
     }
 
     fn cards(placed: &[(Card, Rect)]) -> Vec<Card> {
@@ -558,7 +606,7 @@ mod tests {
                 for height in 0..=70 {
                     let area = Rect::new(3, 4, width, height);
                     let placed = overview_layout(area, mode, true, |card, width| {
-                        staged(3 + (card as u16) % 3, 6 + width % 5)
+                        staged(3 + (card as u16) % 3, 6 + width % 5, width % 7)
                     });
                     for (index, (_, rect)) in placed.iter().enumerate() {
                         assert_eq!(rect.intersection(area), *rect, "{mode:?} {width}x{height}");
@@ -573,15 +621,64 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_cards_are_equally_wide_on_odd_widths() {
+        let width_of = |placed: &[(Card, Rect)], card| {
+            placed
+                .iter()
+                .find(|(c, _)| *c == card)
+                .map(|(_, rect)| rect.width)
+                .unwrap()
+        };
+        for width in [149, 150, 151, 201] {
+            let area = Rect::new(0, 0, width, 40);
+            let wide = overview_layout(area, WidthMode::Wide, true, fixed(4, 8));
+            assert_eq!(
+                width_of(&wide, Card::Cpu),
+                width_of(&wide, Card::Gpu),
+                "{width}"
+            );
+            let right = wide.iter().map(|(_, rect)| rect.right()).max();
+            assert_eq!(right, Some(width), "the Pinned column takes the odd column");
+        }
+        for width in [98, 99, 120, 147] {
+            let area = Rect::new(0, 0, width, 40);
+            let medium = overview_layout(area, WidthMode::Medium, true, fixed(4, 8));
+            assert_eq!(
+                width_of(&medium, Card::Memory),
+                width_of(&medium, Card::Network),
+                "{width}"
+            );
+            let right = medium.iter().map(|(_, rect)| rect.right()).max().unwrap();
+            assert_eq!(right, width - width % 2, "{width}");
+        }
+    }
+
+    #[test]
+    fn graphs_stop_growing_and_the_pinned_column_ends_with_the_cards() {
+        let heights = |card: Card, _| match card {
+            Card::Storage | Card::Pinned => CardHeight::list(2),
+            _ => CardHeight::new(1, 0, true),
+        };
+        // 7 rows per grid row at their tallest (a 9-row graph area is 16),
+        // plus 4 for Storage.
+        let placed = overview_layout(Rect::new(0, 0, 200, 80), WidthMode::Wide, true, heights);
+        let rect = |card| placed.iter().find(|(c, _)| *c == card).unwrap().1;
+        assert_eq!(rect(Card::Cpu).height, 2 + 1 + cards::MAX_GRAPH_ROWS);
+        assert_eq!(rect(Card::Storage).bottom(), 12 + 12 + 4);
+        assert_eq!(rect(Card::Pinned).height, rect(Card::Storage).bottom());
+    }
+
+    #[test]
     fn rows_get_minimums_then_desired_heights_then_graph_room() {
-        let rows = [staged(4, 10), staged(4, 6), staged(3, 5)];
-        let graphs = |index: usize| index < 2;
+        let rows = [staged(4, 10, 5), staged(4, 6, 5), staged(3, 5, 0)];
         // Only the first minimum fits; nothing grows while a row is left out.
-        assert_eq!(allocate_rows(7, &rows, graphs), [4, 0, 0]);
-        assert_eq!(allocate_rows(11, &rows, graphs), [4, 4, 3]);
-        assert_eq!(allocate_rows(21, &rows, graphs), [10, 6, 5]);
-        assert_eq!(allocate_rows(25, &rows, graphs), [12, 8, 5]);
-        assert_eq!(allocate_rows(0, &rows, graphs), [0, 0, 0]);
+        assert_eq!(allocate_rows(7, &rows), [4, 0, 0]);
+        assert_eq!(allocate_rows(11, &rows), [4, 4, 3]);
+        assert_eq!(allocate_rows(21, &rows), [10, 6, 5]);
+        assert_eq!(allocate_rows(25, &rows), [12, 8, 5]);
+        // Graphs stop at their tallest; the rest is left blank.
+        assert_eq!(allocate_rows(40, &rows), [15, 11, 5]);
+        assert_eq!(allocate_rows(0, &rows), [0, 0, 0]);
     }
 
     #[test]
@@ -600,7 +697,8 @@ mod tests {
                 min: 4,
                 listed: 4,
                 graphed: 7,
-                desired: 11
+                desired: 11,
+                tallest: 16
             }
         );
         assert_eq!(
@@ -609,29 +707,29 @@ mod tests {
                 min: 3,
                 listed: 8,
                 graphed: 8,
-                desired: 8
+                desired: 8,
+                tallest: 8
             }
         );
-        let graphs = |index: usize| index < 2;
-        assert_eq!(allocate_rows(40, &rows, graphs), [17, 15, 8]);
-        assert_eq!(allocate_rows(28, &rows, graphs), [11, 9, 8]);
+        assert_eq!(allocate_rows(40, &rows), [16, 14, 8]);
+        assert_eq!(allocate_rows(28, &rows), [11, 9, 8]);
         // The optional rows go first, those of the lower row first.
-        assert_eq!(allocate_rows(26, &rows, graphs), [11, 7, 8]);
-        assert_eq!(allocate_rows(22, &rows, graphs), [7, 7, 8]);
+        assert_eq!(allocate_rows(26, &rows), [11, 7, 8]);
+        assert_eq!(allocate_rows(22, &rows), [7, 7, 8]);
         // Then the graphs shrink to one row.
-        assert_eq!(allocate_rows(19, &rows, graphs), [7, 4, 8]);
-        assert_eq!(allocate_rows(16, &rows, graphs), [4, 4, 8]);
+        assert_eq!(allocate_rows(19, &rows), [7, 4, 8]);
+        assert_eq!(allocate_rows(16, &rows), [4, 4, 8]);
         // Then the lists, down to one row (and `… N more`).
-        assert_eq!(allocate_rows(15, &rows, graphs), [4, 4, 7]);
-        assert_eq!(allocate_rows(11, &rows, graphs), [4, 4, 3]);
+        assert_eq!(allocate_rows(15, &rows), [4, 4, 7]);
+        assert_eq!(allocate_rows(11, &rows), [4, 4, 3]);
         // Then whole rows, from the last.
-        assert_eq!(allocate_rows(10, &rows, graphs), [4, 4, 0]);
-        assert_eq!(allocate_rows(7, &rows, graphs), [4, 0, 0]);
+        assert_eq!(allocate_rows(10, &rows), [4, 4, 0]);
+        assert_eq!(allocate_rows(7, &rows), [4, 0, 0]);
 
         // No row gets shorter as the area grows.
         let mut previous = vec![0; rows.len()];
         for total in 0..60 {
-            let heights = allocate_rows(total, &rows, graphs);
+            let heights = allocate_rows(total, &rows);
             for (height, before) in heights.iter().zip(&previous) {
                 assert!(height >= before, "{total}: {heights:?}");
             }
@@ -662,6 +760,38 @@ mod tests {
         assert_eq!(narrow(22), (Some(Card::Gpu), Some(7)));
         assert_eq!(narrow(18), (Some(Card::Gpu), Some(3)));
         assert_eq!(narrow(17), (Some(Card::Storage), Some(3)));
+    }
+
+    #[test]
+    fn a_tall_narrow_overview_draws_graphs_inside_the_cards() {
+        let mut app = App::default();
+        for _ in 0..3 {
+            app.update(Action::SystemMetricsUpdated(crate::linux::SystemMetrics {
+                cpu_percent: Some(50.0),
+                ..crate::linux::SystemMetrics::default()
+            }));
+        }
+        let screen = |height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect::<Vec<String>>()
+        };
+        let graph = |row: &String| row.contains('▄') || row.contains('█');
+
+        let short = screen(15);
+        assert!(
+            short[0].starts_with("┌ CPU") && graph(&short[0]),
+            "{short:#?}"
+        );
+        let tall = screen(60);
+        assert!(!graph(&tall[0]), "{tall:#?}");
+        assert!(tall[1..10].iter().any(graph), "{tall:#?}");
     }
 
     fn process(pid: u32, state_code: char) -> crate::linux::ProcessInfo {
