@@ -375,9 +375,9 @@ pub(super) fn storage_card_height(
 ) -> CardHeight {
     let (mounts, devices) = storage_row_counts(inventory, metrics);
     if cards::padded_width(inner_width) >= STORAGE_SIDE_BY_SIDE_WIDTH {
-        CardHeight::new(1, mounts.max(devices) - 1, false)
+        CardHeight::list(mounts.max(devices))
     } else {
-        CardHeight::new(1, (mounts + devices).saturating_sub(1), false)
+        CardHeight::list(mounts + devices)
     }
 }
 
@@ -396,6 +396,7 @@ pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
     let metrics = app.system_metrics();
     let inventory = app.hardware();
     let mount_line = |width: usize| mount_lines(&metrics.mounts, width);
+    let height = usize::from(inner.height);
     if inner.width >= STORAGE_SIDE_BY_SIDE_WIDTH {
         let mount_width = inner.width * 2 / 5;
         let gap = 2;
@@ -406,17 +407,31 @@ pub(super) fn render_storage_card(frame: &mut Frame, app: &App, area: Rect) {
             inner.height,
         );
         frame.render_widget(
-            Paragraph::new(mount_line(usize::from(mount_width))),
+            Paragraph::new(fit_rows(
+                mount_line(usize::from(mount_width)),
+                height,
+                " filesystems",
+            )),
             Rect::new(inner.x, inner.y, mount_width, inner.height),
         );
         let lines = device_lines(inventory, metrics, devices_area.width, devices_area.height);
         frame.render_widget(Paragraph::new(lines), devices_area);
     } else {
         let mut lines = mount_line(usize::from(inner.width));
-        let height = inner.height.saturating_sub(lines.len() as u16);
-        lines.extend(device_lines(inventory, metrics, inner.width, height));
-        frame.render_widget(Paragraph::new(lines), inner);
+        lines.extend(device_lines(inventory, metrics, inner.width, u16::MAX));
+        frame.render_widget(Paragraph::new(fit_rows(lines, height, "")), inner);
     }
+}
+
+/// `lines` cut to `height`, the last row then saying how many are left out:
+/// `… 3 more filesystems`.
+fn fit_rows(mut lines: Vec<Line<'static>>, height: usize, what: &str) -> Vec<Line<'static>> {
+    if lines.len() > height && height > 0 {
+        let hidden = lines.len() - (height - 1);
+        lines.truncate(height - 1);
+        lines.push(Line::from(format!("… {hidden} more{what}")));
+    }
+    lines
 }
 
 /// One usage gauge per mounted filesystem, the mount points in a column as
@@ -1115,6 +1130,50 @@ mod tests {
         let narrow = rows(&app, 60, 5, draw);
         assert!(narrow[1].contains("/   50%"), "{narrow:#?}");
         assert!(narrow[2].contains("NVMe0  Test Disk"), "{narrow:#?}");
+    }
+
+    #[test]
+    fn a_short_storage_card_counts_the_rows_it_leaves_out() {
+        let mut app = App::default();
+        app.update(crate::action::Action::SystemMetricsUpdated(SystemMetrics {
+            mounts: ["/", "/boot", "/home"]
+                .into_iter()
+                .map(|mount_point| crate::linux::MountUsage {
+                    mount_point: mount_point.into(),
+                    usage: crate::linux::ByteUsage {
+                        used: 50 << 30,
+                        total: 100 << 30,
+                    },
+                })
+                .collect(),
+            ..SystemMetrics::default()
+        }));
+        app.update(crate::action::Action::HardwareDiscovered(
+            HardwareInventory {
+                storage_devices: vec![StorageDevice {
+                    system_name: "nvme0n1".into(),
+                    kind: StorageKind::Nvme,
+                    model: Some("Test Disk".into()),
+                    capacity_bytes: None,
+                    device_path: None,
+                }],
+                ..HardwareInventory::default()
+            },
+        ));
+        let draw: fn(&mut Frame, &App, Rect) =
+            |frame, app, area| render_storage_card(frame, app, area);
+
+        let wide = rows(&app, 120, 4, draw);
+        assert!(wide[1].contains("│ /       50%"), "{wide:#?}");
+        assert!(wide[2].contains("… 2 more filesystems"), "{wide:#?}");
+        assert!(wide[1].contains("NVMe0  Test Disk"), "{wide:#?}");
+
+        // Stacked, the disk after the filesystems is counted too.
+        let narrow = rows(&app, 60, 5, draw);
+        assert!(narrow[2].contains("/boot"), "{narrow:#?}");
+        assert!(narrow[3].contains("… 2 more"), "{narrow:#?}");
+        let tall = rows(&app, 60, 6, draw);
+        assert!(tall[4].contains("NVMe0  Test Disk"), "{tall:#?}");
     }
 
     #[test]

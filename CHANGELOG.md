@@ -50,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out-of-tree `zenpower`, or from RAPL energy counters, which are root-only
   unless an administrator makes them readable (the README shows a narrow
   udev rule and its security trade-off). `tuxctl` asks for no privileges.
+- Pinned processes on the Overview show their CPU use colored by band (a
+  process busy on several cores counts as 100 %). A short Overview gives
+  up the optional rows first (the per-CPU grid, other GPUs and interfaces,
+  memory modules), then graph height, then Pinned and Storage rows (a
+  short Storage card now says how many filesystems or disks it leaves
+  out), and only then whole cards.
 - Graphs keep 240 samples instead of 60 and show as many as fit the card.
   The Network graph follows the interface in the card's title rather than
   the sum of all listed interfaces.

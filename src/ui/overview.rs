@@ -13,8 +13,7 @@ use crate::{action::Action, app::App, keymap};
 
 use super::{
     cards::{self, CardTitle},
-    format_bytes, format_uptime, hardware, hardware_cpu, hardware_network_summary, layout,
-    processes, theme,
+    format_bytes, format_uptime, hardware, hardware_cpu, hardware_network_summary, layout, theme,
 };
 
 /// Content widths (the terminal is two columns wider) at which the Overview
@@ -61,10 +60,20 @@ pub(super) enum Card {
     Pinned,
 }
 
-/// Heights a card needs, borders included.
+/// Heights a card needs, borders included, at each step of the height
+/// compression. From the tallest down, a short Overview first hides the
+/// optional rows (the CPU grid, more GPUs or interfaces), then shrinks the
+/// graphs to one row, then cuts lists (Pinned, Storage) to one row, then
+/// leaves out whole cards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CardHeight {
+    /// The fixed rows, one graph row and one list row.
     pub min: u16,
+    /// With the whole list.
+    pub listed: u16,
+    /// With the whole list and full graphs.
+    pub graphed: u16,
+    /// With everything, the optional rows included.
     pub desired: u16,
 }
 
@@ -78,9 +87,25 @@ impl CardHeight {
         } else {
             (0, 0)
         };
+        let min = (2 + fixed + min_graph).max(CARD_MIN_HEIGHT);
+        let graphed = (2 + fixed + graph_rows).max(CARD_MIN_HEIGHT);
         Self {
-            min: (2 + fixed + min_graph).max(CARD_MIN_HEIGHT),
-            desired: (2 + fixed + optional + graph_rows).max(CARD_MIN_HEIGHT),
+            min,
+            listed: min,
+            graphed,
+            desired: (graphed + optional).max(CARD_MIN_HEIGHT),
+        }
+    }
+
+    /// A card of `rows` list rows, which keep their room until the graphs
+    /// are down to one row.
+    pub(super) fn list(rows: u16) -> Self {
+        let listed = (2 + rows).max(CARD_MIN_HEIGHT);
+        Self {
+            min: CARD_MIN_HEIGHT,
+            listed,
+            graphed: listed,
+            desired: listed,
         }
     }
 }
@@ -109,11 +134,7 @@ fn card_height(app: &App, card: Card, inner_width: u16, mode: WidthMode) -> Card
         Card::Storage => {
             hardware::storage_card_height(app.hardware(), app.system_metrics(), inner_width)
         }
-        Card::Pinned => CardHeight::new(
-            1,
-            (app.pinned_processes().count() as u16).saturating_sub(1),
-            false,
-        ),
+        Card::Pinned => CardHeight::list(app.pinned_processes().count() as u16),
     }
 }
 
@@ -132,8 +153,8 @@ fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, mode: Width
 /// Places the cards for `mode`. Rows get their minimum height in priority
 /// order (top to bottom; in the narrow column CPU → Memory → Pinned →
 /// Network → Storage → GPU); a row that does not fit is left out with every
-/// row after it. When every row is shown, rows grow toward their desired
-/// height, and what is left goes to the rows with graphs.
+/// row after it. When every row is shown, rows grow step by step (see
+/// [`CardHeight`]), and what is left goes to the rows with graphs.
 pub(super) fn overview_layout(
     area: Rect,
     mode: WidthMode,
@@ -187,17 +208,18 @@ pub(super) fn overview_layout(
 
     let row_heights: Vec<CardHeight> = rows
         .iter()
-        .map(|row| CardHeight {
-            min: row
+        .map(|row| {
+            let cards: Vec<CardHeight> = row
                 .iter()
-                .map(|&(card, width)| heights(card, width).min)
-                .max()
-                .unwrap_or(0),
-            desired: row
-                .iter()
-                .map(|&(card, width)| heights(card, width).desired)
-                .max()
-                .unwrap_or(0),
+                .map(|&(card, width)| heights(card, width))
+                .collect();
+            let tallest = |step: fn(&CardHeight) -> u16| cards.iter().map(step).max().unwrap_or(0);
+            CardHeight {
+                min: tallest(|height| height.min),
+                listed: tallest(|height| height.listed),
+                graphed: tallest(|height| height.graphed),
+                desired: tallest(|height| height.desired),
+            }
         })
         .collect();
     let allocated = allocate_rows(grid.height, &row_heights, |index| {
@@ -225,9 +247,9 @@ fn halves(left: Card, right: Card, width: u16) -> Vec<(Card, u16)> {
 }
 
 /// Heights for `rows` within `total`: minimums in order (a row that does not
-/// fit and every later one get 0); then, once every row is shown, growth
-/// toward the desired heights in order and the rest shared evenly by the rows
-/// `grows` selects.
+/// fit and every later one get 0); then, once every row is shown, growth in
+/// order toward each step of [`CardHeight`] in turn, and the rest shared
+/// evenly by the rows `grows` selects.
 fn allocate_rows(total: u16, rows: &[CardHeight], grows: impl Fn(usize) -> bool) -> Vec<u16> {
     let mut heights = vec![0; rows.len()];
     let mut remaining = total;
@@ -247,10 +269,14 @@ fn allocate_rows(total: u16, rows: &[CardHeight], grows: impl Fn(usize) -> bool)
     if shown < rows.len() {
         return heights;
     }
-    for (height, row) in heights.iter_mut().zip(rows) {
-        let addition = row.desired.saturating_sub(*height).min(remaining);
-        *height += addition;
-        remaining -= addition;
+    let steps: [fn(&CardHeight) -> u16; 3] =
+        [|row| row.listed, |row| row.graphed, |row| row.desired];
+    for step in steps {
+        for (height, row) in heights.iter_mut().zip(rows) {
+            let addition = step(row).saturating_sub(*height).min(remaining);
+            *height += addition;
+            remaining -= addition;
+        }
     }
     let growing: Vec<usize> = (0..shown).filter(|&index| grows(index)).collect();
     if !growing.is_empty() {
@@ -356,10 +382,12 @@ fn render_pinned_card(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// One row per pinned process, with `… N more` when they do not all fit; a
-/// hint naming the pin key when there are none.
+/// One row per pinned process (name, CPU and memory), with `… N more` when
+/// they do not all fit; a hint naming the pin key when there are none.
 fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
-    const VALUES_WIDTH: usize = 17;
+    // ` 1200.0%  64.0 MiB`: CPU is top-style, up to 100 % per core.
+    const CPU_WIDTH: usize = 7;
+    const VALUES_WIDTH: usize = 1 + CPU_WIDTH + 1 + 9;
     let pins: Vec<_> = app.pinned_processes().collect();
     if height == 0 {
         return Vec::new();
@@ -389,16 +417,19 @@ fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 ))
                 .style(Style::default().fg(theme::MUTED))
             } else if width > VALUES_WIDTH + 4 {
-                Line::from(format!(
-                    "{name:<name_width$} {:>6} {:>9}",
-                    processes::format_cpu(process.cpu_percent),
-                    format_bytes(process.memory_bytes)
-                ))
+                Line::from(vec![
+                    Span::raw(format!("{name:<name_width$} ")),
+                    pinned_cpu(process.cpu_percent),
+                    Span::raw(format!(" {:>9}", format_bytes(process.memory_bytes))),
+                ])
             } else {
-                Line::from(layout::truncate(
-                    &format!("{name} {}", processes::format_cpu(process.cpu_percent)),
-                    width,
-                ))
+                let name = layout::truncate(&process.name, width.saturating_sub(CPU_WIDTH + 1));
+                let cpu = pinned_cpu(process.cpu_percent);
+                if name.is_empty() || width < CPU_WIDTH + 2 {
+                    Line::from(layout::truncate(&name, width))
+                } else {
+                    Line::from(vec![Span::raw(format!("{name} ")), cpu])
+                }
             }
         })
         .collect();
@@ -408,12 +439,34 @@ fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// `  12.5%`, colored by its band; a process busy on several cores is
+/// placed at 100 %.
+fn pinned_cpu(percent: Option<f64>) -> Span<'static> {
+    match percent {
+        Some(percent) => Span::styled(
+            format!("{percent:>6.1}%"),
+            Style::default().fg(theme::band(percent.min(100.0))),
+        ),
+        None => Span::styled(format!("{:>7}", "N/A"), Style::default().fg(theme::MUTED)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A height that grows from `min` to `desired` in its last step.
+    fn staged(min: u16, desired: u16) -> CardHeight {
+        CardHeight {
+            min,
+            listed: min,
+            graphed: min,
+            desired,
+        }
+    }
+
     fn fixed(min: u16, desired: u16) -> impl Fn(Card, u16) -> CardHeight {
-        move |_, _| CardHeight { min, desired }
+        move |_, _| staged(min, desired)
     }
 
     fn cards(placed: &[(Card, Rect)]) -> Vec<Card> {
@@ -504,9 +557,8 @@ mod tests {
             for width in 0..=220 {
                 for height in 0..=70 {
                     let area = Rect::new(3, 4, width, height);
-                    let placed = overview_layout(area, mode, true, |card, width| CardHeight {
-                        min: 3 + (card as u16) % 3,
-                        desired: 6 + width % 5,
+                    let placed = overview_layout(area, mode, true, |card, width| {
+                        staged(3 + (card as u16) % 3, 6 + width % 5)
                     });
                     for (index, (_, rect)) in placed.iter().enumerate() {
                         assert_eq!(rect.intersection(area), *rect, "{mode:?} {width}x{height}");
@@ -522,14 +574,7 @@ mod tests {
 
     #[test]
     fn rows_get_minimums_then_desired_heights_then_graph_room() {
-        let rows = [
-            CardHeight {
-                min: 4,
-                desired: 10,
-            },
-            CardHeight { min: 4, desired: 6 },
-            CardHeight { min: 3, desired: 5 },
-        ];
+        let rows = [staged(4, 10), staged(4, 6), staged(3, 5)];
         let graphs = |index: usize| index < 2;
         // Only the first minimum fits; nothing grows while a row is left out.
         assert_eq!(allocate_rows(7, &rows, graphs), [4, 0, 0]);
@@ -537,6 +582,86 @@ mod tests {
         assert_eq!(allocate_rows(21, &rows, graphs), [10, 6, 5]);
         assert_eq!(allocate_rows(25, &rows, graphs), [12, 8, 5]);
         assert_eq!(allocate_rows(0, &rows, graphs), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_shrinking_overview_drops_optional_rows_then_graph_rows_then_list_rows() {
+        // CPU (a 4-row grid) | GPU, Memory | Network (2 more interfaces),
+        // Storage | Pinned (6 pins): 11 rows at their minimum, 16 with whole
+        // lists, 22 with full graphs, 28 with everything.
+        let rows = [
+            CardHeight::new(1, 4, true),
+            CardHeight::new(1, 2, true),
+            CardHeight::list(6),
+        ];
+        assert_eq!(
+            rows[0],
+            CardHeight {
+                min: 4,
+                listed: 4,
+                graphed: 7,
+                desired: 11
+            }
+        );
+        assert_eq!(
+            rows[2],
+            CardHeight {
+                min: 3,
+                listed: 8,
+                graphed: 8,
+                desired: 8
+            }
+        );
+        let graphs = |index: usize| index < 2;
+        assert_eq!(allocate_rows(40, &rows, graphs), [17, 15, 8]);
+        assert_eq!(allocate_rows(28, &rows, graphs), [11, 9, 8]);
+        // The optional rows go first, those of the lower row first.
+        assert_eq!(allocate_rows(26, &rows, graphs), [11, 7, 8]);
+        assert_eq!(allocate_rows(22, &rows, graphs), [7, 7, 8]);
+        // Then the graphs shrink to one row.
+        assert_eq!(allocate_rows(19, &rows, graphs), [7, 4, 8]);
+        assert_eq!(allocate_rows(16, &rows, graphs), [4, 4, 8]);
+        // Then the lists, down to one row (and `… N more`).
+        assert_eq!(allocate_rows(15, &rows, graphs), [4, 4, 7]);
+        assert_eq!(allocate_rows(11, &rows, graphs), [4, 4, 3]);
+        // Then whole rows, from the last.
+        assert_eq!(allocate_rows(10, &rows, graphs), [4, 4, 0]);
+        assert_eq!(allocate_rows(7, &rows, graphs), [4, 0, 0]);
+
+        // No row gets shorter as the area grows.
+        let mut previous = vec![0; rows.len()];
+        for total in 0..60 {
+            let heights = allocate_rows(total, &rows, graphs);
+            for (height, before) in heights.iter().zip(&previous) {
+                assert!(height >= before, "{total}: {heights:?}");
+            }
+            previous = heights;
+        }
+    }
+
+    #[test]
+    fn narrow_drops_the_gpu_card_only_after_pinned_is_down_to_one_row() {
+        let heights = |card: Card, _| match card {
+            Card::Pinned => CardHeight::list(5),
+            _ => CardHeight::new(1, 0, false),
+        };
+        let narrow = |height| {
+            let placed = overview_layout(
+                Rect::new(0, 0, 60, height),
+                WidthMode::Narrow,
+                true,
+                heights,
+            );
+            let pinned = placed
+                .iter()
+                .find(|(card, _)| *card == Card::Pinned)
+                .map(|(_, rect)| rect.height);
+            (placed.last().map(|(card, _)| *card), pinned)
+        };
+        // Six cards of 3 rows; Pinned grows to 7 once all are shown.
+        assert_eq!(narrow(22), (Some(Card::Gpu), Some(7)));
+        assert_eq!(narrow(18), (Some(Card::Gpu), Some(3)));
+        assert_eq!(narrow(17), (Some(Card::Storage), Some(3)));
     }
 
     fn process(pid: u32, state_code: char) -> crate::linux::ProcessInfo {
@@ -706,6 +831,22 @@ mod tests {
         assert!(rows[1].contains("64.0 MiB"), "{rows:#?}");
         assert!(rows[2].contains("postgres"), "pin order: {rows:#?}");
         assert!(!rows.iter().any(|row| row.contains("bash")));
+    }
+
+    #[test]
+    fn pinned_cpu_is_colored_by_band_and_a_multi_core_process_counts_as_full() {
+        let app = overview_with_pins(&[(1, "idle", 2.0), (2, "build", 250.0)], &[1, 2]);
+        let (rows, buffer) = pinned_card(&app, 40, 5);
+        let cell_of = |row: usize, text: &str| {
+            let x = rows[row].find(text).unwrap();
+            let x = rows[row][..x].chars().count() as u16;
+            buffer[(x, row as u16)].fg
+        };
+        assert!(rows[2].contains(" 250.0%"), "{rows:#?}");
+        assert_eq!(cell_of(1, "2.0%"), theme::band(2.0));
+        assert_eq!(cell_of(2, "250.0%"), theme::band(100.0));
+        // The values line up whatever the width of the CPU value.
+        assert_eq!(rows[1].find("MiB"), rows[2].find("MiB"), "{rows:#?}");
     }
 
     #[test]

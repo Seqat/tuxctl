@@ -36,7 +36,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
   - **Memory:** a graph of RAM use, the RAM and swap gauges, plus RAM modules via EDAC sysfs when available.
   - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak, and a row per other interface.
   - **Storage:** usage of every local filesystem (one line per device, so btrfs subvolumes appear once; network, FUSE and loop mounts are left out), and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
-  - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU and memory.
+  - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU (colored by band; a process using several cores counts as 100 %) and memory. A pinned process that exits stays for a few seconds as `exited`, dimmed.
   - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes.
 
 #### Colors
@@ -505,7 +505,7 @@ The normal interface requires a terminal size of at least:
 
 Below either dimension, `tuxctl` displays a terminal-too-small warning instead of attempting to render the normal interface.
 
-Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview cards that do not fit are omitted in priority order rather than drawn empty. A short CPU card gives up its per-CPU grid first; when part of the grid is shown, it reports how many logical CPUs are not. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
+Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview cards that do not fit are omitted in priority order rather than drawn empty. A short Overview gives up, in this order: the optional rows (the per-CPU grid, other GPUs and interfaces, memory modules), then graph height down to one row, then list rows (Pinned and Storage, which then report how many rows are not shown), and only then whole cards. When part of the CPU grid is shown, it reports how many logical CPUs are not. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
 
 ---
 
