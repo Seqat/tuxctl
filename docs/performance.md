@@ -34,6 +34,38 @@ within the larger of twice that band and a floor of 0.15 CPU percentage
 points, 0.3 redraws/s, or 256 KiB. After minute 5, RSS should grow by at most
 128 KiB over a 15-minute run.
 
+## v0.3.3
+
+Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.74 MB
+(v0.3.0: 1.45 MB). Median of three runs, alternated with three runs of the
+v0.3.0 musl binary in the same session (in brackets). Static binaries do not
+load NVML, so these figures leave it out; see below for a glibc build.
+
+| Scenario | CPU % | Redraws/s | RSS |
+| --- | --- | --- | --- |
+| Overview, idle | 0.60 (0.55) | 2.00 (1.10) | 2.7 MiB |
+| Processes, idle | 0.60 (0.65) | 1.35 (2.00) | 2.8 MiB |
+| Logs, idle | 0.55 (0.50) | 0.00 (0.15) | 2.9 MiB |
+| Logs, 200 journal messages/s | 0.80 (0.80) | 3.87 (3.87) | 3.2 MiB |
+| Mouse hover at 240 Hz | 1.39 (1.39) | 13.43 (13.52) | 3.2 MiB |
+
+- CPU is unchanged: every difference is within the 0.15-point floor.
+- Idle redraws moved between tabs rather than grew: Overview +0.9/s,
+  Processes −0.65/s. Bisected to the temperature work, whose longer metrics
+  sample changes which collector updates land in the same frame (the main
+  loop renders once for updates that arrive together). The redraw guards
+  still pass.
+- Startup RSS: 2.7 MiB (v0.3.0: 2.4 MiB); the difference is about the
+  binary's growth. After 15 minutes on Overview: 2.7 MiB, 8 KiB more than at
+  minute 5.
+- Time to the first frame: 1.8 ms. Input latency during the log storm:
+  0.7 ms (0.7 ms).
+- A glibc build on the same machine loads NVML for its NVIDIA GPU: startup
+  RSS is about 31 MiB, Overview idle about 0.95 % and Processes idle about
+  0.60 % (hardware sensors are read only while the Overview is visible).
+- Another `tuxctl` was running on the machine during these runs; both
+  versions ran alongside it.
+
 ## v0.3.0
 
 Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.45 MB.

@@ -445,17 +445,17 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 
 ## Performance
 
-Measured on an AMD Ryzen 5 7500F with the v0.3.0 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
+Measured on an AMD Ryzen 5 7500F with the v0.3.3 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
 
 | Scenario | CPU | Redraws/s |
 | --- | --- | --- |
-| Overview, idle | 0.60 % | 1.1 |
-| Processes, idle | 0.75 % | 2.0 |
-| Logs, idle | 0.60 % | 0.0 |
-| Logs, 200 journal messages/s | 0.87 % | 3.9 |
-| Mouse hover at 240 Hz | 1.39 % | 13.5 |
+| Overview, idle | 0.60 % | 2.0 |
+| Processes, idle | 0.60 % | 1.4 |
+| Logs, idle | 0.55 % | 0.0 |
+| Logs, 200 journal messages/s | 0.80 % | 3.9 |
+| Mouse hover at 240 Hz | 1.39 % | 13.4 |
 
-RSS is about 2.3 MiB at startup and after 15 minutes, with no growth after warm-up; the binary is 1.45 MB. Measured alternately with v0.2.7 on the same machine, every difference is within run-to-run noise. Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
+RSS is about 2.7 MiB at startup and after 15 minutes, with no growth after warm-up; the binary is 1.74 MB. Measured alternately with v0.3.0 on the same machine, CPU is unchanged within run-to-run noise. A glibc build that loads NVML for an NVIDIA GPU uses about 31 MiB (see [Temperatures](#temperatures)). Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
 
 ---
 
