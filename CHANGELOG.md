@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- Issue forms for bugs (asking for `tuxctl --version` and `tuxctl --check`)
+  and feature requests, links to private security reports and the
+  documentation instead of blank issues, and a pull request checklist.
 - A contributing guide (`CONTRIBUTING.md`). Large unit-test modules live in
   sibling `tests.rs` files (for example `src/ui/tests.rs`), following its
   rule: a file over 500 lines whose tests are at least half of it, or whose
