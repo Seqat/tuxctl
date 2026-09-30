@@ -3,7 +3,7 @@
 Reference measurements for `tuxctl`, how they are made, and how releases
 compare. These numbers come from one machine; they are a baseline for
 regressions, not a guarantee for other systems. The limits that CI enforces
-on every push are listed in [`scripts/README.md`](../scripts/README.md#guards).
+on every push are listed in [`scripts/README.md`](https://github.com/Seqat/tuxctl/blob/main/scripts/README.md#guards).
 
 ## Reference machine
 

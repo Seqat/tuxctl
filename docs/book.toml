@@ -1,0 +1,20 @@
+# The tuxctl documentation, published to https://seqat.github.io/tuxctl/ by
+# .github/workflows/docs.yml. Build locally with `mdbook build docs`.
+[book]
+title = "tuxctl"
+description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
+authors = ["Seqat"]
+language = "en"
+# The pages live next to the screenshots and performance notes they use.
+src = "."
+
+[build]
+build-dir = "../target/book"
+create-missing = false
+
+[output.html]
+default-theme = "coal"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/Seqat/tuxctl"
+edit-url-template = "https://github.com/Seqat/tuxctl/edit/dev/docs/{path}"
+site-url = "/tuxctl/"
