@@ -35,7 +35,7 @@ version (1.88), a pseudo-terminal smoke test and redraw-rate guards; see
   `perf:`, `docs:`, `ci:`, `refactor:`, `test:` or `chore:`. Say why in the
   body when it is not obvious.
 - User-visible changes get an entry under `[Unreleased]` in
-  [CHANGELOG.md](CHANGELOG.md).
+  [CHANGELOG.md](CHANGELOG.md). Releases follow [RELEASING.md](RELEASING.md).
 
 ## Code guidelines
 
