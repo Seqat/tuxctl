@@ -100,9 +100,10 @@ The [documentation](https://seqat.github.io/tuxctl/) covers each screen,
 [development](https://seqat.github.io/tuxctl/development.html). Its sources are
 in [`docs/`](docs/).
 
-## Security
+## Contributing and security
 
-See the [security policy](SECURITY.md) to report a vulnerability privately.
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and the
+[security policy](SECURITY.md) to report a vulnerability privately.
 
 ## License
 

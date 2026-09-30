@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- A contributing guide (`CONTRIBUTING.md`). Large unit-test modules live in
+  sibling `tests.rs` files (for example `src/ui/tests.rs`), following its
+  rule: a file over 500 lines whose tests are at least half of it, or whose
+  tests alone exceed 1000 lines. Nine files moved; the tests are unchanged.
 - Every `unsafe` block states why it is sound, enforced by clippy
   (`undocumented_unsafe_blocks`); code outside tests may not use `unwrap`,
   `expect`, `panic!` or `unreachable!`, and the two `unreachable!` left are

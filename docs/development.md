@@ -7,7 +7,10 @@ cargo run                    # debug build
 cargo build --release        # optimized build in target/release/tuxctl
 ```
 
-Work happens on the `dev` branch; `main` receives releases.
+Work happens on the `dev` branch; `main` receives releases. The
+[contributing guide](https://github.com/Seqat/tuxctl/blob/main/CONTRIBUTING.md)
+has the branch and commit conventions, the code guidelines, and where tests
+go.
 
 ## Checks
 
