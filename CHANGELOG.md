@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documentation at <https://seqat.github.io/tuxctl/>: installation and
+  verification, each screen, every key, temperatures and GPUs, optional setup,
+  design, performance and development. The README is now a short
+  introduction that links to it.
+
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 

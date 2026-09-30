@@ -262,8 +262,8 @@ mod tests {
         }
     }
 
-    /// Maps a key as written in the README tables to a key event.
-    fn readme_key(token: &str) -> KeyEvent {
+    /// Maps a key as written in the docs/controls.md tables to a key event.
+    fn doc_key(token: &str) -> KeyEvent {
         let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
         match token {
             "Tab" => plain(KeyCode::Tab),
@@ -290,18 +290,20 @@ mod tests {
             single if single.chars().count() == 1 => {
                 plain(KeyCode::Char(single.chars().next().unwrap()))
             }
-            other => panic!("README key {other:?} has no mapping in readme_key()"),
+            other => panic!("documented key {other:?} has no mapping in doc_key()"),
         }
     }
 
     #[test]
-    fn every_key_in_the_readme_tables_is_handled() {
-        let readme = include_str!("../README.md");
-        let controls = readme
-            .split("## Controls & Keybindings")
-            .nth(1)
-            .and_then(|rest| rest.split("### Mouse Controls").next())
-            .expect("README controls section");
+    fn every_key_in_the_documented_tables_is_handled() {
+        let page = include_str!("../docs/controls.md");
+        let start = page
+            .find("## Global Controls")
+            .expect("docs/controls.md key tables");
+        let controls = page[start..]
+            .split("## Mouse Controls")
+            .next()
+            .unwrap_or_default();
         let mut modes: &[InputMode] = &[];
         let mut checked = 0;
         for line in controls.lines() {
@@ -314,7 +316,7 @@ mod tests {
                         "Main Menu" => &[InputMode::Menu],
                         "Services" => &[InputMode::Services],
                         "Logs" => &[InputMode::Logs],
-                        other => panic!("unknown README controls section {other:?}"),
+                        other => panic!("unknown controls section {other:?} in docs/controls.md"),
                     };
                     continue;
                 }
@@ -324,21 +326,21 @@ mod tests {
             };
             let first_column = keys.split(" | ").next().unwrap_or_default();
             for token in format!("`{first_column}").split('`').skip(1).step_by(2) {
-                let key = readme_key(token);
+                let key = doc_key(token);
                 for &mode in modes {
-                    // The Network screen has no search; the README lists `/` as common.
+                    // The Network screen has no search; the docs list `/` as common.
                     if token == "/" && mode == InputMode::Network {
                         continue;
                     }
                     assert!(
                         translate_key_event(key, mode).is_some(),
-                        "README documents `{token}` but {mode:?} ignores it"
+                        "docs/controls.md documents `{token}` but {mode:?} ignores it"
                     );
                 }
                 checked += 1;
             }
         }
-        assert!(checked >= 30, "only {checked} README keys were checked");
+        assert!(checked >= 30, "only {checked} documented keys were checked");
     }
 
     #[test]

@@ -6,6 +6,7 @@ rust-version = "1.88"
 authors = ["Seqat"]
 license = "MIT"
 repository = "https://github.com/Seqat/tuxctl"
+homepage = "https://seqat.github.io/tuxctl/"
 description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
 readme = "README.md"
 keywords = ["tui", "system-monitor", "linux", "terminal", "ratatui"]
