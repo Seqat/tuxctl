@@ -1,8 +1,9 @@
 name: Release
 
 # Publishing a GitHub release attaches static Linux binaries and checksums to
-# it. Other triggers are dry runs that upload the same files as workflow
-# artifacts only: a manual run, or a push to dev that changes this workflow.
+# it and publishes the crate on crates.io. Other triggers are dry runs that
+# upload the same files as workflow artifacts only and run `cargo publish
+# --dry-run`: a manual run, or a push to dev that changes this workflow.
 on:
   release:
     types: [published]
@@ -115,3 +116,42 @@ jobs:
         run: >
           gh release upload "$TAG" dist/tuxctl-*.tar.gz dist/SHA256SUMS
           --clobber --repo "$GITHUB_REPOSITORY"
+
+  crates:
+    name: crates.io
+    # Only once every binary built, so a broken release never reaches crates.io.
+    needs: build
+    runs-on: ubuntu-latest
+    # crates.io Trusted Publishing: the job trades its GitHub OIDC token for a
+    # short-lived publish token; no crates.io token is stored in the repository.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - name: Read the package version
+        run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
+      - name: Check the tag matches Cargo.toml
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::release tag $TAG does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+      - name: Dry run
+        if: github.event_name != 'release'
+        run: cargo publish --dry-run --locked
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: github.event_name == 'release'
+        id: auth
+      - name: Publish
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
+  --locked` builds against glibc and can show NVIDIA GPUs through NVML.
+
+### Internal
+
+- Publishing a GitHub release also publishes the crate on crates.io through
+  Trusted Publishing (no stored token); other runs of the release workflow
+  check the package with `cargo publish --dry-run`.
+- The package lists keywords and the `command-line-utilities` category.
+
 ## [0.3.3] - 2026-09-30
 
 A redesigned Overview: responsive cards with temperatures, GPU usage, power,
