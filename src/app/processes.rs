@@ -358,17 +358,16 @@ impl App {
             }
         }
         let sort = self.process_sort;
-        let live_index = |row: &ProcessRow| match *row {
-            ProcessRow::Live { index, .. } => index,
-            ProcessRow::Exited { .. } => unreachable!("unpinned rows are live"),
-        };
-        rows.sort_by(|left, right| {
-            let (left, right) = (live_index(left), live_index(right));
-            compare_processes(
-                (&processes[left], &keys[left]),
-                (&processes[right], &keys[right]),
-                sort,
-            )
+        rows.sort_by(|left, right| match (*left, *right) {
+            (ProcessRow::Live { index: left, .. }, ProcessRow::Live { index: right, .. }) => {
+                compare_processes(
+                    (&processes[left], &keys[left]),
+                    (&processes[right], &keys[right]),
+                    sort,
+                )
+            }
+            // Only live rows are sorted here; exited pins join below.
+            _ => std::cmp::Ordering::Equal,
         });
         // Pinned rows lead in the user's order; sorting never touches them.
         let pinned_section = pinned.iter().enumerate().filter_map(|(slot, pin)| {

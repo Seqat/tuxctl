@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
+    io::{self, Read},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
     sync::Arc,
@@ -434,16 +435,40 @@ fn read_process(path: &Path, expected_pid: u32, page_size: u64) -> Option<RawPro
     Some(process)
 }
 
+/// The most of a command line that is read: more than any row or the detail
+/// view shows, while a process whose owner gave it megabytes of arguments
+/// costs no more memory than any other.
+const MAX_COMMAND_BYTES: u64 = 4096;
+
 fn read_command(path: &Path) -> Option<String> {
-    let command = fs::read(path.join("cmdline"))
+    let command = read_prefix(&path.join("cmdline"), MAX_COMMAND_BYTES)
         .ok()
-        .and_then(|bytes| parse_command_line(&bytes));
+        .and_then(|(bytes, truncated)| {
+            let command = parse_command_line(&bytes)?;
+            Some(if truncated {
+                format!("{command}…")
+            } else {
+                command
+            })
+        });
 
     command.or_else(|| {
         fs::read_link(path.join("exe"))
             .ok()
             .map(|executable| executable.to_string_lossy().into_owned())
     })
+}
+
+/// Up to `limit` bytes of the file at `path`, and whether it had more.
+fn read_prefix(path: &Path, limit: u64) -> io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((bytes, truncated))
 }
 
 fn parse_command_line(bytes: &[u8]) -> Option<String> {
@@ -889,6 +914,64 @@ mod tests {
         let contents = "cpu  10 20 30 40 50 60 70 80 90 100\ncpu0 1 2\ncpu1 3 4\nintr 0\n";
 
         assert_eq!(parse_system_cpu(contents), Some((360, 2)));
+    }
+
+    #[test]
+    fn a_name_cannot_forge_the_fields_after_it() {
+        // `comm` is set by the process's owner; fields that follow the last `)`
+        // are the kernel's, so a name that imitates them changes nothing.
+        let forged = "x) R 1 1 1 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 1 0 1";
+        let line = stat_line(forged);
+        let process = parse_process_stat(&line, 4096).unwrap();
+        assert_eq!(process.name, forged);
+        assert_eq!(process.state, 'S');
+        assert_eq!(process.parent_pid, 7);
+        assert_eq!(process.start_time, 900);
+        // The start time is half of the identity that signals are checked against.
+        assert_eq!(read_process_start_time(&line), Some(900));
+
+        for name in [")", "((", ") (", "\n)\n", "tab\there", ""] {
+            let process = parse_process_stat(&stat_line(name), 4096).unwrap();
+            assert_eq!((process.name.as_str(), process.start_time), (name, 900));
+        }
+    }
+
+    #[test]
+    fn truncated_or_malformed_stat_lines_are_skipped() {
+        let line = stat_line("worker");
+        for cut in [0, 3, 10, line.len() - 10] {
+            assert!(parse_process_stat(&line[..cut], 4096).is_none(), "{cut}");
+        }
+        assert!(parse_process_stat("42 worker S 7", 4096).is_none());
+        assert!(parse_process_stat(") 42 (", 4096).is_none());
+        assert!(parse_process_stat(&line.replace("900", "-1"), 4096).is_none());
+        assert_eq!(read_process_start_time(") 42 ("), None);
+    }
+
+    #[test]
+    fn huge_command_lines_are_read_only_up_to_a_bound() {
+        let proc_dir = temp_proc_dir("huge_cmdline");
+        let pid_dir = proc_dir.join("42");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let mut arguments = b"/usr/bin/demo\0".to_vec();
+        arguments.extend(std::iter::repeat_n(b'a', 1 << 20));
+        fs::write(pid_dir.join("cmdline"), &arguments).unwrap();
+
+        let command = read_command(&pid_dir).unwrap();
+        assert!(
+            command.starts_with("/usr/bin/demo aaa"),
+            "{}",
+            &command[..20]
+        );
+        assert!(command.ends_with('…'));
+        assert!(command.len() <= MAX_COMMAND_BYTES as usize + '…'.len_utf8());
+
+        fs::write(pid_dir.join("cmdline"), b"/usr/bin/demo\0--short\0").unwrap();
+        assert_eq!(
+            read_command(&pid_dir).as_deref(),
+            Some("/usr/bin/demo --short")
+        );
+        let _ = fs::remove_dir_all(&proc_dir);
     }
 
     #[test]

@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Command lines are read up to 4 KiB per process; longer ones end in `…`.
+  Before, another local user could make `tuxctl` hold megabytes per process
+  by starting processes with huge argument lists.
 - A security policy (`SECURITY.md`) with private vulnerability reporting
   through GitHub.
 - Release archives carry a build provenance attestation:
@@ -22,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- Every `unsafe` block states why it is sound, enforced by clippy
+  (`undocumented_unsafe_blocks`); code outside tests may not use `unwrap`,
+  `expect`, `panic!` or `unreachable!`, and the two `unreachable!` left are
+  gone.
+- Tests for hostile `/proc/<pid>/stat` names (a name imitating the fields
+  after it cannot change the start time used to verify signal targets),
+  malformed stat lines and huge command lines.
 - Every GitHub Action is pinned to a commit, and checkouts do not keep the
   repository token. A new Security workflow runs `cargo-deny` (RustSec
   advisories, licenses, sources) and `zizmor` (workflow audit) on every push

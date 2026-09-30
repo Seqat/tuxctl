@@ -1,3 +1,19 @@
+// Every `unsafe` block states why it is sound (`// SAFETY: …`).
+#![deny(clippy::undocumented_unsafe_blocks)]
+// Outside tests, errors are handled rather than turned into panics: a panic
+// in the UI thread ends the session.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 mod about;
 mod action;
 mod app;

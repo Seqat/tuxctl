@@ -203,6 +203,8 @@ impl Drop for JournalCollector {
 }
 
 fn spawn_journalctl() -> std::io::Result<Child> {
+    // JSON output turns fields over 4096 bytes into `null`, which bounds every
+    // entry whatever other users log; do not add `--all`, which lifts that.
     Command::new("journalctl")
         .args([
             "--no-pager",

@@ -486,7 +486,8 @@ impl App {
                 None => false,
             },
             Action::ActivateMenuItem(item) => self.activate_menu_item(item),
-            Action::Resize => unreachable!("resize actions return before modal suppression"),
+            // Handled before this match, so no modal can suppress it.
+            Action::Resize => true,
             _ if self.overlay.is_some() => false,
             Action::ShowHelp => {
                 self.overlay = Some(Overlay::Help);
