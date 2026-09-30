@@ -70,3 +70,19 @@ fn a_valid_interval_does_not_prevent_version() {
     assert_eq!(output.status.code(), Some(0));
     assert!(text(&output.stdout).starts_with("tuxctl "));
 }
+
+#[test]
+fn no_nvidia_temperature_is_accepted_on_every_build() {
+    let output = run(&["--no-nvidia-temperature", "--version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(text(&output.stdout).starts_with("tuxctl "));
+}
+
+#[test]
+fn check_prints_a_sensor_report_without_touching_the_terminal() {
+    let output = run(&["--check"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = text(&output.stdout);
+    assert!(report.starts_with("tuxctl "), "{report}");
+    assert!(report.contains("sensor check"), "{report}");
+}

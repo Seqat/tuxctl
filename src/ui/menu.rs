@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -13,7 +13,7 @@ use crate::{
     action::{MenuItem, MouseTarget},
 };
 
-use super::layout;
+use super::{layout, theme};
 
 const MENU_WIDTH: u16 = 34;
 const HINT: &str = "↑↓ select  Enter open  Esc close";
@@ -46,11 +46,11 @@ pub(super) fn render_menu(
         let row = Rect::new(inner.x, inner.y + offset, inner.width, 1);
         let style = if item == selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if hovered == Some(&MouseTarget::MenuItem(item)) {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(theme::HOVER_BG)
         } else {
             Style::default()
         };
@@ -67,7 +67,7 @@ pub(super) fn render_menu(
         let hint = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         frame.render_widget(
             Paragraph::new(layout::truncate(HINT, usize::from(inner.width)))
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(Alignment::Center),
             hint,
         );
@@ -83,7 +83,7 @@ pub(super) fn render_about(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(format!("{} {}", about::NAME, about::VERSION)).style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(about::DESCRIPTION),
@@ -95,7 +95,7 @@ pub(super) fn render_about(frame: &mut Frame, area: Rect) {
             about::RUST_VERSION
         )),
         Line::from(""),
-        Line::from("Esc back to the menu").style(Style::default().fg(Color::DarkGray)),
+        Line::from("Esc back to the menu").style(Style::default().fg(theme::MUTED)),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(

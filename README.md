@@ -23,33 +23,62 @@ tar xzf tuxctl-$(uname -m)-unknown-linux-musl.tar.gz
 ./tuxctl-$(uname -m)-unknown-linux-musl/tuxctl
 ```
 
-Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked`. See [Installation](#installation) for checksums and other options.
+Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.3 --locked`. See [Installation](#installation) for checksums and other options.
 
 ## Features
 
 ### Overview
 
-- Responsive **System** and **Hardware** dashboard.
-- System information:
-  - Hostname and kernel version.
-  - Uptime.
-  - Process, running-process, and zombie counts.
-  - Root filesystem usage.
-  - Pinned processes (pin them with `P` on the Processes tab) with live CPU and memory.
-- Live CPU monitoring:
-  - Aggregate CPU utilization.
-  - Bounded CPU utilization history.
-  - 1-minute, 5-minute, and 15-minute load averages.
-  - Per-logical-CPU utilization.
-  - Responsive logical-CPU grid for different terminal sizes.
-- Live RAM usage with used/total capacity and a usage trend.
-- Hardware inventory:
-  - CPU model information.
-  - RAM module information via EDAC sysfs when available.
-  - GPU devices using DRM/NVIDIA sysfs metadata.
-  - NVMe and SATA/SCSI storage devices, with live read/write throughput from `/proc/diskstats`.
-- Compact physical network interface summary with live RX/TX rates and a combined traffic trend with its peak.
-- Responsive layout that switches between side-by-side and stacked dashboards as terminal space changes.
+- A system summary in the top border: hostname, kernel, uptime, and process, running-process, and zombie counts (zombies are highlighted when there are any). It shortens on narrow terminals: the kernel goes first, then the counts are abbreviated (`397p · 2r · 0z`), then the uptime goes.
+- Cards for **CPU**, **GPU**, **Memory**, **Network**, **Storage**, and **Pinned** processes. Each card names its component in its title with the model, temperature and power where known (`GPU  RTX 5070 Ti · 43°C · 28W`); the model is shortened first when the title does not fit.
+  - **CPU:** a graph of total utilization, utilization and 1/5/15-minute load averages, and a per-logical-CPU grid. Package power appears where this user can read it: from the out-of-tree `zenpower` driver (AMD Zen 1–3), or from RAPL energy counters, which are root-only unless an administrator makes them readable (see [CPU power](#cpu-power) under Optional setup).
+  - **GPU:** the discrete GPU (or the only one) with a utilization graph, utilization, VRAM use and fan speed where the driver reports them, and a row per other GPU. NVIDIA GPUs of the proprietary driver report through NVML; `amdgpu` through sysfs (`gpu_busy_percent`, `mem_info_vram_*`, hwmon power and fan); `nouveau` reports power and fan; Intel GPUs report none of these. A runtime-suspended GPU is never woken to be read.
+  - **Memory:** a graph of RAM use, the RAM and swap gauges, plus RAM modules via EDAC sysfs when available.
+  - **Network:** the main physical interface with its state and temperature, a graph of its traffic with the peak (on a logarithmic scale, so one spike does not flatten everyday traffic; below 1 KiB/s stays at the baseline), and a row per other interface.
+  - **Storage:** usage of every local filesystem (one line per device, so btrfs subvolumes appear once; network, FUSE and loop mounts are left out), and NVMe/SATA/SCSI disks with their temperature and live read/write throughput from `/proc/diskstats`.
+  - **Pinned:** processes pinned with `P` on the Processes tab, with live CPU (colored by band; a process using several cores counts as 100 %) and memory. A pinned process that exits stays for a few seconds as `exited`, dimmed.
+  - Graphs keep the last 240 samples and show as many as fit the card; the bottom border states the time span shown. They start over when the sampling interval changes.
+
+#### Colors
+
+Utilization values (total and per-CPU utilization, RAM, GPU utilization and VRAM) and the columns of the CPU, memory and GPU graphs take a color band: light blue below 10 %, green below 65 %, yellow below 80 %, orange below 95 %, and red from 95 %. The network graph shows throughput, not a percentage, and stays neutral. Temperatures use the same bands as a share of their critical limit.
+
+`tuxctl` reads `COLORTERM` and `TERM` once at startup: `truecolor`/`24bit` get the full palette, `*256color` terminals the nearest 256-color entries, and anything else the 16 basic colors (where orange becomes bright red).
+- Component temperatures: CPU packages, GPUs, NVMe/SATA storage, and network adapters that have a kernel sensor (see [Temperatures](#temperatures)).
+- Responsive layout by terminal width: 150 columns and more show a 2×2 grid (CPU | GPU, Memory | Network), Storage below it and Pinned as a column on the right; 100–149 columns show the grid with Storage and Pinned side by side below it; narrower terminals stack the cards (CPU, Memory, Pinned, Network, Storage, GPU) with each graph in its card's title row, or above the card's rows when the terminal is tall enough for every card that way. Cards side by side are equally wide, so their graphs span the same time.
+
+#### Temperatures
+
+A temperature appears next to a component only when the kernel provides a sensor for it; components without one show nothing. `–` means the sensor exists but has no value right now, for example while a GPU is runtime-suspended. Sensors are read at most every 2 seconds, whatever the sampling interval.
+
+The number takes the color band of its share of the component's critical temperature (see [Colors](#colors)): the limit the driver reports (`temp*_crit`, else `temp*_max`; for NVIDIA GPUs the slowdown temperature NVML reports), or, when it reports none, an assumed limit per component type. The value itself is always shown, so the color never carries meaning alone.
+
+| Component | Assumed critical temperature |
+| --- | --- |
+| CPU | 95 °C |
+| GPU | 95 °C |
+| NVMe | 80 °C |
+| SATA / SAS and other disks | 60 °C |
+| Network adapter | 100 °C |
+
+| Component | Source |
+| --- | --- |
+| Intel CPU | `coretemp`: the `Package id N` sensor, or the hottest core when there is none |
+| AMD CPU | `k10temp` or `zenpower`: `Tdie`, else `Tctl` (per-CCD sensors are not used) |
+| Other CPUs (ARM, SoCs) | Only without a CPU hwmon driver: the hottest thermal zone whose type names the CPU or SoC (never `acpitz`) |
+| AMD GPU | `amdgpu` (the `edge` sensor) or `radeon` hwmon |
+| Intel GPU | `i915` / `xe` hwmon, when the GPU has its own sensor; integrated GPUs usually do not |
+| NVIDIA GPU, `nouveau` | `nouveau` hwmon |
+| NVIDIA GPU, proprietary driver | NVML (`libnvidia-ml.so.1`, installed with the driver); not in the static release binaries |
+| NVMe | `nvme` hwmon (`Composite`) |
+| SATA / SAS | `drivetemp` hwmon, only when that module is loaded (see [Optional setup](#optional-setup)) |
+| Network adapter | A hwmon sensor on the adapter or on its PHY |
+
+RAM (SPD) sensors are not shown.
+
+**NVIDIA proprietary driver.** Its GPUs have no hwmon sensor, so their temperature comes from NVML, which `tuxctl` loads only when it finds a GPU using the `nvidia` driver. NVML is expensive in memory: on the reference machine below it adds about 20 MiB of private memory (`RssAnon` +20.2 MiB, PSS +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages) and one thread, from the first reading on. Reading an NVIDIA GPU through NVML also costs CPU time in the driver: utilization and power are read on every sample and temperature, VRAM and fan every 2 seconds, which adds about 0.35 % of one core at the default 1 s interval and about 0.65 % at 250 ms on the reference machine (the fan query alone takes about 4 ms). These and the other hardware sensors are read only while the Overview is visible; the other tabs cost nothing for them. `--no-nvidia-temperature` leaves NVML unloaded. The static release binaries cannot load NVML at all, so they show no temperature for these GPUs; use a glibc build, such as one built with `cargo install`.
+
+**Runtime power management.** `tuxctl` never wakes a sleeping GPU: it reads `power/runtime_status` first and shows `–` while the GPU is suspended. NVML stays initialized only when the GPU cannot runtime-suspend anyway (`power/control` is `on`, or the driver reports `Runtime D3 status` as not supported or disabled). With RTD3 enabled, as on many hybrid laptops, NVML is initialized for each reading and shut down right after, and only while every NVIDIA GPU is awake, so `tuxctl` never keeps the GPU powered.
 
 ### Processes
 
@@ -66,7 +95,7 @@ Or build it with Rust 1.88 or newer: `cargo install --git https://github.com/Seq
 - Kernel-thread filter (`v`).
 - Detailed process inspection (`Enter`).
 - Safe process signaling:
-  - SIGTERM with `t`.
+  - SIGTERM with `T` / `Shift+T`.
   - SIGKILL with `K` / `Shift+K`.
   - Explicit confirmation before destructive actions.
   - `Cancel` is the safe default.
@@ -228,12 +257,14 @@ install -Dm755 "tuxctl-$arch-unknown-linux-musl/tuxctl" ~/.local/bin/tuxctl
 
 `~/.local/bin` must be on your `PATH`.
 
+The static binaries cannot load NVIDIA's NVML library, so they cannot show temperatures or usage of NVIDIA GPUs on the proprietary driver; build from source for that (see [Optional setup](#optional-setup)).
+
 ### Install from Source
 
 Install a tagged version directly with Cargo:
 
 ```sh
-cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.0 --locked
+cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.3 --locked
 ```
 
 Or from a clone of the repository:
@@ -259,15 +290,57 @@ cargo build --release --locked
 ./target/release/tuxctl
 ```
 
+### Optional setup
+
+Everything works without setup. Three things need a step, and `tuxctl --check` shows which apply to your machine: it lists the sensors `tuxctl` finds, with their values and where they come from, and says what would enable the missing ones.
+
+| To see | You need |
+| --- | --- |
+| SATA / SAS disk temperatures | the `drivetemp` kernel module ([below](#sata-and-sas-disk-temperatures)) |
+| CPU package power | readable RAPL energy counters ([below](#cpu-power)) |
+| Temperature and usage of NVIDIA GPUs on the proprietary driver | a glibc build of `tuxctl`, such as `cargo install` ([below](#nvidia-gpus)) |
+
+#### SATA and SAS disk temperatures
+
+SATA and SAS disk temperatures need the kernel's `drivetemp` module, which ships with the kernel but is usually not loaded. It is optional: without it `tuxctl` works normally and shows no temperature for these disks. `tuxctl` never loads it for you. To load it now and at every boot:
+
+```sh
+sudo modprobe drivetemp
+echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf
+```
+
+Restart `tuxctl` afterwards: it looks for new sensors at startup. To undo, delete `/etc/modules-load.d/drivetemp.conf`.
+
+> **Hard disks:** per the [kernel documentation](https://docs.kernel.org/hwmon/drivetemp.html), reading the temperature may reset the spin-down timer on some drives (observed with WD120EFAX). `tuxctl` reads it every 2 seconds, so such a drive would never spin down. SSDs do not spin, so this does not concern them. If you rely on hard disks spinning down, leave `drivetemp` unloaded.
+
+#### CPU power
+
+Intel and AMD CPUs report their package energy through RAPL (`/sys/class/powercap/intel-rapl:N/energy_uj`), but since Linux 5.10 only root can read it: unprivileged access allowed a side-channel attack on the CPU (PLATYPUS, CVE-2020-8694). `tuxctl` asks for no privileges. It shows the package power when the counter is readable, computed from the energy used between two readings 2 seconds apart, and nothing otherwise.
+
+To make only the energy counters readable, now and at every boot:
+
+```sh
+echo 'ACTION=="add", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:[0-9]*", RUN+="/usr/bin/chmod a+r /sys%p/energy_uj"' | sudo tee /etc/udev/rules.d/90-rapl-energy.rules
+sudo udevadm trigger --subsystem-match=powercap --action=add
+```
+
+Restart `tuxctl` afterwards. This lets every local user read the energy counters again, and so reopens that side channel; weigh it on a shared machine. To undo, delete the rule and reboot. Some monitors are instead installed with the `cap_dac_read_search` capability (btop, for example), which lets them read every file on the system regardless of its permissions; `tuxctl` does not need or recommend that.
+
+#### NVIDIA GPUs
+
+GPUs on NVIDIA's proprietary driver report through NVML (`libnvidia-ml.so.1`, installed with the driver), which `tuxctl` loads at run time. The static release binaries cannot load it; build from source, for example with `cargo install` ([Install from Source](#install-from-source)). NVML adds about 20 MiB of memory and some CPU time; see [Temperatures](#temperatures) for the figures, and `--no-nvidia-temperature` to leave it unloaded.
+
 ### Command-Line Options
 
 ```text
-tuxctl [--interval <DURATION>]
+tuxctl [--interval <DURATION>] [--no-nvidia-temperature] [--check]
 ```
 
 | Option | Description |
 | --- | --- |
 | `--interval <DURATION>` | Sampling interval for CPU, memory, and network: `250ms`, `500ms`, `1s` (default), `2s`, `5s`, `10s`, `30s`, or `60s`. Processes refresh at most once per second and services at most every 5 seconds. The Overview CPU history shows the time span it covers. `+` and `-` change the interval while `tuxctl` runs. |
+| `--no-nvidia-temperature` | Do not load NVML for NVIDIA GPUs on the proprietary driver. NVML shows their temperature but adds about 20 MiB of private memory (see [Temperatures](#temperatures)); static builds never load it. The Help overlay shows whether it is on. |
+| `--check` | Print which sensors `tuxctl` finds on this machine, their values and origins, and what would enable the missing ones; then exit. See [Optional setup](#optional-setup). |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print the version. |
 
@@ -293,8 +366,8 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `?` | Toggle Help dialog |
 | `+` / `-` | Longer / shorter sampling interval (`250ms` to `60s`, shown as `⟳` in the top-right corner) |
 | `Esc` | Dismiss dialog / clear the search, then the view filter / open the main menu |
-| `q` | Quit |
-| `Ctrl+C` | Quit globally |
+| `q` | Open the main menu on Exit; `Enter` or `q` again quits |
+| `Ctrl+C` | Quit immediately, from anywhere |
 
 ### Navigation & Common Actions
 
@@ -315,7 +388,7 @@ Performance and smoke-test helpers for development live in [`scripts/`](scripts/
 | `m` | Sort by Memory |
 | `p` | Sort by PID |
 | `n` | Sort by Name |
-| `t` | Request `SIGTERM` for selected process |
+| `T` / `Shift+T` | Request `SIGTERM` for selected process |
 | `K` / `Shift+K` | Request `SIGKILL` for selected process |
 | `P` / `Shift+P` | Pin / unpin the selected process (up to 8) |
 | `Shift+↑` / `Shift+↓` | Move the selected pinned process up / down (`Alt+↑` / `Alt+↓` also work) |
@@ -339,6 +412,7 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 | --- | --- |
 | `↑` / `↓` | Move between About and Exit (`k` / `j` also work) |
 | `Enter` | Open About, or exit `tuxctl` |
+| `q` | Exit `tuxctl` |
 | `Esc` | Close the menu (from About, go back to the menu) |
 
 ### Services
@@ -371,17 +445,17 @@ Repeated sort commands toggle the sort direction. Pinned processes stay at the t
 
 ## Performance
 
-Measured on an AMD Ryzen 5 7500F with the v0.3.0 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
+Measured on an AMD Ryzen 5 7500F with the v0.3.3 release binary (static, x86_64) in a 160×50 terminal at the default 1 s interval. CPU is the percentage of one core; the numbers are a reference from one machine, not a guarantee.
 
 | Scenario | CPU | Redraws/s |
 | --- | --- | --- |
-| Overview, idle | 0.60 % | 1.1 |
-| Processes, idle | 0.75 % | 2.0 |
-| Logs, idle | 0.60 % | 0.0 |
-| Logs, 200 journal messages/s | 0.87 % | 3.9 |
-| Mouse hover at 240 Hz | 1.39 % | 13.5 |
+| Overview, idle | 0.60 % | 2.0 |
+| Processes, idle | 0.60 % | 1.4 |
+| Logs, idle | 0.55 % | 0.0 |
+| Logs, 200 journal messages/s | 0.80 % | 3.9 |
+| Mouse hover at 240 Hz | 1.39 % | 13.4 |
 
-RSS is about 2.3 MiB at startup and after 15 minutes, with no growth after warm-up; the binary is 1.45 MB. Measured alternately with v0.2.7 on the same machine, every difference is within run-to-run noise. Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
+RSS is about 2.7 MiB at startup and after 15 minutes, with no growth after warm-up; the binary is 1.74 MB. Measured alternately with v0.3.0 on the same machine, CPU is unchanged within run-to-run noise. A glibc build that loads NVML for an NVIDIA GPU uses about 31 MiB (see [Temperatures](#temperatures)). Every push is also checked on GitHub Actions against fixed redraw limits. See [docs/performance.md](docs/performance.md) for the method, history, and sources of noise.
 
 ---
 
@@ -431,7 +505,7 @@ The normal interface requires a terminal size of at least:
 
 Below either dimension, `tuxctl` displays a terminal-too-small warning instead of attempting to render the normal interface.
 
-Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview sections that do not fit are omitted rather than shown as empty headings; the CPU grid always reports how many logical CPUs are not shown. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
+Within supported dimensions, layouts adapt to available space. On narrow terminals the tab bar switches to short labels (`Ovr Proc Svc Logs Net`), and Overview cards that do not fit are omitted in priority order rather than drawn empty. A short Overview gives up, in this order: the optional rows (the per-CPU grid, other GPUs and interfaces, memory modules), then graph height down to one row, then list rows (Pinned and Storage, which then report how many rows are not shown), and only then whole cards. When part of the CPU grid is shown, it reports how many logical CPUs are not. Long values may be truncated in constrained layouts; horizontal scrolling is not currently provided.
 
 ---
 
@@ -439,6 +513,7 @@ Within supported dimensions, layouts adapt to available space. On narrow termina
 
 - **Linux only:** `tuxctl` relies directly on Linux `/proc`, `/sys`, systemd utilities, and Linux-specific process signaling.
 - **systemd dependency:** Services and Logs require access to `systemctl` and `journalctl`.
+- **NVIDIA temperatures:** GPUs on the proprietary driver need a glibc build; the static release binaries cannot load NVML.
 - **Hardware hotplug:** Hardware inventory is discovered at startup. Newly attached hardware is not dynamically re-enumerated until `tuxctl` is restarted.
 - **Process permissions:** Signaling another user's or privileged processes is subject to normal Linux permissions.
 - **pidfd availability:** Process signaling requires safe pidfd support. `tuxctl` intentionally does not fall back to PID-only signaling if that safety guarantee is unavailable.

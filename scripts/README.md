@@ -33,9 +33,9 @@ speed, so they hold on shared CI runners:
 | Rapid hover redraws/s | ≤ 31 | Hover redraws are coalesced to one per 33 ms. |
 | Log storm redraws/s | ≤ 21 | Background redraws are limited to one per 50 ms. |
 | Overview and Processes idle redraws/s | ≤ 3.5 at `1s`, ≤ 9.5 at `250ms` | At most one redraw per collector update (metrics and network every interval, processes at most once per second), plus 0.5, never one per 250 ms tick. The limit follows `--interval` after `--`. |
-| Startup RSS | ≤ 16 MiB | Catastrophe limit (about 3× a typical desktop). |
+| Startup RSS | ≤ 35 MiB | Catastrophe limit. `tuxctl` uses about 5 MiB, or about 30 MiB when it loads NVML for an NVIDIA GPU. |
 | Storm input latency (median) | ≤ 1000 ms | Catastrophe limit. |
-| Exit | `q` exits with status 0 | Liveness. |
+| Exit | `q` `q` exits with status 0 (one `q` for versions before v0.3.3) | Liveness. |
 
 CPU % and absolute RSS are reported, never enforced: they depend on the machine.
 Compare them locally against `docs/performance.md`.

@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-30
+
+A redesigned Overview: responsive cards with temperatures, GPU usage, power,
+swap, every local filesystem and colors by load. Also a greyed-out background
+behind popups, and safer keys: **`SIGTERM` now needs `Shift+T`**, and `q`
+asks before quitting. There were no 0.3.1 or 0.3.2 releases.
+
+### Added
+
+- Component temperatures on the Overview, in the card titles and on the
+  disk and interface rows. Sources are the kernel's hwmon drivers
+  (`coretemp`, `k10temp`, `zenpower`, `amdgpu`, `radeon`, `nouveau`,
+  `i915`, `xe`, `nvme`, `drivetemp`, network adapters and their PHYs), plus
+  CPU thermal zones on systems without a CPU hwmon driver. Components
+  without a sensor show nothing; `–` marks a known sensor without a value,
+  such as a runtime-suspended GPU, which is never woken to be read.
+  Sensors are read at most every 2 seconds, whatever the sampling interval,
+  and rediscovered (at most every 30 s) when one stops working.
+- GPU usage on the Overview: a utilization graph, utilization, VRAM use and
+  fan speed, with the power in the card title. `amdgpu` reports through
+  sysfs, `nouveau` reports power and fan, and Intel GPUs report none of
+  these.
+- NVIDIA GPUs on the proprietary driver report temperature and usage
+  through NVML, loaded at run time from the driver's `libnvidia-ml.so.1`
+  when such a GPU is found; NVML's slowdown temperature is their critical
+  limit. NVML adds about 20 MiB of private memory (RSS +24.7 MiB) and a
+  thread; utilization and power are read on every sample and temperature,
+  VRAM and fan every 2 seconds, about 0.35 % of a core at 1 s and 0.65 % at
+  250 ms on the reference machine. `--no-nvidia-temperature` leaves it
+  unloaded. NVML stays initialized only when the GPU cannot
+  runtime-suspend; with RTD3 it is initialized for each reading and only
+  while the GPU is awake. The static release binaries cannot load NVML;
+  use a glibc build such as one built with `cargo install`. Help shows
+  whether NVML is used.
+- CPU package power in the CPU card title where this user can read it:
+  from the out-of-tree `zenpower`, or from RAPL energy counters, which are
+  root-only unless an administrator makes them readable (the README shows
+  a narrow udev rule and its security trade-off). `tuxctl` asks for no
+  privileges.
+- Swap use on the Memory card, and every local filesystem on the Storage
+  card instead of only `/`: one line per block device (btrfs subvolumes
+  appear once), at most 8, leaving out network, FUSE and loop mounts.
+- `tuxctl --check` prints which sensors `tuxctl` finds (value and origin,
+  such as `k10temp Tctl` or `NVML`) and what would enable the missing ones:
+  `drivetemp` for SATA disks, readable RAPL counters for CPU power, or a
+  glibc build for NVIDIA GPUs. The README gathers these steps under
+  "Optional setup".
+- The screen behind a popup (main menu, About, Help, details, signal
+  confirmation) is greyed out so the popup stands out.
+
+### Changed
+
+- **Breaking:** `SIGTERM` is now requested with `T` / `Shift+T` instead of `t`.
+  Keys that change the system or persistent state (signals, pins) use `Shift`;
+  navigation, sorting, views, search and menus stay on plain keys. A plain
+  `t` does nothing.
+- `q` no longer quits straight away: it opens the main menu with Exit
+  selected, and `Enter` or `q` again quits (`Esc` cancels). `Ctrl+C` still
+  quits immediately. A pending signal confirmation is cancelled.
+- The Overview is a set of cards that uses the whole terminal: CPU, GPU,
+  Memory, Network, Storage and Pinned, each with its model and temperature
+  in the title and, for CPU, GPU, Memory and Network, a graph as wide as
+  the card. At 150 columns and more they form a 2×2 grid with Storage below
+  and Pinned on the right; at 100–149 columns Storage and Pinned sit side
+  by side under the grid; narrower terminals stack the cards in priority
+  order, with the graphs in the card titles unless the terminal is tall
+  enough for them inside the cards. Hostname, kernel, uptime and process
+  counts moved into the top border.
+- Utilization values, graphs (column by column), pinned processes' CPU and
+  temperatures are colored by band: light blue below 10 %, green below
+  65 %, yellow below 80 %, orange below 95 %, red above. Temperatures are
+  placed as a share of the driver's critical or maximum temperature, or of
+  an assumed limit per component type when the driver reports none (CPU
+  and GPU 95 °C, NVMe 80 °C, other disks 60 °C, network adapters 100 °C).
+  The colors follow what the terminal supports (`COLORTERM`, `TERM`): true
+  color, 256 colors, or the 16 basic colors.
+- Graphs keep 240 samples instead of 60 and show as many as fit the card.
+  The Network graph follows the interface in the card's title and uses a
+  logarithmic scale, so one spike no longer flattens everyday traffic.
+  Cards side by side are equally wide, so their graphs span the same time.
+- A short Overview gives up the optional rows first (the per-CPU grid,
+  other GPUs and interfaces, memory modules), then graph height, then
+  Pinned and Storage rows (with a count of what is left out), and only
+  then whole cards.
+- Temperatures, GPU usage, CPU power and filesystem use are read only
+  while the Overview is visible; other tabs keep the last values, and
+  returning to the Overview reads them at once.
+
+### Fixed
+
+- Overview storage rows no longer cut a device label short (for example to
+  `NVMe…`) at the one width where only the label would have fit.
+
+### Internal
+
+- Key bindings live in one table per input mode (`src/keymap.rs`), and UI
+  colors are named by meaning in one place (`src/ui/theme.rs`), as groundwork
+  for configurable keys and themes.
+- The hardware inventory records the canonical sysfs path of GPUs, disks and
+  network adapters; temperatures are matched to components by that path.
+- Temperature, GPU and mount discovery are tested against fake sysfs and
+  procfs data, and NVML sits behind a small trait so the sampler's
+  decisions are tested without the library or the hardware.
+- `measure.py` and `rss.py` quit through the new exit menu (`q` `q`), and
+  the startup RSS limit of `measure.py --check` is 35 MiB, since `tuxctl`
+  uses about 30 MiB when it loads NVML.
+
 ## [0.3.0] - 2026-09-23
 
 Tracking and interaction: pin processes, filter views, change the sampling
@@ -239,7 +346,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Seqat/tuxctl/compare/v0.3.0...v0.3.3
 [0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
 [0.2.5]: https://github.com/Seqat/tuxctl/compare/v0.2.2...v0.2.5

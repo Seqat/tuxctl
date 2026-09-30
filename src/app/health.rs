@@ -153,6 +153,7 @@ impl App {
         self.aggregate_cpu_history.clear();
         self.memory_history.clear();
         self.network_history.clear();
+        self.gpu_history.clear();
         self.sampling_interval_changed = true;
         true
     }

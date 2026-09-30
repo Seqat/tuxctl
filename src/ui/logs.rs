@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
@@ -12,7 +12,7 @@ use crate::{
     linux::{priority_label, JournalEntry},
 };
 
-use super::layout;
+use super::{layout, theme};
 
 pub struct LogRender {
     pub rows: Vec<(u64, Rect)>,
@@ -75,10 +75,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> LogRender {
 
         let style = if selected == Some(entry.id) {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::ROW_SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if hovered == Some(&MouseTarget::LogRow(entry.id)) {
-            Style::default().bg(Color::Rgb(35, 35, 35))
+            Style::default().bg(theme::ROW_HOVER_BG)
         } else {
             Style::default()
         };
@@ -101,7 +101,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> LogRender {
 
     let header = Row::new(["  TIME", "UNIT/SOURCE", "PRIORITY", "MESSAGE"]).style(
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     );
     frame.render_widget(
@@ -122,7 +122,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> LogRender {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(ratatui::layout::Alignment::Center),
             row_area,
         );
@@ -141,18 +141,16 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         (
             "[PAUSED]",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         )
     } else if app.log_following() {
         (
             "[FOLLOW]",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
         )
     } else {
-        ("[MANUAL]", Style::default().fg(Color::Cyan))
+        ("[MANUAL]", Style::default().fg(theme::ACCENT))
     };
 
     let pause_hint = if app.log_paused() {
@@ -174,7 +172,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("Search: {}_", app.log_search_query()),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         ));
     } else if app.log_search_query().is_empty() {
@@ -202,14 +200,16 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     if app.log_dropped() > 0 {
         spans.push(Span::styled(
             format!("   {} dropped", app.log_dropped()),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING),
         ));
     }
 
     if let Some(error) = app.log_error() {
         spans.push(Span::styled(
             format!("   Error: {error}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -247,7 +247,7 @@ pub fn render_detail(frame: &mut Frame, entry: Option<&JournalEntry>, area: Rect
             lines.push(Line::from(""));
             lines.push(
                 Line::from("Read-only inspection; Esc closes")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::MUTED)),
             );
             lines
         },
@@ -266,10 +266,12 @@ pub fn render_detail(frame: &mut Frame, entry: Option<&JournalEntry>, area: Rect
 
 fn priority_style(priority: Option<u8>) -> Style {
     match priority {
-        Some(0..=3) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Some(4) => Style::default().fg(Color::Yellow),
-        Some(5 | 6) => Style::default().fg(Color::Cyan),
-        Some(7) => Style::default().fg(Color::DarkGray),
+        Some(0..=3) => Style::default()
+            .fg(theme::ERROR)
+            .add_modifier(Modifier::BOLD),
+        Some(4) => Style::default().fg(theme::WARNING),
+        Some(5 | 6) => Style::default().fg(theme::ACCENT),
+        Some(7) => Style::default().fg(theme::MUTED),
         _ => Style::default(),
     }
 }

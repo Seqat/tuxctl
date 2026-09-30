@@ -1,8 +1,10 @@
 mod about;
 mod action;
 mod app;
+mod check;
 mod cli;
 mod event;
+mod keymap;
 mod linux;
 mod shutdown;
 mod ui;
@@ -32,8 +34,18 @@ const MAX_ACTIONS_PER_TURN: usize = 16;
 
 fn main() -> io::Result<()> {
     // Arguments are handled before the terminal is touched.
-    let interval = match cli::parse(std::env::args().skip(1)) {
-        Ok(cli::Command::Run { interval }) => interval,
+    let (interval, nvidia_temperature) = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::Run {
+            interval,
+            nvidia_temperature,
+        }) => (interval, nvidia_temperature),
+        Ok(cli::Command::Check { nvidia_temperature }) => {
+            print!(
+                "{}",
+                check::report_text(&linux::sensor_report(nvidia_temperature))
+            );
+            return Ok(());
+        }
         Ok(cli::Command::Help) => {
             print!("{}", cli::help_text());
             return Ok(());
@@ -48,6 +60,10 @@ fn main() -> io::Result<()> {
         }
     };
     let periods = CollectorPeriods::for_sampling_interval(interval);
+    ui::init_color_depth(ui::ColorDepth::detect(
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    ));
     let shutdown = shutdown::Shutdown::install()?;
 
     let main_thread = std::thread::current().id();
@@ -60,9 +76,11 @@ fn main() -> io::Result<()> {
     }));
 
     let mut terminal = TerminalSession::new()?;
-    let mut app = App::default().with_collector_periods(periods);
+    let mut app = App::default()
+        .with_collector_periods(periods)
+        .with_nvidia_temperature(nvidia_temperature);
     let mut events = EventHandler::new(TICK_RATE);
-    let metrics = match linux::SystemMetricsCollector::start(periods.metrics) {
+    let metrics = match linux::SystemMetricsCollector::start(periods.metrics, nvidia_temperature) {
         Ok(metrics) => metrics,
         Err(error) => return finish_application(terminal, (), Err(error)),
     };
@@ -72,6 +90,7 @@ fn main() -> io::Result<()> {
     };
     // Services only collect while their tab is visible; journalctl starts on
     // the first visit to Logs.
+    let mut sensors_active = app.sensors_visible();
     let mut services_paused = !app.services_visible();
     let services = match linux::ServiceCollector::start(periods.services, services_paused) {
         Ok(services) => services,
@@ -127,6 +146,10 @@ fn main() -> io::Result<()> {
             // to exactly one collection.
             if let Some(generation) = app.take_service_refresh_request() {
                 services.request_refresh(generation);
+            }
+            if sensors_active != app.sensors_visible() {
+                sensors_active = !sensors_active;
+                metrics.set_sensors_active(sensors_active);
             }
             if services_paused == app.services_visible() {
                 services_paused = !services_paused;

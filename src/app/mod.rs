@@ -34,12 +34,14 @@ mod test_support;
 use health::CollectorHealth;
 pub use health::{Collector, CollectorPeriods, DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS};
 use logs::LogView;
-pub(crate) use network::{is_overview_interface, is_physical_interface};
+pub(crate) use network::overview_interfaces;
 use processes::{PinnedProcess, ProcessKeys, ProcessRow, ProcessView};
 use services::ServiceView;
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
-const METRIC_HISTORY_CAPACITY: usize = 60;
+/// Samples kept per history: enough for a graph as wide as a card on a very
+/// wide terminal (a fixed 1.9 KiB each).
+const METRIC_HISTORY_CAPACITY: usize = 240;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalConfirmation {
@@ -76,6 +78,11 @@ impl MetricHistory {
         }
         self.samples.push_back(value);
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&mut self, value: f64) {
+        self.push(value);
     }
 
     fn push_percent(&mut self, percent: f64) -> bool {
@@ -120,10 +127,16 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
+    /// Whether NVML may be loaded for NVIDIA GPUs, shown in Help.
+    nvidia_temperature: bool,
     aggregate_cpu_history: MetricHistory,
     memory_history: MetricHistory,
-    /// Combined RX+TX bytes/s of the interfaces the Overview lists.
+    /// RX+TX bytes/s of the interface the Overview's Network card is about.
     network_history: MetricHistory,
+    /// That interface; its history starts over when it changes.
+    network_history_interface: Option<String>,
+    /// Utilization of the GPU the Overview's GPU card is about.
+    gpu_history: MetricHistory,
     processes: Vec<ProcessInfo>,
     /// Lowercased search/sort keys parallel to `processes`; empty until the next
     /// filter rebuild after a snapshot replaced `processes`.
@@ -191,9 +204,12 @@ impl Default for App {
             active_tab: Tab::Overview,
             system_metrics: SystemMetrics::default(),
             hardware: None,
+            nvidia_temperature: false,
             aggregate_cpu_history: MetricHistory::default(),
             memory_history: MetricHistory::default(),
             network_history: MetricHistory::default(),
+            network_history_interface: None,
+            gpu_history: MetricHistory::default(),
             processes: Vec::new(),
             process_keys: Vec::new(),
             process_summary: ProcessSummary::default(),
@@ -250,6 +266,11 @@ impl Default for App {
 
 impl App {
     /// Services are only collected while their tab is visible.
+    /// Whether the hardware sensors are shown (only the Overview shows them).
+    pub fn sensors_visible(&self) -> bool {
+        self.active_tab == Tab::Overview
+    }
+
     pub fn services_visible(&self) -> bool {
         self.active_tab == Tab::Services
     }
@@ -279,6 +300,11 @@ impl App {
         }
     }
 
+    /// Whether a popup (menu, dialog or details) covers the screen.
+    pub fn overlay_open(&self) -> bool {
+        self.overlay.is_some()
+    }
+
     pub fn about_visible(&self) -> bool {
         self.overlay == Some(Overlay::About)
     }
@@ -299,8 +325,21 @@ impl App {
         &self.network_history
     }
 
+    pub fn gpu_history(&self) -> &MetricHistory {
+        &self.gpu_history
+    }
+
     pub fn hardware(&self) -> Option<&HardwareInventory> {
         self.hardware.as_ref()
+    }
+
+    pub fn with_nvidia_temperature(mut self, enabled: bool) -> Self {
+        self.nvidia_temperature = enabled;
+        self
+    }
+
+    pub fn nvidia_temperature(&self) -> bool {
+        self.nvidia_temperature
     }
 
     pub fn input_mode(&self) -> InputMode {
@@ -360,7 +399,14 @@ impl App {
                 let memory_recorded = metrics
                     .memory
                     .is_some_and(|memory| self.memory_history.push_percent(memory.percent()));
-                let history_changed = cpu_recorded || memory_recorded;
+                let gpu_recorded = self
+                    .hardware
+                    .as_ref()
+                    .and_then(|inventory| inventory.primary_gpu()?.device_path.clone())
+                    .and_then(|path| metrics.gpus.iter().find(|gpu| gpu.device_path == path))
+                    .and_then(|gpu| gpu.utilization)
+                    .is_some_and(|utilization| self.gpu_history.push_percent(utilization));
+                let history_changed = cpu_recorded || memory_recorded || gpu_recorded;
                 let metrics_changed = self.system_metrics != metrics;
                 if metrics_changed {
                     self.system_metrics = metrics;
@@ -427,6 +473,7 @@ impl App {
             // Staleness is global state, so it is checked even while a modal is open.
             Action::Tick(now) => self.check_collector_staleness(now) | self.expire_exited_pins(now),
             Action::Escape => self.escape(),
+            Action::RequestQuit => self.request_quit(),
             Action::CancelProcessSignal => self.cancel_process_signal(),
             Action::ConfirmProcessSignal => self.confirm_process_signal(),
             Action::ToggleProcessSignalFocus => self.toggle_process_signal_focus(),
@@ -535,6 +582,11 @@ impl App {
 
     fn select_tab(&mut self, tab: Tab) -> bool {
         let entering_services = tab == Tab::Services && self.active_tab != Tab::Services;
+        // The GPU is not sampled while the Overview is hidden; a graph spanning
+        // that gap would misstate its time axis.
+        if tab == Tab::Overview && self.active_tab != Tab::Overview {
+            self.gpu_history.clear();
+        }
         // Tab actions are blocked while an overlay is open, so none is open here.
         let changed = self.active_tab != tab
             || self.process_searching
@@ -622,6 +674,21 @@ impl App {
         }
     }
 
+    /// `q` never quits by itself: it opens the main menu on Exit, where Enter
+    /// or `q` confirms. A pending signal confirmation is cancelled first.
+    fn request_quit(&mut self) -> bool {
+        self.cancel_process_signal();
+        let menu = Some(Overlay::Menu {
+            selected: MenuItem::Exit,
+        });
+        if self.overlay == menu {
+            return false;
+        }
+        self.overlay = menu;
+        self.hovered = None;
+        true
+    }
+
     fn move_menu_selection(&mut self, delta: isize) -> bool {
         let Some(Overlay::Menu { selected }) = &mut self.overlay else {
             return false;
@@ -649,7 +716,7 @@ impl App {
                 true
             }
             MenuItem::Exit => {
-                // Not destructive: leaving tuxctl needs no confirmation.
+                // The menu is the confirmation step (also for `q`).
                 self.should_quit = true;
                 false
             }
@@ -1134,6 +1201,28 @@ mod tests {
     }
 
     #[test]
+    fn request_quit_opens_the_menu_on_exit_from_every_overlay() {
+        let mut app = App::default();
+        assert!(app.update(Action::RequestQuit));
+        assert!(!app.should_quit());
+        assert_eq!(app.menu_selection(), Some(MenuItem::Exit));
+        assert!(!app.update(Action::RequestQuit), "already open");
+        app.update(Action::ActivateSelectedMenuItem);
+        assert!(app.should_quit());
+
+        for kind in OVERLAYS {
+            let mut app = app_with_overlay(kind);
+            app.update(Action::RequestQuit);
+            assert!(!app.should_quit(), "{kind:?}");
+            assert_eq!(app.menu_selection(), Some(MenuItem::Exit), "{kind:?}");
+            assert!(app.process_signal_confirmation().is_none(), "{kind:?}");
+            assert!(app.update(Action::Escape), "{kind:?} Esc cancels");
+            assert!(app.overlay.is_none(), "{kind:?}");
+            assert!(!app.should_quit(), "{kind:?}");
+        }
+    }
+
+    #[test]
     fn quit_action_stops_the_app() {
         let mut app = App::default();
 
@@ -1298,6 +1387,79 @@ mod tests {
     }
 
     #[test]
+    fn gpu_mount_and_swap_changes_redraw_only_the_overview() {
+        use std::{path::Path, sync::Arc};
+        let with = |value: u64| SystemMetrics {
+            cpu_percent: Some(10.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
+            swap: Some(crate::linux::ByteUsage {
+                used: value,
+                total: 100,
+            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: value,
+                    total: 100,
+                },
+            }],
+            gpus: vec![crate::linux::GpuTelemetry {
+                device_path: Arc::from(Path::new("/sys/devices/gpu")),
+                utilization: Some(value as f64),
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }],
+            ..SystemMetrics::default()
+        };
+        let mut app = App::default();
+        app.update(Action::SystemMetricsUpdated(with(1)));
+        for (offset, tab) in [Tab::Processes, Tab::Services, Tab::Logs, Tab::Network]
+            .into_iter()
+            .enumerate()
+        {
+            app.update(Action::SelectTab(tab));
+            assert!(
+                !app.update(Action::SystemMetricsUpdated(with(2 + offset as u64))),
+                "{tab:?}"
+            );
+        }
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(app.update(Action::SystemMetricsUpdated(with(50))));
+    }
+
+    #[test]
+    fn temperature_changes_redraw_only_the_overview() {
+        use crate::linux::{Temperature, TemperatureKey};
+        let with_temperature = |celsius| SystemMetrics {
+            cpu_percent: Some(10.0),
+            memory: Some(crate::linux::ByteUsage { used: 1, total: 4 }),
+            temperatures: vec![Temperature {
+                key: TemperatureKey::CpuPackage(0),
+                celsius: Some(celsius),
+                max: None,
+                crit: None,
+            }],
+            ..SystemMetrics::default()
+        };
+        let mut app = App::default();
+        app.update(Action::SystemMetricsUpdated(with_temperature(50)));
+
+        // Hidden Overview: the new value is cached without a redraw.
+        for tab in [Tab::Processes, Tab::Services, Tab::Logs, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            let celsius = 51 + tab as i16;
+            assert!(
+                !app.update(Action::SystemMetricsUpdated(with_temperature(celsius))),
+                "{tab:?}"
+            );
+            assert_eq!(app.system_metrics().temperatures[0].celsius, Some(celsius));
+        }
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(app.update(Action::SystemMetricsUpdated(with_temperature(60))));
+    }
+
+    #[test]
     fn overview_collector_health_transitions_redraw_only_while_visible() {
         let mut app = App::default();
         let process_snapshot = processes(vec![process(1, "init")]);
@@ -1376,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn network_history_sums_the_overview_interfaces_once_per_snapshot() {
+    fn network_history_follows_the_primary_interface_once_per_snapshot() {
         let mut app = App::default();
         let interface = |name: &str, rx, tx| NetworkInterfaceInfo {
             rx_rate_bytes_per_sec: rx,
@@ -1397,9 +1559,11 @@ mod tests {
         assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
         // An unchanged snapshot still adds a sample and redraws the Overview.
         assert!(app.update(Action::NetworkUpdated(snapshot.clone())));
+        // enp6s0 is the Network card's interface: 1000 + 24; wlan0 and the
+        // virtual interfaces are not counted.
         assert_eq!(
             app.network_history().iter().collect::<Vec<_>>(),
-            [1025.0, 1025.0]
+            [1024.0, 1024.0]
         );
 
         // Errors and snapshots without any rate add nothing.
@@ -1417,6 +1581,108 @@ mod tests {
         app.update(Action::SelectTab(Tab::Logs));
         assert!(!app.update(Action::NetworkUpdated(snapshot)));
         assert_eq!(app.network_history().iter().len(), 3);
+
+        // A new primary interface starts a new history.
+        app.update(Action::NetworkUpdated(NetworkSnapshot {
+            interfaces: vec![interface("wlan0", Some(7.0), Some(3.0))],
+            error: None,
+        }));
+        assert_eq!(app.network_history().iter().collect::<Vec<_>>(), [10.0]);
+    }
+
+    #[test]
+    fn sensors_are_visible_only_on_the_overview_and_the_gpu_graph_restarts_there() {
+        use std::{path::Path, sync::Arc};
+        let path: Arc<Path> = Arc::from(Path::new("/sys/devices/gpu"));
+        let mut app = App::default();
+        assert!(app.sensors_visible());
+        app.update(Action::HardwareDiscovered(
+            crate::linux::HardwareInventory {
+                gpus: vec![crate::linux::GpuDevice {
+                    model: "GPU".into(),
+                    kind: Some(crate::linux::GpuKind::Discrete),
+                    vram_bytes: None,
+                    device_path: Some(Arc::clone(&path)),
+                }],
+                ..crate::linux::HardwareInventory::default()
+            },
+        ));
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            gpus: vec![crate::linux::GpuTelemetry {
+                device_path: Arc::clone(&path),
+                utilization: Some(40.0),
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }],
+            ..SystemMetrics::default()
+        }));
+        assert_eq!(app.gpu_history().iter().len(), 1);
+
+        for tab in [Tab::Processes, Tab::Services, Tab::Logs, Tab::Network] {
+            app.update(Action::SelectTab(tab));
+            assert!(!app.sensors_visible(), "{tab:?}");
+        }
+        assert_eq!(app.gpu_history().iter().len(), 1, "kept while away");
+        app.update(Action::SelectTab(Tab::Overview));
+        assert!(app.sensors_visible());
+        assert_eq!(app.gpu_history().iter().len(), 0, "restarted on return");
+        // Selecting the Overview again while on it keeps the history.
+        app.update(Action::SystemMetricsUpdated(SystemMetrics {
+            gpus: vec![crate::linux::GpuTelemetry {
+                device_path: Arc::clone(&path),
+                utilization: Some(50.0),
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }],
+            ..SystemMetrics::default()
+        }));
+        app.update(Action::SelectTab(Tab::Overview));
+        assert_eq!(app.gpu_history().iter().len(), 1);
+    }
+
+    #[test]
+    fn gpu_history_records_the_primary_gpu_utilization() {
+        use std::{path::Path, sync::Arc};
+        let integrated: Arc<Path> = Arc::from(Path::new("/sys/devices/igpu"));
+        let discrete: Arc<Path> = Arc::from(Path::new("/sys/devices/dgpu"));
+        let gpu = |path: &Arc<Path>, kind| crate::linux::GpuDevice {
+            model: "GPU".into(),
+            kind: Some(kind),
+            vram_bytes: None,
+            device_path: Some(Arc::clone(path)),
+        };
+        let telemetry = |path: &Arc<Path>, utilization| crate::linux::GpuTelemetry {
+            utilization: Some(utilization),
+            ..crate::linux::GpuTelemetry {
+                device_path: Arc::clone(path),
+                utilization: None,
+                vram: None,
+                power_watts: None,
+                fan_percent: None,
+            }
+        };
+        let metrics = SystemMetrics {
+            gpus: vec![telemetry(&integrated, 5.0), telemetry(&discrete, 60.0)],
+            ..SystemMetrics::default()
+        };
+        let mut app = App::default();
+        // Before discovery there is no primary GPU to record.
+        assert!(app.update(Action::SystemMetricsUpdated(metrics.clone())));
+        assert_eq!(app.gpu_history().iter().len(), 0);
+
+        app.update(Action::HardwareDiscovered(
+            crate::linux::HardwareInventory {
+                gpus: vec![
+                    gpu(&integrated, crate::linux::GpuKind::Integrated),
+                    gpu(&discrete, crate::linux::GpuKind::Discrete),
+                ],
+                ..crate::linux::HardwareInventory::default()
+            },
+        ));
+        assert!(app.update(Action::SystemMetricsUpdated(metrics)));
+        assert_eq!(app.gpu_history().iter().collect::<Vec<_>>(), [60.0]);
     }
 
     #[test]
@@ -1426,15 +1692,16 @@ mod tests {
 
         for sample in 0..sample_count {
             app.update(Action::SystemMetricsUpdated(SystemMetrics {
-                cpu_percent: Some(sample as f64),
+                // Tenths, so every sample stays a valid percentage.
+                cpu_percent: Some(sample as f64 / 10.0),
                 ..Default::default()
             }));
         }
 
         let history = app.aggregate_cpu_history().iter().collect::<Vec<_>>();
         assert_eq!(history.len(), METRIC_HISTORY_CAPACITY);
-        assert_eq!(history.first(), Some(&5.0));
-        assert_eq!(history.last(), Some(&64.0));
+        assert_eq!(history.first(), Some(&0.5));
+        assert_eq!(history.last(), Some(&((sample_count - 1) as f64 / 10.0)));
     }
 
     fn assert_resize_preserves_overlay(app: &mut App, overlay_is_open: impl Fn(&App) -> bool) {

@@ -148,9 +148,11 @@ check("no process left in the session after exit", not t.session_processes(), st
 
 t2 = Tui(ARGV, cols=80, rows=24)
 t2.send("3", 0.5)
+t2.send("q", 0.4)
+check("a single 'q' only opens the exit menu", t2.alive())
 os.write(t2.fd, b"q")
 code = t2.wait_exit()
-check("'q' exits from Services (exit 0)", code == 0, f"exit={code}")
+check("'q' 'q' exits from Services (exit 0)", code == 0, f"exit={code}")
 
 # Signals quit like `q`, restore the terminal, stop the collectors, and then end
 # the process with the signal itself.

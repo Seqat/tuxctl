@@ -5,17 +5,29 @@ use std::{
     io::{self, Read},
     mem::MaybeUninit,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use super::{
     control::{run_periodic, CollectorControl},
+    gpu::GpuTelemetry,
     hardware::is_whole_disk,
     latest_snapshot::{self, LatestReceiver},
     rate::CounterSample,
+    temperature::{SysfsRoots, Temperature, TemperatureSampler},
 };
+
+/// NVIDIA temperatures come from NVML where it can be loaded; static musl
+/// builds know NVIDIA GPUs but cannot read them.
+#[cfg(not(target_env = "musl"))]
+pub(super) type Nvidia = super::nvml::NvmlReader;
+#[cfg(target_env = "musl")]
+pub(super) type Nvidia = super::temperature::NoNvidia;
 
 const PROC_STAT: &str = "/proc/stat";
 const PROC_MEMINFO: &str = "/proc/meminfo";
@@ -25,6 +37,9 @@ const PROC_DISKSTATS: &str = "/proc/diskstats";
 /// /proc/diskstats counts sectors in 512-byte units, whatever the device's
 /// real sector size.
 const DISKSTATS_SECTOR_BYTES: f64 = 512.0;
+const PROC_MOUNTS: &str = "/proc/self/mounts";
+/// Filesystems listed at most.
+const MAX_MOUNTS: usize = 8;
 const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 const PROC_KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
 
@@ -35,10 +50,20 @@ pub struct SystemMetrics {
     pub memory: Option<ByteUsage>,
     pub uptime: Option<Duration>,
     pub load_average: Option<LoadAverage>,
-    pub root_filesystem: Option<ByteUsage>,
+    /// `None` without swap.
+    pub swap: Option<ByteUsage>,
+    /// Local filesystems, `/` first; see [`parse_mounts`].
+    pub mounts: Vec<MountUsage>,
     pub system_identity: SystemIdentity,
     /// Throughput of whole disks; empty when /proc/diskstats is unreadable.
     pub disks: Vec<DiskIo>,
+    /// One entry per discovered sensor, read at most every 2 s.
+    pub temperatures: Vec<Temperature>,
+    /// Utilization, memory, power and fan of each GPU it can read.
+    pub gpus: Vec<GpuTelemetry>,
+    /// CPU package power where a driver reports it (zenpower), read with
+    /// the temperatures.
+    pub cpu_power_watts: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +101,12 @@ pub struct SystemIdentity {
     pub kernel_release: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountUsage {
+    pub mount_point: String,
+    pub usage: ByteUsage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteUsage {
     pub used: u64,
@@ -102,19 +133,28 @@ pub struct LoadAverage {
 pub struct SystemMetricsCollector {
     receiver: LatestReceiver<SystemMetrics>,
     control: Arc<CollectorControl>,
+    /// Whether the hardware sensors (temperatures, GPUs, CPU power, mounts)
+    /// are read; only the Overview shows them.
+    sensors_active: Arc<AtomicBool>,
+    refresh_generation: AtomicU64,
     worker: Option<JoinHandle<()>>,
 }
 
 impl SystemMetricsCollector {
-    pub fn start(refresh_rate: Duration) -> io::Result<Self> {
+    /// `nvidia_temperature` loads NVML for NVIDIA GPUs of the proprietary
+    /// driver; it is never set on builds without NVML (see `cli`).
+    pub fn start(refresh_rate: Duration, nvidia_temperature: bool) -> io::Result<Self> {
         let (metrics_tx, receiver) = latest_snapshot::channel();
         let control = Arc::new(CollectorControl::new(refresh_rate, false));
         let worker_control = Arc::clone(&control);
+        let sensors_active = Arc::new(AtomicBool::new(true));
+        let worker_sensors_active = Arc::clone(&sensors_active);
         let worker = thread::Builder::new()
             .name("system-metrics".into())
             .spawn(move || {
                 let identity = collect_system_identity();
-                let mut sampler = SystemMetricsSampler::new(identity);
+                let mut sampler =
+                    SystemMetricsSampler::new(identity, nvidia_temperature, worker_sensors_active);
 
                 run_periodic(
                     &worker_control,
@@ -126,12 +166,26 @@ impl SystemMetricsCollector {
         Ok(Self {
             receiver,
             control,
+            sensors_active,
+            refresh_generation: AtomicU64::new(0),
             worker: Some(worker),
         })
     }
 
     pub fn latest(&self) -> Option<SystemMetrics> {
         self.receiver.take_latest()
+    }
+
+    /// Reads the hardware sensors only while `active` (the Overview is
+    /// visible): they cost CPU time, NVML queries above all. Becoming active
+    /// asks for a sample at once, so the Overview does not show old values
+    /// for up to a sampling interval.
+    pub fn set_sensors_active(&self, active: bool) {
+        let was_active = self.sensors_active.swap(active, Ordering::Relaxed);
+        if active && !was_active {
+            let generation = self.refresh_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.control.request_refresh(generation);
+        }
     }
 
     /// Applies a new sampling period to the running worker.
@@ -165,18 +219,35 @@ struct SystemMetricsSampler {
     previous_cpu: Option<CpuSample>,
     system_identity: SystemIdentity,
     disks: DiskIoSampler,
+    temperatures: TemperatureSampler<Nvidia>,
+    sensors_active: Arc<AtomicBool>,
+    /// Kept while the sensors are inactive.
+    mounts: Vec<MountUsage>,
 }
 
 impl SystemMetricsSampler {
-    fn new(system_identity: SystemIdentity) -> Self {
+    /// Created on the worker thread: temperature discovery runs here.
+    fn new(
+        system_identity: SystemIdentity,
+        nvidia_temperature: bool,
+        sensors_active: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             previous_cpu: None,
             system_identity,
             disks: DiskIoSampler::default(),
+            temperatures: TemperatureSampler::new(
+                SysfsRoots::default(),
+                nvidia_temperature.then(Nvidia::default),
+                Instant::now(),
+            ),
+            sensors_active,
+            mounts: Vec::new(),
         }
     }
 
     fn collect(&mut self) -> SystemMetrics {
+        let now = Instant::now();
         let current_cpu = fs::read_to_string(PROC_STAT)
             .ok()
             .and_then(|contents| parse_cpu_sample(&contents));
@@ -188,23 +259,31 @@ impl SystemMetricsSampler {
             self.previous_cpu = current_cpu;
         }
 
+        let sensors_active = self.sensors_active.load(Ordering::Relaxed);
+        self.temperatures.set_active(sensors_active);
+        if sensors_active {
+            self.mounts = fs::read_to_string(PROC_MOUNTS)
+                .map(|contents| mount_usage(&parse_mounts(&contents)))
+                .unwrap_or_default();
+        }
+        let meminfo = fs::read_to_string(PROC_MEMINFO).ok();
         SystemMetrics {
             cpu_percent,
             logical_cpus,
-            memory: fs::read_to_string(PROC_MEMINFO)
-                .ok()
-                .and_then(|contents| parse_memory_usage(&contents)),
+            memory: meminfo.as_deref().and_then(parse_memory_usage),
+            swap: meminfo.as_deref().and_then(parse_swap_usage),
             uptime: fs::read_to_string(PROC_UPTIME)
                 .ok()
                 .and_then(|contents| parse_uptime(&contents)),
             load_average: fs::read_to_string(PROC_LOADAVG)
                 .ok()
                 .and_then(|contents| parse_load_average(&contents)),
-            root_filesystem: filesystem_usage("/").ok(),
+            mounts: self.mounts.clone(),
             system_identity: self.system_identity.clone(),
-            disks: self
-                .disks
-                .collect(Path::new(PROC_DISKSTATS), Instant::now()),
+            disks: self.disks.collect(Path::new(PROC_DISKSTATS), now),
+            temperatures: self.temperatures.sample(now).to_vec(),
+            gpus: self.temperatures.gpus().to_vec(),
+            cpu_power_watts: self.temperatures.cpu_power_watts(),
         }
     }
 }
@@ -369,6 +448,95 @@ fn parse_memory_usage(contents: &str) -> Option<ByteUsage> {
         used: total.saturating_sub(available),
         total,
     })
+}
+
+/// Swap in use; `None` when there is no swap.
+fn parse_swap_usage(contents: &str) -> Option<ByteUsage> {
+    let value = |name: &str| meminfo_kib(contents, name);
+    let total = value("SwapTotal")?.checked_mul(1024)?;
+    let free = value("SwapFree")?.checked_mul(1024)?;
+    (total > 0).then(|| ByteUsage {
+        used: total.saturating_sub(free),
+        total,
+    })
+}
+
+fn meminfo_kib(contents: &str, name: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key == name)
+            .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+/// Mount points of local filesystems on block devices, one per device (its
+/// shortest mount point, so btrfs subvolumes appear once), `/` first, then
+/// in path order, at most [`MAX_MOUNTS`]. Network, FUSE and pseudo
+/// filesystems (whose sources are not `/dev/…`), loop devices and squashfs
+/// images are left out, so a stale network mount can never block a sample.
+fn parse_mounts(contents: &str) -> Vec<String> {
+    let mut mounts: Vec<(&str, String)> = Vec::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(target), Some(kind)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !source.starts_with("/dev/") || source.starts_with("/dev/loop") || kind == "squashfs" {
+            continue;
+        }
+        let target = unescape_mount_path(target);
+        match mounts.iter_mut().find(|(known, _)| *known == source) {
+            Some((_, known)) => {
+                if (target.chars().count(), &target) < (known.chars().count(), known) {
+                    *known = target;
+                }
+            }
+            None => mounts.push((source, target)),
+        }
+    }
+    let mut targets: Vec<String> = mounts.into_iter().map(|(_, target)| target).collect();
+    targets.sort_by(|left, right| (left != "/", left).cmp(&(right != "/", right)));
+    targets.truncate(MAX_MOUNTS);
+    targets
+}
+
+/// Mount paths escape space, tab, newline and backslash as octal (`\040`).
+fn unescape_mount_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(index) = rest.find('\\') {
+        result.push_str(&rest[..index]);
+        let code = rest.get(index + 1..index + 4);
+        match code.and_then(|code| u8::from_str_radix(code, 8).ok()) {
+            Some(byte) => {
+                result.push(char::from(byte));
+                rest = &rest[index + 4..];
+            }
+            None => {
+                result.push('\\');
+                rest = &rest[index + 1..];
+            }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Usage of each mount point; mounts that fail or are empty are skipped.
+fn mount_usage(mount_points: &[String]) -> Vec<MountUsage> {
+    mount_points
+        .iter()
+        .filter_map(|mount_point| {
+            let usage = filesystem_usage(mount_point).ok()?;
+            (usage.total > 0).then(|| MountUsage {
+                mount_point: mount_point.clone(),
+                usage,
+            })
+        })
+        .collect()
 }
 
 fn parse_uptime(contents: &str) -> Option<Duration> {
@@ -569,6 +737,59 @@ mod tests {
             total: 20,
         };
         assert_eq!(cpu_utilization(sample, reset), None);
+    }
+
+    #[test]
+    fn parses_swap_and_treats_no_swap_as_none() {
+        let contents = "MemTotal: 1000 kB\nSwapTotal:  2048 kB\nSwapFree:  1024 kB\n";
+        assert_eq!(
+            parse_swap_usage(contents),
+            Some(ByteUsage {
+                used: 1024 * 1024,
+                total: 2048 * 1024,
+            })
+        );
+        assert_eq!(parse_swap_usage("SwapTotal: 0 kB\nSwapFree: 0 kB\n"), None);
+        assert_eq!(parse_swap_usage("MemTotal: 1000 kB\n"), None);
+    }
+
+    #[test]
+    fn mounts_are_local_block_filesystems_once_per_device() {
+        let contents = concat!(
+            "/dev/nvme0n1p2 /home btrfs rw,subvol=/@home 0 0\n",
+            "proc /proc proc rw 0 0\n",
+            "/dev/nvme0n1p2 / btrfs rw,subvol=/@ 0 0\n",
+            "/dev/nvme0n1p2 /var/log btrfs rw,subvol=/@log 0 0\n",
+            "tmpfs /tmp tmpfs rw 0 0\n",
+            "/dev/sda1 /mnt/my\\040disk btrfs rw 0 0\n",
+            "/dev/nvme0n1p1 /boot vfat rw 0 0\n",
+            "server:/export /mnt/nfs nfs4 rw 0 0\n",
+            "sshfs#me@host: /mnt/ssh fuse.sshfs rw 0 0\n",
+            "overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n",
+            "/dev/loop3 /snap/core/1 squashfs ro 0 0\n",
+            "/dev/sr0 /media/cd squashfs ro 0 0\n",
+            "malformed\n",
+        );
+        assert_eq!(parse_mounts(contents), ["/", "/boot", "/mnt/my disk"]);
+        assert!(parse_mounts("").is_empty());
+    }
+
+    #[test]
+    fn mount_lists_are_capped() {
+        let contents: String = (0..20)
+            .map(|index| format!("/dev/sd{index} /data{index:02} ext4 rw 0 0\n"))
+            .collect();
+        let mounts = parse_mounts(&contents);
+        assert_eq!(mounts.len(), MAX_MOUNTS);
+        assert_eq!(mounts[0], "/data00");
+    }
+
+    #[test]
+    fn mount_paths_unescape_octal_codes() {
+        assert_eq!(unescape_mount_path("/a\\040b\\011c"), "/a b\tc");
+        assert_eq!(unescape_mount_path("/back\\134slash"), "/back\\slash");
+        assert_eq!(unescape_mount_path("/odd\\9"), "/odd\\9");
+        assert_eq!(unescape_mount_path("/end\\"), "/end\\");
     }
 
     #[test]

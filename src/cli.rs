@@ -7,11 +7,23 @@ use crate::{
     app::{DEFAULT_SAMPLING_INTERVAL, SAMPLING_PRESETS},
 };
 
-pub const USAGE: &str = "Usage: tuxctl [--interval <DURATION>]  (see --help)";
+pub const USAGE: &str =
+    "Usage: tuxctl [--interval <DURATION>] [--no-nvidia-temperature] [--check]  (see --help)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    Run { interval: Duration },
+    Run {
+        interval: Duration,
+        /// Read NVIDIA GPU temperatures through NVML, where it can be loaded
+        /// (on by default; it costs about 20 MiB of private memory once an
+        /// NVIDIA GPU is read).
+        nvidia_temperature: bool,
+    },
+    /// Print which sensors are found, and what would enable the missing
+    /// ones, then exit.
+    Check {
+        nvidia_temperature: bool,
+    },
     Help,
     Version,
 }
@@ -19,6 +31,8 @@ pub enum Command {
 /// Parses the arguments after the program name.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut interval = DEFAULT_SAMPLING_INTERVAL;
+    let mut nvidia_temperature = NVML_AVAILABLE;
+    let mut check = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -30,14 +44,25 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                     .ok_or_else(|| "--interval requires a value".to_owned())?;
                 interval = parse_interval(&value)?;
             }
+            "--no-nvidia-temperature" => nvidia_temperature = false,
+            "--check" => check = true,
             _ => match arg.strip_prefix("--interval=") {
                 Some(value) => interval = parse_interval(value)?,
                 None => return Err(format!("unexpected argument '{arg}'")),
             },
         }
     }
-    Ok(Command::Run { interval })
+    if check {
+        return Ok(Command::Check { nvidia_temperature });
+    }
+    Ok(Command::Run {
+        interval,
+        nvidia_temperature,
+    })
 }
+
+/// Static musl builds cannot load the (glibc) NVIDIA library.
+pub const NVML_AVAILABLE: bool = !cfg!(target_env = "musl");
 
 fn parse_interval(value: &str) -> Result<Duration, String> {
     SAMPLING_PRESETS
@@ -75,6 +100,12 @@ Options:
                              One of: {presets}
                              Processes refresh at most once per second, services every 5s.
                              Press + / - inside {name} to change it while running.
+      --no-nvidia-temperature
+                             Do not load NVML for NVIDIA GPUs on the proprietary driver.
+                             It shows their temperature and adds about 20 MiB of private
+                             memory. Static (musl) builds never load it.
+      --check                Print which sensors tuxctl finds on this machine and what
+                             would enable the missing ones (drivetemp, CPU power, NVML).
   -h, --help                 Print help
   -V, --version              Print version
 
@@ -103,7 +134,8 @@ mod tests {
         assert_eq!(
             parse_args(&[]),
             Ok(Command::Run {
-                interval: Duration::from_secs(1)
+                interval: Duration::from_secs(1),
+                nvidia_temperature: NVML_AVAILABLE,
             })
         );
     }
@@ -111,7 +143,10 @@ mod tests {
     #[test]
     fn every_preset_is_accepted_in_both_forms() {
         for (name, interval) in SAMPLING_PRESETS {
-            let expected = Ok(Command::Run { interval });
+            let expected = Ok(Command::Run {
+                interval,
+                nvidia_temperature: NVML_AVAILABLE,
+            });
             assert_eq!(parse_args(&["--interval", name]), expected, "{name}");
             assert_eq!(
                 parse_args(&[&format!("--interval={name}")]),
@@ -137,6 +172,39 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_temperature_is_on_where_nvml_can_load_and_can_be_turned_off() {
+        assert_eq!(
+            parse_args(&["--no-nvidia-temperature", "--interval", "2s"]),
+            Ok(Command::Run {
+                interval: Duration::from_secs(2),
+                nvidia_temperature: false,
+            })
+        );
+        assert_eq!(NVML_AVAILABLE, !cfg!(target_env = "musl"));
+        for arg in ["--nvidia-temperature", "--no-nvidia-temperature=1"] {
+            assert!(parse_args(&[arg]).is_err(), "{arg}");
+        }
+    }
+
+    #[test]
+    fn check_reports_instead_of_running_and_keeps_the_nvml_choice() {
+        assert_eq!(
+            parse_args(&["--check"]),
+            Ok(Command::Check {
+                nvidia_temperature: NVML_AVAILABLE
+            })
+        );
+        assert_eq!(
+            parse_args(&["--no-nvidia-temperature", "--check"]),
+            Ok(Command::Check {
+                nvidia_temperature: false
+            })
+        );
+        assert_eq!(parse_args(&["--check", "--version"]), Ok(Command::Version));
+        assert!(help_text().contains("--check"));
+    }
+
+    #[test]
     fn unknown_arguments_are_errors() {
         for arg in ["--intervals=1s", "-i", "run", "--verbose"] {
             assert!(parse_args(&[arg]).is_err(), "{arg}");
@@ -159,6 +227,8 @@ mod tests {
         );
         let help = help_text();
         assert!(help.contains("--interval <DURATION>"));
+        assert!(help.contains("--no-nvidia-temperature"));
+        assert!(USAGE.contains("--no-nvidia-temperature"));
         assert!(help.contains(env!("CARGO_PKG_REPOSITORY")));
     }
 }

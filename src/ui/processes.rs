@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
@@ -13,7 +13,7 @@ use crate::{
     linux::{ProcessInfo, ProcessSignal, SystemMetrics},
 };
 
-use super::{format_bytes, hardware::utilization_bar, layout, status, ProcessRowRegion};
+use super::{format_bytes, hardware::utilization_bar, layout, status, theme, ProcessRowRegion};
 
 pub(super) struct ProcessRender {
     pub rows: Vec<ProcessRowRegion>,
@@ -101,15 +101,15 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         let is_selected = selected == Some(process.identity());
         let mut style = if is_selected {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::ROW_SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if hovered == Some(&MouseTarget::ProcessRow(process.identity())) {
-            Style::default().bg(Color::Rgb(35, 35, 35))
+            Style::default().bg(theme::ROW_HOVER_BG)
         } else {
             Style::default()
         };
         if row.dimmed || row.exited {
-            style = style.fg(Color::DarkGray);
+            style = style.fg(theme::MUTED);
         }
         if section_end == Some(index) {
             style = style.add_modifier(Modifier::UNDERLINED);
@@ -154,7 +154,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         for (control, glyph) in [(region.pin_up, "▲"), (region.pin_down, "▼")] {
             if let Some(area) = control {
                 frame.render_widget(
-                    Paragraph::new(glyph).style(Style::default().fg(Color::Cyan)),
+                    Paragraph::new(glyph).style(Style::default().fg(theme::ACCENT)),
                     area,
                 );
             }
@@ -192,7 +192,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> ProcessRender {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(ratatui::layout::Alignment::Center),
             row_area,
         );
@@ -221,13 +221,13 @@ fn sort_header(
     };
     let style = if active {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(theme::SELECTED_FG)
+            .bg(theme::SELECTED_BG)
             .add_modifier(Modifier::BOLD)
     } else if hovered == Some(&MouseTarget::ProcessSortHeader(field)) {
-        Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+        Style::default().fg(theme::ACCENT).bg(theme::HOVER_BG)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme::ACCENT)
     };
 
     Cell::from(label).style(style)
@@ -305,8 +305,8 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
         (
             format!("Filter: \"{query}\""),
             &[
-                "/ edit   Esc clear   P pin   t term   K kill",
-                "/ edit   Esc clear   t term   K kill",
+                "/ edit   Esc clear   P pin   T term   K kill",
+                "/ edit   Esc clear   T term   K kill",
                 "Esc clear",
             ],
         )
@@ -319,9 +319,9 @@ fn render_controls(frame: &mut Frame, app: &App, area: Rect) {
                 if sort.descending { "▼" } else { "▲" }
             ),
             &[
-                "/ search   Enter details   P pin   v view   t term   K kill",
-                "/ search   Enter details   P pin   t term   K kill",
-                "/ search   Enter details   t term   K kill",
+                "/ search   Enter details   P pin   v view   T term   K kill",
+                "/ search   Enter details   P pin   T term   K kill",
+                "/ search   Enter details   T term   K kill",
                 "/ find   Enter view",
             ],
         )
@@ -356,23 +356,27 @@ pub fn render_signal_confirmation(
             ProcessSignal::Term => (
                 " Terminate Process (SIGTERM) ",
                 "Terminate this process gracefully?",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::WARNING),
                 " [ Terminate ] ",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::WARNING),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::SELECTED_BG)
                     .add_modifier(Modifier::BOLD),
             ),
             ProcessSignal::Kill => (
                 " Force Kill Process (SIGKILL) ",
                 "FORCE KILL this process immediately? (Uncatchable)",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                " [ Force Kill ] ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
+                    .fg(theme::ERROR)
+                    .add_modifier(Modifier::BOLD),
+                " [ Force Kill ] ",
+                Style::default()
+                    .fg(theme::ERROR)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::DANGER_FG)
+                    .bg(theme::ERROR)
                     .add_modifier(Modifier::BOLD),
             ),
         };
@@ -434,11 +438,11 @@ pub fn render_signal_confirmation(
 
     let cancel_style = if confirmation.focused_button == SignalConfirmButton::Cancel {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(theme::SELECTED_FG)
+            .bg(theme::SELECTED_BG)
             .add_modifier(Modifier::BOLD)
     } else if hovered == Some(&MouseTarget::ProcessSignalCancel) {
-        Style::default().bg(Color::DarkGray)
+        Style::default().bg(theme::HOVER_BG)
     } else {
         Style::default()
     };
@@ -446,7 +450,7 @@ pub fn render_signal_confirmation(
     let confirm_style = if confirmation.focused_button == SignalConfirmButton::Confirm {
         confirm_focused_style
     } else if hovered == Some(&MouseTarget::ProcessSignalConfirm) {
-        confirm_base_style.bg(Color::DarkGray)
+        confirm_base_style.bg(theme::HOVER_BG)
     } else {
         confirm_base_style
     };
@@ -473,7 +477,7 @@ pub fn render_signal_confirmation(
         );
         frame.render_widget(
             Paragraph::new("Tab / ← → focus   Enter select   Esc cancel")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::MUTED))
                 .alignment(ratatui::layout::Alignment::Center),
             hint_area,
         );
@@ -515,7 +519,7 @@ pub fn render_detail(frame: &mut Frame, process: Option<&ProcessInfo>, area: Rec
                 Line::from(format!("Parent PID:  {}", process.parent_pid)),
                 Line::from(""),
                 Line::from("Read-only inspection; Esc closes")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::MUTED)),
             ]
         },
     );
@@ -680,7 +684,7 @@ mod tests {
         assert!(!modifier(0).contains(Modifier::UNDERLINED));
         assert!(modifier(1).contains(Modifier::UNDERLINED), "section end");
         assert!(!modifier(2).contains(Modifier::UNDERLINED));
-        assert_eq!(buffer[(rows.x + 4, rows.y + 1)].fg, Color::DarkGray);
+        assert_eq!(buffer[(rows.x + 4, rows.y + 1)].fg, theme::MUTED);
 
         // Every row, pinned or not, keeps a one-line hit region inside the body.
         assert!(rendered

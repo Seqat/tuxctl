@@ -1,3 +1,4 @@
+mod cards;
 mod hardware;
 mod hardware_cpu;
 mod hardware_network_summary;
@@ -9,13 +10,18 @@ mod overview;
 mod processes;
 mod sanitize;
 mod services;
+mod sparkline;
 mod status;
+mod theme;
+
+pub use theme::{init_color_depth, ColorDepth};
 
 use std::sync::Arc;
 
 use ratatui::{
+    buffer::Buffer,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -24,7 +30,6 @@ use ratatui::{
 use crate::{
     action::{InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
-    linux::ByteUsage,
 };
 
 #[derive(Debug, Default)]
@@ -416,7 +421,10 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
     let outer = Block::default().borders(Borders::ALL).title(TITLE);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
-    let interval_buttons = render_top_right(frame, app, area);
+    let (interval_buttons, corner_x) = render_top_right(frame, app, area);
+    if app.active_tab() == Tab::Overview {
+        render_overview_header(frame, app, area, corner_x);
+    }
 
     let screen = layout::screen(inner);
     let tab_areas = layout::tab_areas(screen.tabs);
@@ -474,6 +482,9 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         ContentRender::None => {}
     }
 
+    if app.overlay_open() {
+        dim_backdrop(frame.buffer_mut(), area);
+    }
     if app.process_detail_visible() {
         processes::render_detail(frame, app.selected_process(), area);
         regions.suppress_background_interaction();
@@ -507,13 +518,25 @@ fn render_frame(frame: &mut Frame, app: &App) -> UiRegions {
         regions.suppress_background_interaction();
     }
     if app.help_visible() {
-        render_help(frame, area);
+        render_help(frame, app, area);
         regions.suppress_background_interaction();
         regions.process_signal_cancel = None;
         regions.process_signal_confirm = None;
     }
 
     regions
+}
+
+/// Greys out the screen behind a popup so the popup stands out. Popups clear
+/// their own area, so they are drawn at full color on top of it.
+fn dim_backdrop(buffer: &mut Buffer, area: Rect) {
+    buffer.set_style(
+        area,
+        Style::new()
+            .fg(theme::BACKDROP_FG)
+            .bg(theme::BACKDROP_BG)
+            .remove_modifier(Modifier::BOLD | Modifier::REVERSED),
+    );
 }
 
 const TITLE: &str = " tuxctl ";
@@ -523,11 +546,23 @@ const INTERVAL_BUTTONS: [(IntervalStep, &str); 2] = [
     (IntervalStep::Longer, "[+]"),
 ];
 
+/// The system summary after the title on the Overview, in the part of the top
+/// border left of `corner_x` (where the right corner starts), with a gap.
+fn render_overview_header(frame: &mut Frame, app: &App, area: Rect, corner_x: u16) {
+    let x = area.x.saturating_add(1 + TITLE.len() as u16);
+    let room = corner_x.saturating_sub(1).saturating_sub(x);
+    if let Some(line) = overview::header_line(app, usize::from(room)) {
+        let width = (line.width() as u16).min(room);
+        frame.render_widget(Paragraph::new(line), Rect::new(x, area.y, width, 1));
+    }
+}
+
 /// Draws the right end of the top border: the stale marker (collectors behind
 /// this screen that stopped updating), the sampling interval and its `[-]`/`[+]`
 /// buttons. Space is given up in that order: stale names become a bare marker,
-/// then the buttons go. Returns the drawn buttons for hit testing.
-fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalStep, Rect)> {
+/// then the buttons go. Returns the drawn buttons for hit testing and the
+/// column where the corner starts.
+fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> (Vec<(IntervalStep, Rect)>, u16) {
     // Keep both corners and a gap after the title free.
     let room = usize::from(area.width).saturating_sub(TITLE.len() + 3);
     let names: Vec<&str> = app.stale_collectors().map(Collector::label).collect();
@@ -554,44 +589,46 @@ fn render_top_right(frame: &mut Frame, app: &App, area: Rect) -> Vec<(IntervalSt
         .flat_map(|buttons| stale_options.iter().map(move |stale| (stale, buttons)))
         .find(|(stale, buttons)| width_of(stale, *buttons) <= room)
     else {
-        return Vec::new();
+        return (Vec::new(), area.right().saturating_sub(1));
     };
 
     let width = width_of(stale, buttons) as u16;
     let mut x = area.right().saturating_sub(1 + width);
+    let corner_x = x;
     let mut spans = Vec::with_capacity(4);
     if let Some(stale) = stale {
         spans.push(Span::styled(
             stale.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING),
         ));
     }
     spans.push(Span::styled(
         interval.clone(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::MUTED),
     ));
     let corner = Rect::new(x, area.y, width, 1);
     // Blank the border under the whole corner, including the gaps between buttons.
     frame.render_widget(Clear, corner);
     frame.render_widget(Paragraph::new(Line::from(spans)), corner);
     if !buttons {
-        return Vec::new();
+        return (Vec::new(), corner_x);
     }
     x = x.saturating_add(width - buttons_width as u16);
-    INTERVAL_BUTTONS
+    let buttons = INTERVAL_BUTTONS
         .iter()
         .map(|&(step, label)| {
             let button = Rect::new(x, area.y, label.len() as u16, 1);
             let style = if app.hovered() == Some(&MouseTarget::IntervalStep(step)) {
-                Style::default().fg(Color::Cyan).bg(Color::DarkGray)
+                Style::default().fg(theme::ACCENT).bg(theme::HOVER_BG)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme::ACCENT)
             };
             frame.render_widget(Paragraph::new(label).style(style), button);
             x = x.saturating_add(button.width + 1);
             (step, button)
         })
-        .collect()
+        .collect();
+    (buttons, corner_x)
 }
 
 fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
@@ -605,7 +642,7 @@ fn render_terminal_size_warning(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("tuxctl").style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
@@ -638,11 +675,11 @@ fn render_tabs(
     for &(tab, area) in tabs {
         let style = if tab == active_tab {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if hovered == Some(&MouseTarget::Tab(tab)) {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(theme::HOVER_BG)
         } else {
             Style::default()
         };
@@ -666,7 +703,7 @@ fn render_tabs(
             );
             frame.render_widget(
                 Paragraph::new(hint_text)
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(theme::MUTED))
                     .alignment(Alignment::Right),
                 hint_rect,
             );
@@ -707,14 +744,6 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) -> ContentRender {
     ContentRender::None
 }
 
-pub(super) fn format_usage(usage: ByteUsage) -> String {
-    format!(
-        "{} / {}",
-        format_bytes(usage.used),
-        format_bytes(usage.total)
-    )
-}
-
 pub(super) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
@@ -750,8 +779,8 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 /// Width of the Help popup; every line must fit inside its borders.
 const HELP_WIDTH: u16 = 64;
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let lines = help_lines();
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = help_lines(app.nvidia_temperature());
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = layout::centered_rect(area, HELP_WIDTH, height);
     if popup.width == 0 || popup.height == 0 {
@@ -765,11 +794,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn help_lines() -> Vec<Line<'static>> {
+fn help_lines(nvidia_temperature: bool) -> Vec<Line<'static>> {
     let heading = |text: &'static str| {
         Line::from(text).style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
     };
@@ -780,7 +809,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ?                   Toggle help"),
         Line::from("  + / -               Longer / shorter sampling interval (⟳)"),
         Line::from("  Esc                 Close popup / clear search, view / menu"),
-        Line::from("  q / Ctrl+C          Quit application"),
+        Line::from("  q                   Quit (confirm with Enter or q)"),
+        Line::from("  Ctrl+C              Quit immediately"),
         Line::from(""),
         heading("Navigation:"),
         Line::from("  ↑/k ↓/j PgUp/PgDn   Move selection / scroll (mouse wheel)"),
@@ -790,14 +820,29 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         heading("Screen Controls:"),
         Line::from("  Processes           c CPU, m MEM, p PID, n Name sort"),
-        Line::from("  Signals             t terminate (SIGTERM), K kill (SIGKILL)"),
+        Line::from("  Signals             T terminate (SIGTERM), K kill (SIGKILL)"),
         Line::from("  Pins                P pin / unpin, Shift+↑/↓ move (or ▲/▼)"),
         Line::from("  Views               v kernel threads, failed units, priority"),
         Line::from("  Services            r refresh system services"),
         Line::from("  Logs                f follow, Space toggle pause"),
         Line::from(""),
-        Line::from("Esc closes").style(Style::default().fg(Color::DarkGray)),
+        heading("Temperatures (Overview):"),
+        Line::from("  Sources             hwmon, thermal zones (– = no value now)"),
+        Line::from(nvidia_help(nvidia_temperature)),
+        Line::from(""),
+        Line::from("Esc closes").style(Style::default().fg(theme::MUTED)),
     ]
+}
+
+/// Whether NVIDIA temperatures are on, and how to change that.
+fn nvidia_help(enabled: bool) -> &'static str {
+    if enabled {
+        "  NVIDIA GPUs         NVML; off: --no-nvidia-temperature"
+    } else if crate::cli::NVML_AVAILABLE {
+        "  NVIDIA GPUs         off (--no-nvidia-temperature)"
+    } else {
+        "  NVIDIA GPUs         off; NVML needs a glibc build"
+    }
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -814,6 +859,8 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
+
+    use std::path::Path;
 
     use super::*;
     use crate::action::Action;
@@ -1083,10 +1130,13 @@ mod tests {
                 used: 4 << 30,
                 total: 16 << 30,
             }),
-            root_filesystem: Some(ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: 50 << 30,
+                    total: 100 << 30,
+                },
+            }],
             ..SystemMetrics::default()
         }));
         app.update(Action::NetworkUpdated(crate::linux::NetworkSnapshot {
@@ -1267,6 +1317,51 @@ mod tests {
         assert!(text.contains(" tuxctl "));
     }
 
+    #[test]
+    fn an_open_popup_dims_the_screen_behind_it() {
+        // The border and tab rows lie outside every popup.
+        let dimmed = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width).all(|x| {
+                (0..2).all(|y| {
+                    let cell = &buffer[(x, y)];
+                    cell.fg == theme::BACKDROP_FG && cell.bg == theme::BACKDROP_BG
+                })
+            })
+        };
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        assert!(!dimmed(&terminal));
+
+        app.update(Action::Escape);
+        rendered_regions(&mut terminal, &app);
+        assert!(dimmed(&terminal));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme::SELECTED_BG),
+            "the menu keeps its colors"
+        );
+
+        app.update(Action::Escape);
+        rendered_regions(&mut terminal, &app);
+        assert!(!dimmed(&terminal), "closing the menu restores colors");
+    }
+
+    #[test]
+    fn dimming_is_safe_in_tiny_terminals() {
+        let mut app = App::default();
+        app.update(Action::Escape);
+        for (width, height) in [(1, 1), (2, 2), (10, 3), (20, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            rendered_regions(&mut terminal, &app);
+        }
+    }
+
     /// The top border row as text.
     fn top_row(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -1282,7 +1377,7 @@ mod tests {
         let regions = rendered_regions(&mut terminal, &app);
         let top = top_row(&terminal);
 
-        assert!(top.starts_with("┌ tuxctl ─"), "{top}");
+        assert!(top.starts_with("┌ tuxctl "), "{top}");
         assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
         assert_eq!(regions.interval_buttons.len(), 2);
         for (step, area) in &regions.interval_buttons {
@@ -1312,6 +1407,25 @@ mod tests {
     }
 
     #[test]
+    fn the_system_summary_sits_in_the_top_border_on_the_overview_only() {
+        let mut app = App::default();
+        let mut metrics = SystemMetrics::default();
+        metrics.system_identity.hostname = Some("build-host".into());
+        app.update(Action::SystemMetricsUpdated(metrics));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        rendered_regions(&mut terminal, &app);
+        let top = top_row(&terminal);
+        assert!(top.starts_with("┌ tuxctl · build-host · "), "{top}");
+        assert!(top.contains(" zombie ─"), "a gap before the corner: {top}");
+        assert!(top.ends_with(" ⟳ 1s [-] [+] ┐"), "{top}");
+
+        app.update(Action::SelectTab(Tab::Processes));
+        rendered_regions(&mut terminal, &app);
+        assert!(!top_row(&terminal).contains("build-host"));
+    }
+
+    #[test]
     fn the_top_right_corner_gives_up_space_without_touching_the_title() {
         let mut app = App::default().with_collector_periods(
             crate::app::CollectorPeriods::for_sampling_interval(std::time::Duration::from_secs(1)),
@@ -1330,7 +1444,7 @@ mod tests {
                 continue;
             }
             let top = top_row(&terminal);
-            assert!(top.starts_with("┌ tuxctl ─"), "{width}: {top}");
+            assert!(top.starts_with("┌ tuxctl "), "{width}: {top}");
             assert!(top.ends_with('┐'), "{width}: {top}");
             assert!(top.contains(" stale "), "{width}: {top}");
             assert!(top.contains("250ms"), "{width}: {top}");
@@ -1348,6 +1462,39 @@ mod tests {
         assert!(regions.interval_buttons.is_empty());
     }
 
+    /// One of each kind: a CPU package, a GPU at its limit, an asleep disk
+    /// sensor (`–`) and a NIC.
+    fn sweep_temperatures() -> Vec<crate::linux::Temperature> {
+        use crate::linux::{Temperature, TemperatureKey};
+        let device = |path: &str| TemperatureKey::Device(Path::new(path).into());
+        vec![
+            Temperature {
+                key: TemperatureKey::CpuPackage(0),
+                celsius: Some(54),
+                max: None,
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/gpu"),
+                celsius: Some(100),
+                max: Some(95),
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/disk"),
+                celsius: None,
+                max: Some(80),
+                crit: None,
+            },
+            Temperature {
+                key: device("/sys/devices/nic"),
+                celsius: Some(47),
+                max: None,
+                crit: None,
+            },
+        ]
+    }
+
     fn overview_sweep_app(cpu_count: u32) -> App {
         let mut app = App::default();
         app.update(Action::SystemMetricsUpdated(SystemMetrics {
@@ -1362,10 +1509,14 @@ mod tests {
                 used: 4 << 30,
                 total: 16 << 30,
             }),
-            root_filesystem: Some(ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
+            mounts: vec![crate::linux::MountUsage {
+                mount_point: "/".into(),
+                usage: crate::linux::ByteUsage {
+                    used: 50 << 30,
+                    total: 100 << 30,
+                },
+            }],
+            temperatures: sweep_temperatures(),
             ..SystemMetrics::default()
         }));
         let module = crate::linux::MemoryModule {
@@ -1387,16 +1538,19 @@ mod tests {
                     model: "Test Graphics".into(),
                     kind: None,
                     vram_bytes: None,
+                    device_path: Some(Path::new("/sys/devices/gpu").into()),
                 }],
                 storage_devices: vec![crate::linux::StorageDevice {
                     system_name: "nvme0n1".into(),
                     kind: crate::linux::StorageKind::Nvme,
                     model: Some("Test Disk".into()),
                     capacity_bytes: Some(1_000_000_000_000),
+                    device_path: Some(Path::new("/sys/devices/disk").into()),
                 }],
                 network_devices: vec![crate::linux::NetworkDevice {
                     interface_name: "eth0".into(),
                     model: None,
+                    device_path: Some(Path::new("/sys/devices/nic").into()),
                 }],
             },
         ));
@@ -1424,30 +1578,23 @@ mod tests {
         app
     }
 
-    /// Content rows inside the Hardware panel, located by its title.
-    fn hardware_panel_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    /// Rows of the Overview below the tabs, inside the outer border.
+    fn overview_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let rows: Vec<Vec<&str>> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
-        let Some((top, left)) = rows.iter().enumerate().find_map(|(y, row)| {
-            let line: String = row.concat();
-            let title = line.find(" Hardware ")?;
-            let title_column = line[..title].chars().count();
-            let left = (0..title_column).rev().find(|&x| row[x] == "┌")?;
-            Some((y, left))
-        }) else {
-            return Vec::new();
-        };
-        let right = (left + 1..width).find(|&x| rows[top][x] == "┐").unwrap();
-        rows[top + 1..]
-            .iter()
-            .take_while(|row| row[left] != "└")
-            .map(|row| row[left + 1..right].concat())
+        let width = buffer.area.width;
+        (2..buffer.area.height.saturating_sub(1))
+            .map(|y| (1..width - 1).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    /// Every card border that starts below the tabs has a row inside it.
+    fn cards_have_content(terminal: &Terminal<TestBackend>) -> bool {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (2..area.height.saturating_sub(1)).all(|y| {
+            (1..area.width - 1)
+                .all(|x| buffer[(x, y)].symbol() != "┌" || buffer[(x, y + 1)].symbol() != "└")
+        })
     }
 
     fn shown_cpu_labels(rows: &[String]) -> Vec<u32> {
@@ -1468,11 +1615,9 @@ mod tests {
     fn more_cpus(rows: &[String]) -> usize {
         rows.iter()
             .find_map(|row| {
-                row.trim()
-                    .strip_prefix("… ")?
-                    .strip_suffix(" more logical CPUs")?
-                    .parse()
-                    .ok()
+                let (_, rest) = row.split_once("… ")?;
+                let (count, _) = rest.split_once(" more logical CPUs")?;
+                count.parse().ok()
             })
             .unwrap_or(0)
     }
@@ -1481,26 +1626,29 @@ mod tests {
     fn overview_resize_sweep_keeps_cpu_counts_and_sections_consistent() {
         for cpu_count in [12, 64] {
             let app = overview_sweep_app(cpu_count);
-            for width in [40, 50, 60, 89, 90, 120, 160] {
+            for width in [40, 50, 60, 89, 99, 100, 120, 149, 150, 200] {
                 let mut previous_shown = 0;
                 for height in layout::MIN_TERMINAL_HEIGHT..=60 {
                     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                     rendered_regions(&mut terminal, &app);
-                    let rows = hardware_panel_rows(&terminal);
+                    let rows = overview_rows(&terminal);
                     let context =
                         format!("{cpu_count} CPUs at {width}x{height}:\n{}", rows.join("\n"));
-                    if rows.is_empty() {
-                        continue;
-                    }
+                    assert!(
+                        cards_have_content(&terminal),
+                        "card without content; {context}"
+                    );
 
                     let shown = shown_cpu_labels(&rows);
                     let mut distinct = shown.clone();
                     distinct.sort_unstable();
                     distinct.dedup();
                     assert_eq!(distinct.len(), shown.len(), "{context}");
-                    assert_eq!(
-                        shown.len() + more_cpus(&rows),
-                        cpu_count as usize,
+                    // The grid is the first thing a short card gives up; when
+                    // any of it is shown, it accounts for every CPU.
+                    let grid_hidden = shown.is_empty() && more_cpus(&rows) == 0;
+                    assert!(
+                        grid_hidden || shown.len() + more_cpus(&rows) == cpu_count as usize,
                         "shown + overflow must equal the CPU count; {context}"
                     );
                     assert!(
@@ -1508,17 +1656,65 @@ mod tests {
                         "visible CPUs decreased as height grew; {context}"
                     );
                     previous_shown = shown.len();
-
-                    for (index, row) in rows.iter().enumerate() {
-                        if ["RAM", "GPU", "STORAGE", "NETWORK", "CPU"].contains(&row.trim()) {
-                            let next = rows.get(index + 1).map_or("", |next| next.trim());
-                            assert!(
-                                !next.is_empty(),
-                                "section heading without content; {context}"
-                            );
-                        }
-                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_shows_component_temperatures() {
+        let app = overview_sweep_app(12);
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        rendered_regions(&mut terminal, &app);
+        let rows = overview_rows(&terminal);
+        let row = |text: &str| {
+            rows.iter()
+                .find(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {rows:#?}"))
+                .clone()
+        };
+
+        assert!(row("Test Processor").contains("Test Processor · 54°C"));
+        assert!(row("Test Graphics").contains("Test Graphics · 100°C"));
+        assert!(row("Test Disk").contains("1 TB  –"), "{}", row("Test Disk"));
+        assert!(row("eth0").contains("47°C"));
+
+        // Temperatures take the band of their share of the limit: the GPU is
+        // past its driver's 95 °C, the CPU at 54 of an assumed 95 °C.
+        let buffer = terminal.backend().buffer();
+        let style_of = |text: &str| {
+            let (y, line) = buffer
+                .content()
+                .chunks(160)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .enumerate()
+                .find(|(_, line)| line.contains(text))
+                .unwrap();
+            let x = line[..line.find(text).unwrap()].chars().count();
+            buffer[(x as u16, y as u16)].fg
+        };
+        assert_eq!(style_of("100°C"), ratatui::style::Color::Red);
+        assert_eq!(style_of("54°C"), ratatui::style::Color::Green);
+    }
+
+    #[test]
+    fn hardware_panel_with_temperatures_survives_tiny_areas() {
+        let app = overview_sweep_app(12);
+        for width in 0..=60 {
+            for height in 0..=40 {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width.max(1), height.max(1))).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = Rect::new(
+                            0,
+                            0,
+                            width.min(frame.area().width),
+                            height.min(frame.area().height),
+                        );
+                        overview::render(frame, &app, area);
+                    })
+                    .unwrap();
             }
         }
     }
@@ -1529,7 +1725,7 @@ mod tests {
         for height in layout::MIN_TERMINAL_HEIGHT..=60 {
             let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
             rendered_regions(&mut terminal, &app);
-            for row in hardware_panel_rows(&terminal) {
+            for row in overview_rows(&terminal) {
                 let mut rest = row.as_str();
                 while let Some(position) = rest.find("CPU") {
                     rest = &rest[position + 3..];
@@ -1728,17 +1924,12 @@ mod tests {
             .chunks(120)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
-        let heading = lines
+        let row = lines
             .iter()
-            .position(|line| line.contains("Filesystem"))
-            .expect("filesystem heading");
-        let row = &lines[heading + 1];
-        let usage = format_usage(ByteUsage {
-            used: 50 << 30,
-            total: 100 << 30,
-        });
-        assert!(row.contains("/  50%  █"), "row: {row}");
-        assert!(row.contains(&format!("░  {usage}")), "row: {row}");
+            .find(|line| line.contains("/   50%"))
+            .expect("filesystem row in the Storage card");
+        assert!(row.contains("/   50%  █"), "row: {row}");
+        assert!(row.contains("░  50.0 GiB / 100.0 GiB"), "row: {row}");
     }
 
     #[test]
@@ -1953,10 +2144,13 @@ mod tests {
                     total: 32 * 1024 * 1024 * 1024,
                 }),
                 uptime: Some(std::time::Duration::from_secs(90_000)),
-                root_filesystem: Some(ByteUsage {
-                    used: 120 * 1024 * 1024 * 1024,
-                    total: 500 * 1024 * 1024 * 1024,
-                }),
+                mounts: vec![crate::linux::MountUsage {
+                    mount_point: "/".into(),
+                    usage: crate::linux::ByteUsage {
+                        used: 120 * 1024 * 1024 * 1024,
+                        total: 500 * 1024 * 1024 * 1024,
+                    },
+                }],
                 ..SystemMetrics::default()
             };
             metrics.system_identity.hostname = Some("build-host".into());
@@ -1993,18 +2187,24 @@ mod tests {
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
                 .collect::<Vec<_>>();
 
-            // Row 0 is outer border, Row 1 is tab bar, Row 2 begins System content directly below tabs.
+            // Row 0 is the outer border with the system summary, row 1 the
+            // tabs, row 2 the top border of the first card directly below them.
+            let context = format!("{width}x{height}:\n{}", rows.join("\n"));
             assert!(rows[1].contains("Overview") || rows[1].contains(" Ovr "));
-            assert!(rows[2].contains("System"));
+            if width >= 60 {
+                assert!(rows[0].contains("· build-host · "), "{context}");
+            }
+            assert!(rows[2].contains(" CPU "), "{context}");
             assert!(!rows[2].contains("Overview"));
-            assert!(!rows[2].trim().is_empty());
             assert!(!rows[3].trim().is_empty());
 
-            let content_width = width.saturating_sub(2);
-            if content_width >= 90 {
-                assert!(rows[2].contains("Hardware"));
+            if width - 2 >= overview::MEDIUM_MIN_WIDTH {
+                assert!(rows[2].contains(" GPU "), "{context}");
             } else {
-                assert!(rows.iter().skip(3).any(|row| row.contains("Hardware")));
+                assert!(
+                    rows.iter().skip(3).any(|row| row.contains(" Memory ")),
+                    "{context}"
+                );
             }
         }
     }
@@ -2247,7 +2447,15 @@ mod tests {
 
     #[test]
     fn help_lists_every_binding_and_every_line_fits() {
-        let lines = help_lines();
+        for enabled in [false, true] {
+            for line in help_lines(enabled) {
+                assert!(
+                    line.to_string().chars().count() <= usize::from(HELP_WIDTH - 2),
+                    "{line:?} is cut off"
+                );
+            }
+        }
+        let lines = help_lines(false);
         let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
         for line in &text {
             assert!(
@@ -2267,6 +2475,7 @@ mod tests {
             "v kernel threads",
             "Ctrl+C",
             "Space",
+            "NVIDIA GPUs",
         ] {
             assert!(all.contains(binding), "Help does not mention {binding:?}");
         }

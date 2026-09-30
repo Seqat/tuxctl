@@ -1,293 +1,788 @@
+//! The Overview: responsive cards for CPU, GPU, memory, network, storage and
+//! pinned processes, plus the system summary shown in the top border.
+
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
+    layout::Rect,
+    style::Style,
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::app::App;
+use crate::{action::Action, app::App, keymap};
 
-use super::{format_bytes, format_uptime, format_usage, hardware, layout, processes};
+use super::{
+    cards::{self, CardTitle},
+    format_bytes, format_uptime, hardware, hardware_cpu, hardware_network_summary, layout, theme,
+};
 
-const SIDE_BY_SIDE_MIN_WIDTH: u16 = 90;
+/// Content widths (the terminal is two columns wider) at which the Overview
+/// switches from one column to a 2×2 grid, and adds a Pinned column.
+pub(super) const MEDIUM_MIN_WIDTH: u16 = 98;
+pub(super) const WIDE_MIN_WIDTH: u16 = 148;
+/// A card is a border plus at least one row.
+pub(super) const CARD_MIN_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OverviewAreas {
-    system: Rect,
-    hardware: Rect,
+pub(super) enum WidthMode {
+    /// One column; graphs sit in the card titles unless every card fits
+    /// with its graph above its rows.
+    Narrow,
+    /// A 2×2 grid, then Storage and Pinned side by side.
+    Medium,
+    /// A 2×2 grid and Storage, with Pinned as a column on the right.
+    Wide,
+}
+
+impl WidthMode {
+    pub(super) fn for_width(width: u16) -> Self {
+        if width >= WIDE_MIN_WIDTH {
+            Self::Wide
+        } else if width >= MEDIUM_MIN_WIDTH {
+            Self::Medium
+        } else {
+            Self::Narrow
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Card {
+    Cpu,
+    Gpu,
+    Memory,
+    Network,
+    Storage,
+    Pinned,
+}
+
+/// Heights a card needs, borders included, at each step of the height
+/// compression. From the tallest down, a short Overview first hides the
+/// optional rows (the CPU grid, more GPUs or interfaces), then shrinks the
+/// graphs to one row, then cuts lists (Pinned, Storage) to one row, then
+/// leaves out whole cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CardHeight {
+    /// The fixed rows, one graph row and one list row.
+    pub min: u16,
+    /// With the whole list.
+    pub listed: u16,
+    /// With the whole list and full graphs.
+    pub graphed: u16,
+    /// With everything, the optional rows included.
+    pub desired: u16,
+    /// Whether the card has a graph, which takes a share of the spare rows
+    /// once everything is shown.
+    pub graph: bool,
+}
+
+impl CardHeight {
+    /// `fixed` rows always shown, `optional` rows that give way first, and a
+    /// graph when `graph` is set (one row at least, [`cards::GRAPH_ROWS`]
+    /// when there is room).
+    pub(super) fn new(fixed: u16, optional: u16, graph: bool) -> Self {
+        let (min_graph, graph_rows) = if graph {
+            (1, cards::GRAPH_ROWS)
+        } else {
+            (0, 0)
+        };
+        let min = (2 + fixed + min_graph).max(CARD_MIN_HEIGHT);
+        let graphed = (2 + fixed + graph_rows).max(CARD_MIN_HEIGHT);
+        Self {
+            min,
+            listed: min,
+            graphed,
+            desired: (graphed + optional).max(CARD_MIN_HEIGHT),
+            graph,
+        }
+    }
+
+    /// A card of `rows` list rows, which keep their room until the graphs
+    /// are down to one row.
+    pub(super) fn list(rows: u16) -> Self {
+        let listed = (2 + rows).max(CARD_MIN_HEIGHT);
+        Self {
+            min: CARD_MIN_HEIGHT,
+            listed,
+            graphed: listed,
+            desired: listed,
+            graph: false,
+        }
+    }
 }
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-
-    let areas = overview_areas(area);
-    render_system(frame, app, areas.system);
-    hardware::render(frame, app, areas.hardware);
+    let mode = WidthMode::for_width(area.width);
+    let show_pinned = mode == WidthMode::Wide || app.pinned_processes().next().is_some();
+    // The narrow column draws graphs above the rows, as wider modes do, once
+    // every card fits whole that way.
+    let graphs = mode != WidthMode::Narrow || {
+        let inner_width = area.width.saturating_sub(2);
+        narrow_cards(show_pinned)
+            .map(|card| u32::from(card_height(app, card, inner_width, true).desired))
+            .sum::<u32>()
+            <= u32::from(area.height)
+    };
+    let placed = overview_layout(area, mode, show_pinned, |card, width| {
+        card_height(app, card, width.saturating_sub(2), graphs)
+    });
+    for (card, rect) in placed {
+        render_card(frame, app, card, rect, graphs);
+    }
 }
 
-fn overview_areas(area: Rect) -> OverviewAreas {
-    if area.width >= SIDE_BY_SIDE_MIN_WIDTH {
-        let system_width = (area.width / 3).clamp(26, 38).min(area.width);
-        let columns =
-            Layout::horizontal([Constraint::Length(system_width), Constraint::Min(0)]).split(area);
-        OverviewAreas {
-            system: columns[0],
-            hardware: columns[1],
+/// The narrow column's cards in priority order.
+fn narrow_cards(show_pinned: bool) -> impl Iterator<Item = Card> {
+    [
+        Some(Card::Cpu),
+        Some(Card::Memory),
+        show_pinned.then_some(Card::Pinned),
+        Some(Card::Network),
+        Some(Card::Storage),
+        Some(Card::Gpu),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+fn card_height(app: &App, card: Card, inner_width: u16, graphs: bool) -> CardHeight {
+    match card {
+        Card::Cpu => hardware_cpu::card_height(app.system_metrics(), inner_width, graphs),
+        Card::Gpu => hardware::gpu_card_height(app, graphs),
+        Card::Memory => hardware::memory_card_height(app, graphs),
+        Card::Network => hardware_network_summary::card_height(app, graphs),
+        Card::Storage => {
+            hardware::storage_card_height(app.hardware(), app.system_metrics(), inner_width)
         }
-    } else {
-        let system_height = if area.height >= 22 {
-            11
-        } else if area.height >= 12 {
-            area.height / 2
-        } else {
-            area.height.min(6)
+        Card::Pinned => CardHeight::list(app.pinned_processes().count() as u16),
+    }
+}
+
+fn render_card(frame: &mut Frame, app: &App, card: Card, area: Rect, graphs: bool) {
+    match card {
+        Card::Cpu => hardware_cpu::render_card(frame, app, area, graphs),
+        Card::Gpu => hardware::render_gpu_card(frame, app, area, graphs),
+        Card::Memory => hardware::render_memory_card(frame, app, area, graphs),
+        Card::Network => hardware_network_summary::render_card(frame, app, area, graphs),
+        Card::Storage => hardware::render_storage_card(frame, app, area),
+        Card::Pinned => render_pinned_card(frame, app, area),
+    }
+}
+
+/// Places the cards for `mode`. Rows get their minimum height in priority
+/// order (top to bottom; in the narrow column CPU → Memory → Pinned →
+/// Network → Storage → GPU); a row that does not fit is left out with every
+/// row after it. When every row is shown, rows grow step by step (see
+/// [`CardHeight`]), and what is left goes to the rows with graphs. Cards
+/// side by side get the same width: an odd column goes
+/// to the Pinned column or is left blank on the right.
+pub(super) fn overview_layout(
+    area: Rect,
+    mode: WidthMode,
+    show_pinned: bool,
+    heights: impl Fn(Card, u16) -> CardHeight,
+) -> Vec<(Card, Rect)> {
+    let mut placed = Vec::new();
+    let mut grid = area;
+    let mut pinned_column = None;
+    let rows: Vec<Vec<(Card, u16)>> = match mode {
+        WidthMode::Wide => {
+            let mut pinned_width = area.width / 4;
+            // Even, so the grid's halves are equally wide and their graphs
+            // span the same time.
+            pinned_width += (area.width - pinned_width) % 2;
+            grid.width -= pinned_width;
+            if show_pinned && area.height >= CARD_MIN_HEIGHT && pinned_width > 0 {
+                pinned_column = Some(pinned_width);
+            }
+            vec![
+                halves(Card::Cpu, Card::Gpu, grid.width),
+                halves(Card::Memory, Card::Network, grid.width),
+                vec![(Card::Storage, grid.width)],
+            ]
+        }
+        WidthMode::Medium => {
+            grid.width -= area.width % 2;
+            let bottom = if show_pinned {
+                let pinned = grid.width / 3;
+                vec![(Card::Storage, grid.width - pinned), (Card::Pinned, pinned)]
+            } else {
+                vec![(Card::Storage, grid.width)]
+            };
+            vec![
+                halves(Card::Cpu, Card::Gpu, grid.width),
+                halves(Card::Memory, Card::Network, grid.width),
+                bottom,
+            ]
+        }
+        WidthMode::Narrow => narrow_cards(show_pinned)
+            .map(|card| vec![(card, area.width)])
+            .collect(),
+    };
+
+    let row_heights: Vec<CardHeight> = rows
+        .iter()
+        .map(|row| {
+            let cards: Vec<CardHeight> = row
+                .iter()
+                .map(|&(card, width)| heights(card, width))
+                .collect();
+            let tallest = |step: fn(&CardHeight) -> u16| cards.iter().map(step).max().unwrap_or(0);
+            CardHeight {
+                min: tallest(|height| height.min),
+                listed: tallest(|height| height.listed),
+                graphed: tallest(|height| height.graphed),
+                desired: tallest(|height| height.desired),
+                graph: cards.iter().any(|height| height.graph),
+            }
+        })
+        .collect();
+    let allocated = allocate_rows(grid.height, &row_heights);
+
+    let mut y = grid.y;
+    for (row, height) in rows.iter().zip(allocated) {
+        if height == 0 {
+            break;
+        }
+        let mut x = grid.x;
+        for &(card, width) in row {
+            placed.push((card, Rect::new(x, y, width, height)));
+            x += width;
+        }
+        y += height;
+    }
+    if let Some(width) = pinned_column {
+        // As tall as the cards beside it, or the whole height when none fit.
+        let height = match y - grid.y {
+            0 => area.height,
+            used => used,
         };
-        let rows =
-            Layout::vertical([Constraint::Length(system_height), Constraint::Min(0)]).split(area);
-        OverviewAreas {
-            system: rows[0],
-            hardware: rows[1],
-        }
+        placed.insert(
+            0,
+            (Card::Pinned, Rect::new(grid.right(), area.y, width, height)),
+        );
     }
+    placed
 }
 
-fn render_system(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+fn halves(left: Card, right: Card, width: u16) -> Vec<(Card, u16)> {
+    let right_width = width / 2;
+    vec![(left, width - right_width), (right, right_width)]
+}
 
-    let block = Block::default().borders(Borders::ALL).title(" System ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// Heights for `rows` within `total`: minimums in order (a row that does not
+/// fit and every later one get 0); then, once every row is shown, growth in
+/// order toward each step of [`CardHeight`] in turn, and the rest shared
+/// evenly by the rows with graphs.
+fn allocate_rows(total: u16, rows: &[CardHeight]) -> Vec<u16> {
+    let mut heights = vec![0; rows.len()];
+    let mut remaining = total;
+    let mut shown = 0;
+    for (height, row) in heights.iter_mut().zip(rows) {
+        if row.min > remaining {
+            break;
+        }
+        *height = row.min;
+        remaining -= row.min;
+        shown += 1;
+    }
+    // Rows grow only once every row is shown: growing an early row while a
+    // later one is left out would take that growth back when the area gets
+    // tall enough for the later row, and a taller terminal would show fewer
+    // CPUs. Until then the spare rows stay blank.
+    if shown < rows.len() {
+        return heights;
+    }
+    let steps: [fn(&CardHeight) -> u16; 3] =
+        [|row| row.listed, |row| row.graphed, |row| row.desired];
+    for step in steps {
+        for (height, row) in heights.iter_mut().zip(rows) {
+            let addition = step(row).saturating_sub(*height).min(remaining);
+            *height += addition;
+            remaining -= addition;
+        }
+    }
+    let growing = rows.iter().filter(|row| row.graph).count() as u16;
+    if let Some(share) = remaining.checked_div(growing) {
+        let mut extra = remaining % growing;
+        for (height, _) in heights.iter_mut().zip(rows).filter(|(_, row)| row.graph) {
+            *height += share + u16::from(extra > 0);
+            extra = extra.saturating_sub(1);
+        }
+    }
+    heights
+}
+
+/// `· host · kernel · up 2d 3h · 397 proc · 2 run · 0 zombie `, shortened to
+/// `width`: the kernel goes first, then the counts become `397p · 2r · 0z`,
+/// then the uptime goes. The host and the zombie count stay; `None` when not
+/// even they fit.
+pub(super) fn header_line(app: &App, width: usize) -> Option<Line<'static>> {
+    let metrics = app.system_metrics();
+    let host = metrics.system_identity.hostname.clone();
+    let kernel = metrics.system_identity.kernel_release.clone();
+    let uptime = metrics
+        .uptime
+        .map(|uptime| format!("up {}", format_uptime(uptime)));
+    let summary = app.process_error().is_none().then(|| app.process_summary());
+    let zombie_style = |zombies: usize| {
+        Style::default().fg(if zombies == 0 {
+            theme::MUTED
+        } else {
+            theme::WARNING
+        })
+    };
+    let counts = |long: bool, all: bool| -> Vec<Span<'static>> {
+        let Some(summary) = summary else {
+            return Vec::new();
+        };
+        let (proc, run, zombie) = if long {
+            (" proc", " run", " zombie")
+        } else {
+            ("p", "r", "z")
+        };
+        let mut spans = Vec::new();
+        if all {
+            spans.push(Span::raw(format!("{}{proc}", summary.total)));
+            spans.push(Span::raw(format!("{}{run}", summary.running)));
+        }
+        spans.push(Span::styled(
+            format!("{}{zombie}", summary.zombies),
+            zombie_style(summary.zombies),
+        ));
+        spans
+    };
+    let text = |value: &Option<String>| value.clone().map(Span::raw);
+    let variants: [Vec<Option<Span<'static>>>; 5] = [
+        [text(&host), text(&kernel), text(&uptime)]
+            .into_iter()
+            .chain(counts(true, true).into_iter().map(Some))
+            .collect(),
+        [text(&host), text(&uptime)]
+            .into_iter()
+            .chain(counts(true, true).into_iter().map(Some))
+            .collect(),
+        [text(&host), text(&uptime)]
+            .into_iter()
+            .chain(counts(false, true).into_iter().map(Some))
+            .collect(),
+        [text(&host)]
+            .into_iter()
+            .chain(counts(false, true).into_iter().map(Some))
+            .collect(),
+        [text(&host)]
+            .into_iter()
+            .chain(counts(false, false).into_iter().map(Some))
+            .collect(),
+    ];
+    variants.into_iter().find_map(|parts| {
+        let parts: Vec<Span<'static>> = parts.into_iter().flatten().collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let mut spans = Vec::with_capacity(parts.len() * 2 + 1);
+        for part in parts {
+            spans.push(Span::styled("· ", Style::default().fg(theme::MUTED)));
+            spans.push(part);
+            spans.push(Span::raw(" "));
+        }
+        let line = Line::from(spans);
+        (line.width() <= width).then_some(line)
+    })
+}
+
+fn render_pinned_card(frame: &mut Frame, app: &App, area: Rect) {
+    let inner = cards::padded(cards::render_card(
+        frame,
+        area,
+        &CardTitle::plain("Pinned"),
+        None,
+    ));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-
-    let metrics = app.system_metrics();
-    let process_summary = app.process_error().is_none().then(|| app.process_summary());
-    let hostname = metrics.system_identity.hostname.as_deref().unwrap_or("N/A");
-    let kernel = metrics
-        .system_identity
-        .kernel_release
-        .as_deref()
-        .unwrap_or("N/A");
-    let uptime = metrics
-        .uptime
-        .map(format_uptime)
-        .unwrap_or_else(|| "N/A".into());
-    let filesystem = metrics
-        .root_filesystem
-        .map(format_usage)
-        .unwrap_or_else(|| "N/A".into());
-
-    let has_gauge = metrics.root_filesystem.is_some() && inner.height >= 2;
-    let available_text_height = inner.height.saturating_sub(u16::from(has_gauge));
-    let width = usize::from(inner.width);
-    let mut lines = system_lines(
-        hostname,
-        kernel,
-        &uptime,
-        process_summary,
-        &filesystem,
-        width,
-        usize::from(available_text_height),
-    );
-    lines.truncate(usize::from(available_text_height));
-    let text_height = u16::try_from(lines.len()).unwrap_or(available_text_height);
-    frame.render_widget(
-        Paragraph::new(lines),
-        Rect::new(inner.x, inner.y, inner.width, text_height),
-    );
-
-    let mut used = text_height;
-    if let Some(usage) = metrics.root_filesystem.filter(|_| has_gauge) {
-        frame.render_widget(
-            Paragraph::new(hardware::usage_bar_line(
-                "/  ",
-                usage,
-                usize::from(inner.width),
-            )),
-            Rect::new(inner.x, inner.y.saturating_add(text_height), inner.width, 1),
-        );
-        used = used.saturating_add(1);
-    }
-
-    let pinned = pinned_lines(app, width, usize::from(inner.height.saturating_sub(used)));
-    if !pinned.is_empty() {
-        let height = u16::try_from(pinned.len()).unwrap_or(0);
-        frame.render_widget(
-            Paragraph::new(pinned),
-            Rect::new(inner.x, inner.y.saturating_add(used), inner.width, height),
-        );
-    }
+    let lines = pinned_lines(app, usize::from(inner.width), usize::from(inner.height));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The pinned processes under Filesystem: a heading and one row each, or
-/// nothing when there are no pins or not even one row fits.
+/// One row per pinned process (name, CPU and memory), with `… N more` when
+/// they do not all fit; a hint naming the pin key when there are none.
 fn pinned_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
-    // A blank line, the heading and at least one process.
-    const MIN_HEIGHT: usize = 3;
-    const VALUES_WIDTH: usize = 17;
+    // ` 1200.0%  64.0 MiB`: CPU is top-style, up to 100 % per core.
+    const CPU_WIDTH: usize = 7;
+    const VALUES_WIDTH: usize = 1 + CPU_WIDTH + 1 + 9;
     let pins: Vec<_> = app.pinned_processes().collect();
-    if pins.is_empty() || height < MIN_HEIGHT {
+    if height == 0 {
         return Vec::new();
     }
-    let mut lines = vec![
-        Line::from(""),
-        Line::from("Pinned").style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let rows = height - lines.len();
-    let overflow = pins.len() > rows;
-    let shown = if overflow { rows - 1 } else { pins.len() };
-    let name_width = width.saturating_sub(VALUES_WIDTH).max(1);
-    for pin in pins.iter().take(shown) {
-        let process = pin.process;
-        let name = layout::truncate(&process.name, name_width);
-        let line = if pin.exited {
-            Line::from(layout::truncate(
-                &format!("{name:<name_width$} exited"),
-                width,
-            ))
-            .style(Style::default().fg(Color::DarkGray))
-        } else if width > VALUES_WIDTH + 4 {
-            Line::from(format!(
-                "{name:<name_width$} {:>6} {:>9}",
-                processes::format_cpu(process.cpu_percent),
-                format_bytes(process.memory_bytes)
-            ))
-        } else {
-            Line::from(layout::truncate(
-                &format!("{name} {}", processes::format_cpu(process.cpu_percent)),
-                width,
-            ))
-        };
-        lines.push(line);
+    if pins.is_empty() {
+        let hint = keymap::key_for(keymap::PROCESSES, Action::TogglePin).map_or_else(
+            || "No pinned processes".to_owned(),
+            |key| format!("{key} on Processes pins a process"),
+        );
+        return vec![
+            Line::from(layout::truncate(&hint, width)).style(Style::default().fg(theme::MUTED))
+        ];
     }
+    let overflow = pins.len() > height;
+    let shown = if overflow { height - 1 } else { pins.len() };
+    let name_width = width.saturating_sub(VALUES_WIDTH).max(1);
+    let mut lines: Vec<Line<'static>> = pins
+        .iter()
+        .take(shown)
+        .map(|pin| {
+            let process = pin.process;
+            let name = layout::truncate(&process.name, name_width);
+            if pin.exited {
+                Line::from(layout::truncate(
+                    &format!("{name:<name_width$} exited"),
+                    width,
+                ))
+                .style(Style::default().fg(theme::MUTED))
+            } else if width > VALUES_WIDTH + 4 {
+                Line::from(vec![
+                    Span::raw(format!("{name:<name_width$} ")),
+                    pinned_cpu(process.cpu_percent),
+                    Span::raw(format!(" {:>9}", format_bytes(process.memory_bytes))),
+                ])
+            } else {
+                let name = layout::truncate(&process.name, width.saturating_sub(CPU_WIDTH + 1));
+                let cpu = pinned_cpu(process.cpu_percent);
+                if name.is_empty() || width < CPU_WIDTH + 2 {
+                    Line::from(layout::truncate(&name, width))
+                } else {
+                    Line::from(vec![Span::raw(format!("{name} ")), cpu])
+                }
+            }
+        })
+        .collect();
     if overflow {
         lines.push(Line::from(format!("… {} more", pins.len() - shown)));
     }
     lines
 }
 
-#[allow(clippy::too_many_arguments)]
-fn system_lines(
-    hostname: &str,
-    kernel: &str,
-    uptime: &str,
-    process_summary: Option<crate::linux::ProcessSummary>,
-    filesystem: &str,
-    width: usize,
-    height: usize,
-) -> Vec<Line<'static>> {
-    let summary_values = process_summary.map(|summary| {
-        (
-            summary.total.to_string(),
-            summary.running.to_string(),
-            summary.zombies.to_string(),
-        )
-    });
-    if height >= 8 {
-        let (total, running, zombies) =
-            summary_values.unwrap_or_else(|| ("unavailable".into(), "--".into(), "--".into()));
-        vec![
-            info_line("Host", hostname, width),
-            info_line("Kernel", kernel, width),
-            info_line("Uptime", uptime, width),
-            Line::from(""),
-            info_line("Processes", &total, width),
-            info_line("Running", &running, width),
-            info_line("Zombies", &zombies, width),
-            Line::from("Filesystem").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]
-    } else if height >= 5 {
-        let process_line = process_summary.map_or_else(
-            || "Proc  unavailable".to_owned(),
-            |summary| {
-                format!(
-                    "Proc  {}  R {}  Z {}",
-                    summary.total, summary.running, summary.zombies
-                )
-            },
-        );
-        vec![
-            info_line("Host", hostname, width),
-            info_line("Kernel", kernel, width),
-            info_line("Uptime", uptime, width),
-            Line::from(layout::truncate(&process_line, width)),
-            Line::from("Filesystem").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]
-    } else {
-        let process_line = process_summary.map_or_else(
-            || "P unavailable".to_owned(),
-            |summary| {
-                format!(
-                    "P {} R {} Z {}",
-                    summary.total, summary.running, summary.zombies
-                )
-            },
-        );
-        [
-            format!("Host {hostname}"),
-            format!("Up {uptime}"),
-            process_line,
-            format!("/ {filesystem}"),
-        ]
-        .into_iter()
-        .take(height)
-        .map(|line| Line::from(layout::truncate(&line, width)))
-        .collect()
+/// `  12.5%`, colored by its band; a process busy on several cores is
+/// placed at 100 %.
+fn pinned_cpu(percent: Option<f64>) -> Span<'static> {
+    match percent {
+        Some(percent) => Span::styled(
+            format!("{percent:>6.1}%"),
+            Style::default().fg(theme::band(percent.min(100.0))),
+        ),
+        None => Span::styled(format!("{:>7}", "N/A"), Style::default().fg(theme::MUTED)),
     }
-}
-
-fn info_line(label: &str, value: &str, width: usize) -> Line<'static> {
-    const LABEL_WIDTH: usize = 10;
-    if width <= LABEL_WIDTH {
-        return Line::from(layout::truncate(&format!("{label} {value}"), width));
-    }
-
-    let value = layout::truncate(value, width.saturating_sub(LABEL_WIDTH));
-    Line::from(format!("{label:<LABEL_WIDTH$}{value}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{backend::TestBackend, Terminal};
-
     use super::*;
 
-    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+    /// A height that grows from `min` to `desired` in its last step, and
+    /// further with spare rows when it has a `graph`.
+    fn staged(min: u16, desired: u16, graph: bool) -> CardHeight {
+        CardHeight {
+            min,
+            listed: min,
+            graphed: min,
+            desired,
+            graph,
+        }
     }
 
-    fn process(pid: u32, name: &str, state_code: char) -> crate::linux::ProcessInfo {
+    /// Every card but Storage and Pinned has a graph.
+    fn fixed(min: u16, desired: u16) -> impl Fn(Card, u16) -> CardHeight {
+        move |card, _| staged(min, desired, !matches!(card, Card::Storage | Card::Pinned))
+    }
+
+    fn cards(placed: &[(Card, Rect)]) -> Vec<Card> {
+        placed.iter().map(|(card, _)| *card).collect()
+    }
+
+    #[test]
+    fn width_modes_switch_at_their_boundaries() {
+        assert_eq!(
+            WidthMode::for_width(MEDIUM_MIN_WIDTH - 1),
+            WidthMode::Narrow
+        );
+        assert_eq!(WidthMode::for_width(MEDIUM_MIN_WIDTH), WidthMode::Medium);
+        assert_eq!(WidthMode::for_width(WIDE_MIN_WIDTH - 1), WidthMode::Medium);
+        assert_eq!(WidthMode::for_width(WIDE_MIN_WIDTH), WidthMode::Wide);
+        // The terminal is two columns wider than the Overview.
+        assert_eq!(MEDIUM_MIN_WIDTH + 2, 100);
+        assert_eq!(WIDE_MIN_WIDTH + 2, 150);
+    }
+
+    #[test]
+    fn wide_places_a_grid_storage_and_a_pinned_column() {
+        let area = Rect::new(1, 2, 200, 50);
+        let placed = overview_layout(area, WidthMode::Wide, true, fixed(4, 8));
+        assert_eq!(
+            cards(&placed),
+            [
+                Card::Pinned,
+                Card::Cpu,
+                Card::Gpu,
+                Card::Memory,
+                Card::Network,
+                Card::Storage
+            ]
+        );
+        let rect = |card| placed.iter().find(|(c, _)| *c == card).unwrap().1;
+        assert_eq!(rect(Card::Pinned), Rect::new(151, 2, 50, 50));
+        assert_eq!(rect(Card::Cpu).x, 1);
+        assert_eq!(rect(Card::Gpu).right(), 151);
+        assert_eq!(rect(Card::Storage).width, 150);
+        assert_eq!(rect(Card::Storage).bottom(), 2 + 8 + 8 + 8 + (50 - 24));
+        assert!(rect(Card::Cpu).height > 8, "graph rows take what is left");
+    }
+
+    #[test]
+    fn medium_puts_storage_and_pinned_side_by_side_or_storage_alone() {
+        let area = Rect::new(0, 0, 120, 40);
+        let with = overview_layout(area, WidthMode::Medium, true, fixed(4, 6));
+        let rect =
+            |placed: &[(Card, Rect)], card| placed.iter().find(|(c, _)| *c == card).unwrap().1;
+        assert_eq!(rect(&with, Card::Storage).width, 80);
+        assert_eq!(rect(&with, Card::Pinned).width, 40);
+        let without = overview_layout(area, WidthMode::Medium, false, fixed(4, 6));
+        assert!(!cards(&without).contains(&Card::Pinned));
+        assert_eq!(rect(&without, Card::Storage).width, 120);
+    }
+
+    #[test]
+    fn narrow_stacks_by_priority_and_leaves_out_what_does_not_fit() {
+        let area = Rect::new(0, 0, 60, 100);
+        let all = overview_layout(area, WidthMode::Narrow, true, fixed(3, 5));
+        assert_eq!(
+            cards(&all),
+            [
+                Card::Cpu,
+                Card::Memory,
+                Card::Pinned,
+                Card::Network,
+                Card::Storage,
+                Card::Gpu
+            ]
+        );
+        let short = overview_layout(
+            Rect::new(0, 0, 60, 13),
+            WidthMode::Narrow,
+            false,
+            fixed(3, 5),
+        );
+        assert_eq!(
+            cards(&short),
+            [Card::Cpu, Card::Memory, Card::Network, Card::Storage]
+        );
+    }
+
+    #[test]
+    fn cards_never_overlap_or_leave_the_area() {
+        for mode in [WidthMode::Narrow, WidthMode::Medium, WidthMode::Wide] {
+            for width in 0..=220 {
+                for height in 0..=70 {
+                    let area = Rect::new(3, 4, width, height);
+                    let placed = overview_layout(area, mode, true, |card, width| {
+                        staged(3 + (card as u16) % 3, 6 + width % 5, width % 2 == 0)
+                    });
+                    for (index, (_, rect)) in placed.iter().enumerate() {
+                        assert_eq!(rect.intersection(area), *rect, "{mode:?} {width}x{height}");
+                        assert!(rect.height >= CARD_MIN_HEIGHT, "{mode:?} {width}x{height}");
+                        for (_, other) in &placed[index + 1..] {
+                            assert!(!rect.intersects(*other), "{mode:?} {width}x{height}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn side_by_side_cards_are_equally_wide_on_odd_widths() {
+        let width_of = |placed: &[(Card, Rect)], card| {
+            placed
+                .iter()
+                .find(|(c, _)| *c == card)
+                .map(|(_, rect)| rect.width)
+                .unwrap()
+        };
+        for width in [149, 150, 151, 201] {
+            let area = Rect::new(0, 0, width, 40);
+            let wide = overview_layout(area, WidthMode::Wide, true, fixed(4, 8));
+            assert_eq!(
+                width_of(&wide, Card::Cpu),
+                width_of(&wide, Card::Gpu),
+                "{width}"
+            );
+            let right = wide.iter().map(|(_, rect)| rect.right()).max();
+            assert_eq!(right, Some(width), "the Pinned column takes the odd column");
+        }
+        for width in [98, 99, 120, 147] {
+            let area = Rect::new(0, 0, width, 40);
+            let medium = overview_layout(area, WidthMode::Medium, true, fixed(4, 8));
+            assert_eq!(
+                width_of(&medium, Card::Memory),
+                width_of(&medium, Card::Network),
+                "{width}"
+            );
+            let right = medium.iter().map(|(_, rect)| rect.right()).max().unwrap();
+            assert_eq!(right, width - width % 2, "{width}");
+        }
+    }
+
+    #[test]
+    fn spare_rows_go_to_the_graphs_and_fill_the_overview() {
+        let heights = |card: Card, _| match card {
+            Card::Storage | Card::Pinned => CardHeight::list(2),
+            _ => CardHeight::new(1, 0, true),
+        };
+        // 7 rows per grid row and 4 for Storage; the 62 left are shared by
+        // the two grid rows.
+        let placed = overview_layout(Rect::new(0, 0, 200, 80), WidthMode::Wide, true, heights);
+        let rect = |card| placed.iter().find(|(c, _)| *c == card).unwrap().1;
+        assert_eq!(rect(Card::Cpu).height, 7 + 31);
+        assert_eq!(rect(Card::Storage).height, 4);
+        assert_eq!(rect(Card::Storage).bottom(), 80);
+        assert_eq!(rect(Card::Pinned).height, 80);
+    }
+
+    #[test]
+    fn rows_get_minimums_then_desired_heights_then_graph_room() {
+        let rows = [staged(4, 10, true), staged(4, 6, true), staged(3, 5, false)];
+        // Only the first minimum fits; nothing grows while a row is left out.
+        assert_eq!(allocate_rows(7, &rows), [4, 0, 0]);
+        assert_eq!(allocate_rows(11, &rows), [4, 4, 3]);
+        assert_eq!(allocate_rows(21, &rows), [10, 6, 5]);
+        assert_eq!(allocate_rows(25, &rows), [12, 8, 5]);
+        assert_eq!(allocate_rows(40, &rows), [20, 15, 5]);
+        assert_eq!(allocate_rows(0, &rows), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_shrinking_overview_drops_optional_rows_then_graph_rows_then_list_rows() {
+        // CPU (a 4-row grid) | GPU, Memory | Network (2 more interfaces),
+        // Storage | Pinned (6 pins): 11 rows at their minimum, 16 with whole
+        // lists, 22 with full graphs, 28 with everything.
+        let rows = [
+            CardHeight::new(1, 4, true),
+            CardHeight::new(1, 2, true),
+            CardHeight::list(6),
+        ];
+        assert_eq!(
+            rows[0],
+            CardHeight {
+                min: 4,
+                listed: 4,
+                graphed: 7,
+                desired: 11,
+                graph: true
+            }
+        );
+        assert_eq!(
+            rows[2],
+            CardHeight {
+                min: 3,
+                listed: 8,
+                graphed: 8,
+                desired: 8,
+                graph: false
+            }
+        );
+        assert_eq!(allocate_rows(40, &rows), [17, 15, 8]);
+        assert_eq!(allocate_rows(28, &rows), [11, 9, 8]);
+        // The optional rows go first, those of the lower row first.
+        assert_eq!(allocate_rows(26, &rows), [11, 7, 8]);
+        assert_eq!(allocate_rows(22, &rows), [7, 7, 8]);
+        // Then the graphs shrink to one row.
+        assert_eq!(allocate_rows(19, &rows), [7, 4, 8]);
+        assert_eq!(allocate_rows(16, &rows), [4, 4, 8]);
+        // Then the lists, down to one row (and `… N more`).
+        assert_eq!(allocate_rows(15, &rows), [4, 4, 7]);
+        assert_eq!(allocate_rows(11, &rows), [4, 4, 3]);
+        // Then whole rows, from the last.
+        assert_eq!(allocate_rows(10, &rows), [4, 4, 0]);
+        assert_eq!(allocate_rows(7, &rows), [4, 0, 0]);
+
+        // No row gets shorter as the area grows.
+        let mut previous = vec![0; rows.len()];
+        for total in 0..60 {
+            let heights = allocate_rows(total, &rows);
+            for (height, before) in heights.iter().zip(&previous) {
+                assert!(height >= before, "{total}: {heights:?}");
+            }
+            previous = heights;
+        }
+    }
+
+    #[test]
+    fn narrow_drops_the_gpu_card_only_after_pinned_is_down_to_one_row() {
+        let heights = |card: Card, _| match card {
+            Card::Pinned => CardHeight::list(5),
+            _ => CardHeight::new(1, 0, false),
+        };
+        let narrow = |height| {
+            let placed = overview_layout(
+                Rect::new(0, 0, 60, height),
+                WidthMode::Narrow,
+                true,
+                heights,
+            );
+            let pinned = placed
+                .iter()
+                .find(|(card, _)| *card == Card::Pinned)
+                .map(|(_, rect)| rect.height);
+            (placed.last().map(|(card, _)| *card), pinned)
+        };
+        // Six cards of 3 rows; Pinned grows to 7 once all are shown.
+        assert_eq!(narrow(22), (Some(Card::Gpu), Some(7)));
+        assert_eq!(narrow(18), (Some(Card::Gpu), Some(3)));
+        assert_eq!(narrow(17), (Some(Card::Storage), Some(3)));
+    }
+
+    #[test]
+    fn a_tall_narrow_overview_draws_graphs_inside_the_cards() {
+        let mut app = App::default();
+        for _ in 0..3 {
+            app.update(Action::SystemMetricsUpdated(crate::linux::SystemMetrics {
+                cpu_percent: Some(50.0),
+                ..crate::linux::SystemMetrics::default()
+            }));
+        }
+        let screen = |height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect::<Vec<String>>()
+        };
+        let graph = |row: &String| row.contains('▄') || row.contains('█');
+
+        let short = screen(15);
+        assert!(
+            short[0].starts_with("┌ CPU") && graph(&short[0]),
+            "{short:#?}"
+        );
+        let tall = screen(60);
+        assert!(!graph(&tall[0]), "{tall:#?}");
+        assert!(tall[1..10].iter().any(graph), "{tall:#?}");
+    }
+
+    fn process(pid: u32, state_code: char) -> crate::linux::ProcessInfo {
         crate::linux::ProcessInfo {
             pid,
-            name: name.into(),
+            name: format!("p{pid}"),
             cpu_percent: None,
             memory_bytes: 0,
             command: None,
-            state: state_code.to_string(),
+            state: String::new(),
             parent_pid: 1,
             state_code,
             start_time: u64::from(pid),
@@ -295,139 +790,141 @@ mod tests {
         }
     }
 
-    #[test]
-    fn overview_uses_side_by_side_areas_when_width_allows() {
-        let area = Rect::new(3, 4, 100, 20);
-        let result = overview_areas(area);
-
-        assert_eq!(result.system, Rect::new(3, 4, 33, 20));
-        assert_eq!(result.hardware, Rect::new(36, 4, 67, 20));
-    }
-
-    #[test]
-    fn overview_stacks_and_clamps_areas_at_narrow_or_tiny_sizes() {
-        let narrow = overview_areas(Rect::new(2, 3, 40, 18));
-        assert_eq!(narrow.system, Rect::new(2, 3, 40, 9));
-        assert_eq!(narrow.hardware, Rect::new(2, 12, 40, 9));
-
-        let tiny = overview_areas(Rect::new(u16::MAX - 1, u16::MAX - 1, 1, 1));
-        assert_eq!(tiny.system.width, 1);
-        assert_eq!(tiny.system.height, 1);
-        assert_eq!(tiny.hardware.height, 0);
-    }
-
-    #[test]
-    fn overview_keeps_supported_narrow_viewports_stacked() {
-        for width in [40, 46, 80, SIDE_BY_SIDE_MIN_WIDTH - 1] {
-            let area = Rect::new(0, 0, width, 57);
-            let result = overview_areas(area);
-            assert_eq!(result.system.width, width);
-            assert_eq!(result.hardware.width, width);
-            assert_eq!(result.hardware.y, result.system.bottom());
-        }
-
-        let result = overview_areas(Rect::new(0, 0, SIDE_BY_SIDE_MIN_WIDTH, 57));
-        assert_eq!(result.system.y, result.hardware.y);
-        assert!(result.system.width >= 26);
-        assert!(result.hardware.width >= 52);
-    }
-
-    #[test]
-    fn process_summary_is_unavailable_while_cached_data_is_stale() {
+    fn header_app(zombies: u32) -> App {
         let mut app = App::default();
-        app.update(crate::action::Action::ProcessesUpdated(
-            crate::linux::ProcessSnapshot {
-                processes: vec![process(1, "running", 'R'), process(2, "zombie", 'Z')],
-                error: None,
-            },
-        ));
-        app.update(crate::action::Action::ProcessesUpdated(
-            crate::linux::ProcessSnapshot {
-                processes: Vec::new(),
-                error: Some("proc unavailable".into()),
-            },
-        ));
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render_system(frame, &app, frame.area()))
-            .unwrap();
-
-        let stale = rendered_text(&terminal);
-        assert!(stale.contains("Processes unavailable"));
-        assert!(!stale.contains("Processes 2"));
-
-        app.update(crate::action::Action::ProcessesUpdated(
-            crate::linux::ProcessSnapshot {
-                processes: vec![process(3, "healthy", 'S')],
-                error: None,
-            },
-        ));
-        terminal
-            .draw(|frame| render_system(frame, &app, frame.area()))
-            .unwrap();
-        let healthy = rendered_text(&terminal);
-        assert!(!healthy.contains("unavailable"));
-        assert!(healthy.contains("Processes 1"));
+        let mut metrics = crate::linux::SystemMetrics {
+            uptime: Some(std::time::Duration::from_secs(
+                2 * 86_400 + 13 * 3600 + 58 * 60,
+            )),
+            ..crate::linux::SystemMetrics::default()
+        };
+        metrics.system_identity.hostname = Some("Monolith".into());
+        metrics.system_identity.kernel_release = Some("7.2.6-1-cachyos".into());
+        app.update(Action::SystemMetricsUpdated(metrics));
+        let mut processes: Vec<_> = (1..=397).map(|pid| process(pid, 'S')).collect();
+        processes[0].state_code = 'R';
+        processes[1].state_code = 'R';
+        for index in 0..zombies as usize {
+            processes[10 + index].state_code = 'Z';
+        }
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes,
+            error: None,
+        }));
+        app
     }
 
-    use crate::action::{Action, Tab};
-    use crate::linux::{ByteUsage, ProcessIdentity, ProcessSnapshot, SystemMetrics};
+    fn header_text(app: &App, width: usize) -> Option<String> {
+        header_line(app, width).map(|line| line.to_string())
+    }
+
+    #[test]
+    fn the_header_drops_kernel_then_abbreviates_then_drops_uptime() {
+        let app = header_app(0);
+        let full = "· Monolith · 7.2.6-1-cachyos · up 2d 13h 58m · 397 proc · 2 run · 0 zombie ";
+        let steps = [
+            full,
+            "· Monolith · up 2d 13h 58m · 397 proc · 2 run · 0 zombie ",
+            "· Monolith · up 2d 13h 58m · 397p · 2r · 0z ",
+            "· Monolith · 397p · 2r · 0z ",
+            "· Monolith · 0z ",
+        ];
+        let mut seen = Vec::new();
+        for width in (0..=100).rev() {
+            let text = header_text(&app, width);
+            if let Some(text) = &text {
+                assert!(text.chars().count() <= width, "{width}: {text}");
+            }
+            if seen.last() != Some(&text) {
+                seen.push(text);
+            }
+        }
+        let expected: Vec<Option<String>> = steps
+            .iter()
+            .map(|step| Some((*step).to_owned()))
+            .chain([None])
+            .collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn zombies_are_muted_when_zero_and_a_warning_otherwise() {
+        let zombie_style = |app: &App| {
+            header_line(app, 200)
+                .unwrap()
+                .spans
+                .iter()
+                .find(|span| span.content.contains("zombie"))
+                .unwrap()
+                .style
+                .fg
+        };
+        assert_eq!(zombie_style(&header_app(0)), Some(theme::MUTED));
+        assert_eq!(zombie_style(&header_app(3)), Some(theme::WARNING));
+    }
+
+    #[test]
+    fn process_counts_leave_the_header_while_process_data_is_unavailable() {
+        let mut app = header_app(1);
+        assert!(header_text(&app, 200).unwrap().contains("1 zombie"));
+        app.update(Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
+            processes: Vec::new(),
+            error: Some("proc unavailable".into()),
+        }));
+        let stale = header_text(&app, 200).unwrap();
+        assert!(
+            !stale.contains("proc") && !stale.contains("zombie"),
+            "{stale}"
+        );
+        assert!(stale.contains("Monolith"));
+    }
 
     fn snapshot(entries: &[(u32, &str, f64)]) -> Action {
-        Action::ProcessesUpdated(ProcessSnapshot {
+        Action::ProcessesUpdated(crate::linux::ProcessSnapshot {
             processes: entries
                 .iter()
                 .map(|&(pid, name, cpu)| crate::linux::ProcessInfo {
+                    name: name.into(),
                     cpu_percent: Some(cpu),
                     memory_bytes: 64 << 20,
-                    ..process(pid, name, 'S')
+                    ..process(pid, 'S')
                 })
                 .collect(),
             error: None,
         })
     }
 
-    /// Pins `pids` on the Processes tab, then returns to Overview.
+    /// Pins `pids` on the Processes tab, then returns to the Overview.
     fn overview_with_pins(entries: &[(u32, &str, f64)], pids: &[u32]) -> App {
         let mut app = App::default();
-        app.update(Action::SystemMetricsUpdated(SystemMetrics {
-            root_filesystem: Some(ByteUsage {
-                used: 50 << 30,
-                total: 100 << 30,
-            }),
-            ..SystemMetrics::default()
-        }));
-        app.update(Action::SelectTab(Tab::Processes));
+        app.update(Action::SelectTab(crate::action::Tab::Processes));
         app.update(snapshot(entries));
         for &pid in pids {
-            app.update(Action::SelectProcess(ProcessIdentity {
+            app.update(Action::SelectProcess(crate::linux::ProcessIdentity {
                 pid,
                 start_time: u64::from(pid),
             }));
             app.update(Action::TogglePin);
         }
-        app.update(Action::SelectTab(Tab::Overview));
+        app.update(Action::SelectTab(crate::action::Tab::Overview));
         app
     }
 
-    fn system_panel(app: &App, width: u16, height: u16) -> Vec<String> {
+    fn pinned_card(app: &App, width: u16, height: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+        use ratatui::{backend::TestBackend, Terminal};
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_system(frame, app, frame.area()))
+            .draw(|frame| render_pinned_card(frame, app, frame.area()))
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect()
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (rows, buffer)
     }
 
     #[test]
-    fn pinned_processes_are_listed_under_the_filesystem() {
+    fn pinned_processes_are_listed_in_pin_order_with_cpu_and_memory() {
         let app = overview_with_pins(
             &[
                 (1, "postgres", 12.5),
@@ -436,71 +933,85 @@ mod tests {
             ],
             &[2, 1],
         );
-        let rows = system_panel(&app, 36, 20);
-        let at = |text: &str| rows.iter().position(|row| row.contains(text));
-
-        let pinned = at("Pinned").expect("section heading");
-        assert!(at("Filesystem").unwrap() < pinned);
-        assert!(rows[pinned + 1].contains("firefox"), "{rows:#?}");
-        assert!(rows[pinned + 1].contains("30.0%"), "{rows:#?}");
-        assert!(rows[pinned + 1].contains("64.0 MiB"), "{rows:#?}");
+        let (rows, _) = pinned_card(&app, 40, 6);
+        assert!(rows[0].contains(" Pinned "));
         assert!(
-            rows[pinned + 2].contains("postgres"),
-            "pin order: {rows:#?}"
+            rows[1].contains("firefox") && rows[1].contains("30.0%"),
+            "{rows:#?}"
         );
-        assert!(at("bash").is_none(), "unpinned processes are not listed");
+        assert!(rows[1].contains("64.0 MiB"), "{rows:#?}");
+        assert!(rows[2].contains("postgres"), "pin order: {rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("bash")));
     }
 
     #[test]
-    fn exited_pins_are_shown_dimmed_on_overview() {
+    fn pinned_cpu_is_colored_by_band_and_a_multi_core_process_counts_as_full() {
+        let app = overview_with_pins(&[(1, "idle", 2.0), (2, "build", 250.0)], &[1, 2]);
+        let (rows, buffer) = pinned_card(&app, 40, 5);
+        let cell_of = |row: usize, text: &str| {
+            let x = rows[row].find(text).unwrap();
+            let x = rows[row][..x].chars().count() as u16;
+            buffer[(x, row as u16)].fg
+        };
+        assert!(rows[2].contains(" 250.0%"), "{rows:#?}");
+        assert_eq!(cell_of(1, "2.0%"), theme::band(2.0));
+        assert_eq!(cell_of(2, "250.0%"), theme::band(100.0));
+        // The values line up whatever the width of the CPU value.
+        assert_eq!(rows[1].find("MiB"), rows[2].find("MiB"), "{rows:#?}");
+    }
+
+    #[test]
+    fn exited_pins_are_shown_dimmed() {
         let mut app = overview_with_pins(&[(1, "worker", 5.0), (2, "bash", 1.0)], &[1]);
         app.update(snapshot(&[(2, "bash", 1.0)]));
-
-        let rows = system_panel(&app, 36, 20);
-        let row = rows.iter().find(|row| row.contains("worker")).unwrap();
-        assert!(row.contains("exited"), "{row}");
-
-        let mut terminal = Terminal::new(TestBackend::new(36, 20)).unwrap();
-        terminal
-            .draw(|frame| render_system(frame, &app, frame.area()))
-            .unwrap();
-        let y = rows.iter().position(|row| row.contains("worker")).unwrap() as u16;
-        assert_eq!(terminal.backend().buffer()[(2, y)].fg, Color::DarkGray);
-    }
-
-    #[test]
-    fn the_pinned_section_needs_pins_and_room() {
-        let none = overview_with_pins(&[(1, "a", 1.0)], &[]);
-        assert!(!system_panel(&none, 36, 20)
-            .iter()
-            .any(|row| row.contains("Pinned")));
-
-        let pinned = overview_with_pins(&[(1, "a", 1.0)], &[1]);
-        for height in [5, 8, 10] {
-            let rows = system_panel(&pinned, 40, height);
-            if let Some(heading) = rows.iter().position(|row| row.contains("Pinned")) {
-                assert!(heading + 1 < rows.len(), "no heading without a row");
-            }
-        }
+        let (rows, buffer) = pinned_card(&app, 40, 5);
+        assert!(
+            rows[1].contains("worker") && rows[1].contains("exited"),
+            "{rows:#?}"
+        );
+        // The name starts a column in from the border.
+        assert_eq!(buffer[(2, 1)].fg, theme::MUTED);
     }
 
     #[test]
     fn pins_that_do_not_fit_are_counted() {
-        let entries: Vec<(u32, String, f64)> = (1..=8)
-            .map(|pid| (pid, format!("proc{pid}"), 1.0))
-            .collect();
-        let entries: Vec<(u32, &str, f64)> = entries
+        let names: Vec<String> = (1..=8).map(|pid| format!("proc{pid}")).collect();
+        let entries: Vec<(u32, &str, f64)> = names
             .iter()
-            .map(|(pid, name, cpu)| (*pid, name.as_str(), *cpu))
+            .enumerate()
+            .map(|(index, name)| (index as u32 + 1, name.as_str(), 1.0))
             .collect();
         let app = overview_with_pins(&entries, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let (rows, _) = pinned_card(&app, 40, 6);
+        assert!(rows[4].contains("… 5 more"), "{rows:#?}");
+    }
 
-        // 16 rows leave room for the heading and a few of the 8 pins.
-        let rows = system_panel(&app, 36, 16);
+    #[test]
+    fn without_pins_wide_shows_the_pin_key_and_narrower_modes_hide_the_card() {
+        let app = overview_with_pins(&[(1, "a", 1.0)], &[]);
+        let (rows, _) = pinned_card(&app, 40, 4);
         assert!(
-            rows.iter()
-                .any(|row| row.contains("… ") && row.contains("more")),
+            rows[1].contains("P on Processes pins a process"),
             "{rows:#?}"
         );
+
+        let placed = |width: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..40)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .any(|row| row.contains(" Pinned "))
+        };
+        assert!(placed(WIDE_MIN_WIDTH));
+        assert!(!placed(WIDE_MIN_WIDTH - 1));
+        assert!(!placed(60));
     }
 }
