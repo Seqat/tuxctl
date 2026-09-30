@@ -12,8 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 
+### Security
+
+- A security policy (`SECURITY.md`) with private vulnerability reporting
+  through GitHub.
+- Release archives carry a build provenance attestation:
+  `gh attestation verify <archive> --repo Seqat/tuxctl` confirms that the
+  release workflow built it from this repository.
+
 ### Internal
 
+- Every GitHub Action is pinned to a commit, and checkouts do not keep the
+  repository token. A new Security workflow runs `cargo-deny` (RustSec
+  advisories, licenses, sources) and `zizmor` (workflow audit) on every push
+  and weekly; Dependabot proposes weekly dependency and action updates after
+  a 7-day cooldown.
 - Publishing a GitHub release also publishes the crate on crates.io through
   Trusted Publishing (no stored token); other runs of the release workflow
   check the package with `cargo publish --dry-run`.
