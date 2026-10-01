@@ -1,3 +1,7 @@
+//! Screen geometry shared by every screen: the minimum terminal size, the tab
+//! row and content area, tab labels and their widths, centered popups, and text
+//! truncation.
+
 use ratatui::layout::Rect;
 
 use crate::action::Tab;

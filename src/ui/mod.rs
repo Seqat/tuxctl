@@ -1,3 +1,9 @@
+//! Rendering. `render` draws one frame from the cached `App` state and returns
+//! the `UiRegions`, where tabs, rows and buttons ended up, which the event
+//! handler uses to turn mouse coordinates into targets. Drawing never reads the
+//! system, and the finished frame passes through `sanitize` before it reaches
+//! the terminal.
+
 mod cards;
 mod hardware;
 mod hardware_cpu;

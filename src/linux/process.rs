@@ -1,3 +1,9 @@
+//! Processes: the `/proc/<pid>/stat` scanner (CPU from tick deltas, memory,
+//! state, kernel threads), command lines read once per process identity, and
+//! signal delivery. A process is identified by `(PID, start time)`; a signal is
+//! sent through a pidfd only after that identity is checked again, and never by
+//! PID alone.
+
 use std::{
     collections::HashMap,
     fs,
@@ -15,7 +21,7 @@ use super::{
 };
 
 const PROC: &str = "/proc";
-/// `PF_KTHREAD` in the `flags` field of /proc/<pid>/stat.
+/// `PF_KTHREAD` in the `flags` field of `/proc/<pid>/stat`.
 const PF_KTHREAD: u64 = 0x0020_0000;
 
 #[derive(Debug, Clone, PartialEq)]

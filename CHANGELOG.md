@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Issue forms for bugs (asking for `tuxctl --version` and `tuxctl --check`)
   and feature requests, links to private security reports and the
   documentation instead of blank issues, and a pull request checklist.
+- Every module starts with a short `//!` summary of what it does, so the
+  code can be navigated from `cargo doc --document-private-items`.
 - A release checklist (`RELEASING.md`): preparing, checking, merging,
   tagging, verifying what publishing starts, and what to do when a step
   fails.

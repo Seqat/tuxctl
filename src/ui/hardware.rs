@@ -1,3 +1,6 @@
+//! The Overview's Memory, GPU and Storage cards, and the gauges, bars and
+//! temperature styling they share with the CPU and Network cards.
+
 use std::{path::Path, sync::Arc};
 
 use ratatui::{

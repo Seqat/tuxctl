@@ -1,3 +1,8 @@
+//! The systemd journal: `journalctl --follow --output=json` read on a thread into
+//! a bounded channel. Entries that cannot be queued in time are counted as
+//! dropped instead of piling up, and a batch handed to the UI is capped so a
+//! burst of messages cannot starve input handling.
+
 use std::{
     cell::Cell,
     io::{BufRead, BufReader, Read},

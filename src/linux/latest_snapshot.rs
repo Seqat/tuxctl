@@ -1,3 +1,7 @@
+//! A one-slot channel that keeps only the newest value. Publishing replaces
+//! whatever is pending and never blocks, so a slow consumer sees the latest
+//! snapshot rather than a backlog.
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 struct State<T> {

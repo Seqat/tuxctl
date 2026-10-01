@@ -1,3 +1,7 @@
+//! The Overview's CPU card: the title (model, package temperature, power), the
+//! utilization graph, the summary line with the load averages, and the per-CPU
+//! grid, whose rows and columns follow the card's size.
+
 use ratatui::{
     layout::Rect,
     text::{Line, Span},

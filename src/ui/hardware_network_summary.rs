@@ -1,3 +1,7 @@
+//! The Overview's Network card: the main interface with its state and
+//! temperature in the title, a graph of its traffic, its rates, and a row for
+//! each other interface that fits.
+
 use ratatui::{
     layout::Rect,
     text::{Line, Span},

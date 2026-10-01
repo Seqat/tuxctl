@@ -1,3 +1,8 @@
+//! Network interfaces: counters from `/proc/net/dev`, state, MAC address and MTU
+//! from `/sys/class/net`, addresses from `getifaddrs`, and per-second rates
+//! computed from the counters. Rates start over when an interface appears or
+//! disappears or a read fails, rather than showing a spike.
+
 use std::{
     collections::HashMap,
     ffi::CStr,

@@ -1,3 +1,7 @@
+//! The Services screen: the systemd unit table with its status line, and the
+//! read-only detail view of one unit. Rendering also returns the rows it drew,
+//! so clicks can be resolved to units.
+
 use std::sync::Arc;
 
 use ratatui::{

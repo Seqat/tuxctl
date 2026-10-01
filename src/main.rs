@@ -1,3 +1,14 @@
+//! `tuxctl`: a lightweight, keyboard-first Linux TUI for system monitoring and
+//! management.
+//!
+//! This is the entry point and the event loop. It parses the command line, owns
+//! the terminal for the whole session (restored on a normal exit, on SIGTERM,
+//! SIGHUP and SIGINT, and on a panic of the main thread; a worker's panic never
+//! touches it), and starts one background collector per data source. The loop
+//! turns terminal events and collector snapshots into `Action`s, applies them
+//! with `App::update`, and redraws from cached state only when something
+//! visible changed.
+
 // Every `unsafe` block states why it is sound (`// SAFETY: …`).
 #![deny(clippy::undocumented_unsafe_blocks)]
 // Outside tests, errors are handled rather than turned into panics: a panic

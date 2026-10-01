@@ -1,3 +1,8 @@
+//! The Processes screen: the system CPU and RAM summary, the sortable table with
+//! pinned rows first, the key hints, and the dialogs for one process, its
+//! details and the signal confirmation. Rendering also returns the rows and
+//! headers it drew, so clicks can be resolved.
+
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
