@@ -97,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisories, licenses, sources) and `zizmor` (workflow audit) on every push
   and weekly; Dependabot proposes weekly dependency and action updates after
   a 7-day cooldown.
+- Workflows install Rust with the runner's preinstalled `rustup` (minimal
+  profile, the same versions as before) instead of
+  `dtolnay/rust-toolchain`. That action is only published as moving
+  branches, so its pinned commit drifted from its `# master` comment and
+  failed zizmor's `ref-version-mismatch` audit on every upstream push.
 - Publishing a GitHub release also publishes the crate on crates.io through
   Trusted Publishing (no stored token); other runs of the release workflow
   check the package with `cargo publish --dry-run`.

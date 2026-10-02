@@ -18,6 +18,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so release builds are reproducible; bump deliberately. Installed
+  # with the runner's preinstalled rustup (no third-party action to pin).
+  RUST_VERSION: "1.98.1"
 
 jobs:
   build:
@@ -47,11 +50,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          # Pinned so release builds are reproducible; bump deliberately.
-          toolchain: "1.98.1"
-          targets: ${{ matrix.target }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET" --no-self-update
+          rustup default "$RUST_VERSION"
       - name: Read the package version
         run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
       - name: Check the tag matches Cargo.toml
@@ -68,8 +70,9 @@ jobs:
       - if: matrix.libc == 'musl'
         run: cargo build --release --locked --target "$TARGET"
       # The glibc build is tested and linked inside manylinux_2_28 (AlmaLinux
-      # 8, glibc 2.28) with the toolchain installed above, mounted read-write
-      # so cargo can use its registry cache. To update the image, see
+      # 8, glibc 2.28) with the toolchain installed above (the runner's
+      # $HOME/.rustup and $HOME/.cargo), mounted read-write so cargo can use
+      # its registry cache. To update the image, see
       # RELEASING.md.
       - name: Test and build against glibc ${{ matrix.glibc_max }}
         if: matrix.libc == 'gnu'
@@ -205,9 +208,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: "1.98.1"
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
       - name: Read the package version
         run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
       - name: Check the tag matches Cargo.toml
