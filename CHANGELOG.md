@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `tuxctl --check` removes control characters and bidirectional overrides
+  from its report, as the screens already did. Disk and network adapter
+  models come from device firmware, so a USB device could otherwise send
+  escape sequences to the terminal.
 - Command lines are read up to 4 KiB per process; longer ones end in `…`.
   Before, another local user could make `tuxctl` hold megabytes per process
   by starting processes with huge argument lists.

@@ -34,6 +34,7 @@ mod event;
 mod keymap;
 mod linux;
 mod shutdown;
+mod text;
 mod ui;
 
 use std::{

@@ -9,6 +9,7 @@ use crate::{
         CpuPowerAccess, GpuTelemetry, NvidiaAccess, SensorReport, StorageKind, Temperature,
         TemperatureKey,
     },
+    text,
 };
 
 const SEE_README: &str = "see \"Optional setup\" in the README";
@@ -143,7 +144,9 @@ pub fn report_text(report: &SensorReport) -> String {
             None => row(&mut out, "temperature", "–", "no sensor for this adapter"),
         }
     }
-    out
+    // Model names come from device firmware (USB product strings, NVMe
+    // identify data); keep their escape sequences away from the terminal.
+    text::strip_unsafe_lines(&out)
 }
 
 fn section(out: &mut String, kind: &str, title: &str) {
@@ -286,6 +289,22 @@ mod tests {
         text.lines()
             .find(|line| line.trim_start().starts_with(start))
             .unwrap_or_else(|| panic!("{start}:\n{text}"))
+    }
+
+    #[test]
+    fn firmware_strings_cannot_reach_the_terminal_as_escapes() {
+        let mut report = report(NvidiaAccess::On, false);
+        report.inventory.storage_devices[0].model = Some("WD\u{1b}]52;c;cm0=\u{7}Blue".into());
+        report.inventory.gpus[0].model = "RTX\u{202E}evil\u{9b}2J".into();
+
+        let text = report_text(&report);
+
+        assert!(
+            !text.chars().any(|c| c != '\n' && text::is_unsafe(c)),
+            "{text:?}"
+        );
+        assert!(text.contains("WD]52;c;cm0=Blue"), "{text}");
+        assert!(text.contains("RTXevil2J"), "{text}");
     }
 
     #[test]

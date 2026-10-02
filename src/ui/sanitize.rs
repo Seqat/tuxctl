@@ -9,6 +9,8 @@
 
 use ratatui::buffer::Buffer;
 
+use crate::text::is_unsafe;
+
 /// Shown in place of a cell that held only control characters.
 const REPLACEMENT: &str = "\u{FFFD}";
 
@@ -28,12 +30,6 @@ pub(super) fn sanitize_buffer(buffer: &mut Buffer) {
             cell.set_symbol(&cleaned);
         }
     }
-}
-
-/// C0, DEL and C1 controls, plus the bidirectional embedding, override and
-/// isolate characters that can make a name display as something else.
-fn is_unsafe(character: char) -> bool {
-    character.is_control() || matches!(character, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
