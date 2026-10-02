@@ -73,6 +73,8 @@ the hood, performance, verification, and installation.
 - [ ] **crates.io:** `https://crates.io/api/v1/crates/tuxctl` reports the new
       `max_version`; `cargo install tuxctl --locked --root /tmp/tuxctl-check`
       builds and runs.
+- [ ] **AUR:** update `tuxctl` and `tuxctl-bin` as described in
+      `packaging/aur/README.md`, and commit the new PKGBUILDs on `dev`.
 - [ ] **Documentation** (`docs.yml`) deployed; the site describes the new
       release.
 

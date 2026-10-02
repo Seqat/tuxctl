@@ -11,8 +11,15 @@ description = "A lightweight, keyboard-first Linux TUI for system monitoring and
 readme = "README.md"
 keywords = ["tui", "system-monitor", "linux", "terminal", "ratatui"]
 categories = ["command-line-utilities"]
-# Screenshots and development tooling are not needed to build from the crate.
-exclude = ["docs/screenshots/", "scripts/", ".github/", "deny.toml"]
+# Screenshots, development tooling and distribution packaging are not needed
+# to build from the crate.
+exclude = [
+    "docs/screenshots/",
+    "scripts/",
+    ".github/",
+    "deny.toml",
+    "packaging/",
+]
 
 
 # Measured against the default profile (3 runs each, scripts/measure.py): 35 %

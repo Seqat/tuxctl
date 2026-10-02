@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   design, performance and development. The README is now a short
   introduction that links to it.
 
+- AUR packaging in `packaging/aur/`: `tuxctl` builds from the crates.io
+  source against glibc (NVIDIA GPUs through NVML with `nvidia-utils`), and
+  `tuxctl-bin` installs the static release binary.
+
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 
