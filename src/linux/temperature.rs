@@ -25,6 +25,9 @@ const READ_TOLERANCE: Duration = Duration::from_millis(100);
 /// Sensors that stop reading (hotplug, CPU offlined, driver reload) trigger a
 /// new discovery at most this often.
 const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+/// NVML that stays open is unloaded once nothing has shown its values for
+/// this long, and loaded again when they are shown.
+pub(super) const NVML_RELEASE_GRACE: Duration = Duration::from_secs(10);
 /// Readings outside this range are treated as invalid rather than shown.
 const VALID_CELSIUS: std::ops::RangeInclusive<i64> = -40..=150;
 
@@ -87,6 +90,11 @@ pub(super) trait NvidiaSource {
     ) -> Vec<NvidiaReading>;
     /// Drops any open session.
     fn release(&mut self);
+    /// Drops any open session and whatever the library holds; the next read
+    /// loads it again.
+    fn unload(&mut self) {
+        self.release();
+    }
 }
 
 /// For builds without NVML: NVIDIA GPUs are known but have no temperature.
@@ -230,6 +238,9 @@ pub(super) struct TemperatureSampler<N> {
     /// While false (nothing shows the values), nothing is read and the last
     /// values are kept.
     active: bool,
+    /// When the sampler became inactive while NVML may be open; cleared once
+    /// NVML is unloaded.
+    inactive_since: Option<Instant>,
 }
 
 impl<N: NvidiaSource> TemperatureSampler<N> {
@@ -250,6 +261,7 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
             rapl_previous: None,
             cpu_power_watts: None,
             active: true,
+            inactive_since: None,
         };
         sampler.discover(now);
         sampler
@@ -262,6 +274,15 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
     /// the temperature cadence.
     pub(super) fn sample(&mut self, now: Instant) -> &[Temperature] {
         if !self.active {
+            if self
+                .inactive_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= NVML_RELEASE_GRACE)
+            {
+                self.inactive_since = None;
+                if let Some(nvidia) = &mut self.nvidia {
+                    nvidia.unload();
+                }
+            }
             return &self.readings;
         }
         let due = self.last_read.is_none_or(|last| {
@@ -284,13 +305,32 @@ impl<N: NvidiaSource> TemperatureSampler<N> {
 
     /// Whether [`Self::sample`] reads anything. The first sample after
     /// becoming active reads everything at once, so the values shown are
-    /// fresh; a RAPL delta across the pause is not computed.
-    pub(super) fn set_active(&mut self, active: bool) {
+    /// fresh; a RAPL delta across the pause is not computed. NVML kept open
+    /// is unloaded after [`NVML_RELEASE_GRACE`] of inactivity (it holds
+    /// about 20 MiB); NVML initialized per reading (RTD3) is already closed.
+    pub(super) fn set_active(&mut self, active: bool, now: Instant) {
         if active && !self.active {
             self.last_read = None;
             self.rapl_previous = None;
+            self.inactive_since = None;
+        } else if !active && self.active && self.nvidia_keeps_open() {
+            self.inactive_since = Some(now);
         }
         self.active = active;
+    }
+
+    /// Whether NVML stays open between readings: there are NVIDIA GPUs and
+    /// none of them can runtime-suspend.
+    fn nvidia_keeps_open(&self) -> bool {
+        let mut gpus = self
+            .sensors
+            .iter()
+            .filter_map(|sensor| match sensor.source {
+                Source::Nvidia { keep_open, .. } => Some(keep_open),
+                _ => None,
+            })
+            .peekable();
+        self.nvidia.is_some() && gpus.peek().is_some() && gpus.all(|keep_open| keep_open)
     }
 
     /// Telemetry of each GPU, as of the last [`Self::sample`].

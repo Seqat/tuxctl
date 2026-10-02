@@ -63,6 +63,9 @@ load NVML, so these figures leave it out; see below for a glibc build.
 - A glibc build on the same machine loads NVML for its NVIDIA GPU: startup
   RSS is about 31 MiB, Overview idle about 0.95 % and Processes idle about
   0.60 % (hardware sensors are read only while the Overview is visible).
+  From v0.3.4 on, NVML is closed once the Overview has been hidden for 10 s:
+  RSS on other screens drops from about 31 MiB to about 11 MiB (measured on
+  this machine; the GPU cannot runtime-suspend).
 - Another `tuxctl` was running on the machine during these runs; both
   versions ran alongside it.
 

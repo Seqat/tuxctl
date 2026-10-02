@@ -265,7 +265,7 @@ impl SystemMetricsSampler {
         }
 
         let sensors_active = self.sensors_active.load(Ordering::Relaxed);
-        self.temperatures.set_active(sensors_active);
+        self.temperatures.set_active(sensors_active, now);
         if sensors_active {
             self.mounts = fs::read_to_string(PROC_MOUNTS)
                 .map(|contents| mount_usage(&parse_mounts(&contents)))

@@ -653,6 +653,7 @@ type NvidiaCalls = Rc<RefCell<Vec<(Vec<String>, bool)>>>;
 struct FakeNvidia {
     calls: NvidiaCalls,
     releases: Rc<RefCell<usize>>,
+    unloads: Rc<RefCell<usize>>,
     reading: Rc<RefCell<NvidiaReading>>,
     /// Whether each call asked for a full reading.
     full_reads: Rc<RefCell<Vec<bool>>>,
@@ -684,6 +685,10 @@ impl NvidiaSource for FakeNvidia {
 
     fn release(&mut self) {
         *self.releases.borrow_mut() += 1;
+    }
+
+    fn unload(&mut self) {
+        *self.unloads.borrow_mut() += 1;
     }
 }
 
@@ -986,7 +991,7 @@ fn an_inactive_sampler_reads_nothing_and_reads_at_once_when_active_again() {
     assert_eq!(values(&mut sampler, 0), [Some(40), Some(50)]);
     assert_eq!(fake.calls.borrow().len(), 1);
 
-    sampler.set_active(false);
+    sampler.set_active(false, at(start, 500));
     tree.write(&hwmon.join("temp1_input"), "45000");
     *fake.reading.borrow_mut() = NvidiaReading {
         temperature: Some(55),
@@ -1004,7 +1009,102 @@ fn an_inactive_sampler_reads_nothing_and_reads_at_once_when_active_again() {
 
     // Active again 100 ms after the last inactive call: read at once,
     // without waiting for the 2 s gate.
-    sampler.set_active(true);
+    sampler.set_active(true, at(start, 10_100));
     assert_eq!(values(&mut sampler, 10_100), [Some(45), Some(55)]);
     assert_eq!(fake.calls.borrow().len(), 2);
+}
+
+#[test]
+fn open_nvml_is_unloaded_once_after_the_overview_is_hidden_for_the_grace_period() {
+    let (tree, _) = nvidia_tree("nvidia-unload", "on", "active");
+    let fake = FakeNvidia::reporting(50);
+    let start = Instant::now();
+    let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+    sampler.sample(start);
+    let grace = NVML_RELEASE_GRACE.as_millis() as u64;
+
+    sampler.set_active(false, at(start, 1_000));
+    sampler.sample(at(start, 1_000));
+    sampler.sample(at(start, 1_000 + grace - 1));
+    assert_eq!(*fake.unloads.borrow(), 0, "not within the grace period");
+    sampler.sample(at(start, 1_000 + grace));
+    assert_eq!(*fake.unloads.borrow(), 1);
+    for later in [1, 60_000, 600_000] {
+        sampler.sample(at(start, 1_000 + grace + later));
+    }
+    assert_eq!(*fake.unloads.borrow(), 1, "once per time hidden");
+    assert_eq!(fake.calls.borrow().len(), 1, "no reads while hidden");
+    assert_eq!(
+        sampler.sample(at(start, 700_000))[0].celsius,
+        Some(50),
+        "kept"
+    );
+
+    // Shown again: read at once, still kept open.
+    sampler.set_active(true, at(start, 700_000));
+    sampler.sample(at(start, 700_000));
+    assert_eq!(
+        fake.calls.borrow().last().map(|(_, open)| *open),
+        Some(true)
+    );
+    assert_eq!(fake.calls.borrow().len(), 2);
+
+    // Hidden again: a new grace period, a second unload.
+    sampler.set_active(false, at(start, 701_000));
+    sampler.sample(at(start, 701_000 + grace));
+    assert_eq!(*fake.unloads.borrow(), 2);
+}
+
+#[test]
+fn returning_within_the_grace_period_keeps_nvml_loaded() {
+    let (tree, _) = nvidia_tree("nvidia-unload-flip", "on", "active");
+    let fake = FakeNvidia::reporting(50);
+    let start = Instant::now();
+    let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+    sampler.sample(start);
+    let grace = NVML_RELEASE_GRACE.as_millis() as u64;
+
+    for round in 0..3 {
+        let left = 1_000 + round * grace;
+        sampler.set_active(false, at(start, left));
+        sampler.sample(at(start, left + grace - 1));
+        sampler.set_active(true, at(start, left + grace - 1));
+        sampler.sample(at(start, left + grace - 1));
+    }
+    // Active samples never unload, however long ago the last hiding began.
+    sampler.sample(at(start, 100_000));
+    assert_eq!(*fake.unloads.borrow(), 0);
+    assert_eq!(*fake.releases.borrow(), 0);
+}
+
+#[test]
+fn nvml_initialized_per_reading_is_not_unloaded_while_hidden() {
+    let (tree, _) = nvidia_tree("nvidia-rtd3-hidden", "auto", "active");
+    let fake = FakeNvidia::reporting(45);
+    let start = Instant::now();
+    let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+    sampler.sample(start);
+    let calls = fake.calls.borrow().len();
+
+    sampler.set_active(false, at(start, 1_000));
+    for millis in [1_000, 60_000, 600_000] {
+        sampler.sample(at(start, millis));
+    }
+    assert_eq!(*fake.unloads.borrow(), 0);
+    assert_eq!(fake.calls.borrow().len(), calls, "no reads while hidden");
+}
+
+#[test]
+fn nothing_is_unloaded_without_an_nvidia_gpu() {
+    let tree = Tree::new("no-nvidia-unload");
+    let gpu = tree.device("pci0000:00/0000:03:00.0");
+    tree.gpu(0, &gpu, "amdgpu");
+    let fake = FakeNvidia::default();
+    let start = Instant::now();
+    let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
+    sampler.sample(start);
+    sampler.set_active(false, at(start, 1_000));
+    sampler.sample(at(start, 600_000));
+    assert_eq!(*fake.unloads.borrow(), 0);
+    assert_eq!(*fake.releases.borrow(), 0);
 }

@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proprietary driver shows no temperature or usage ("NVML needs a glibc
   build"), instead of leaving it to Help and `--check`.
 
+### Changed
+
+- NVML is closed once the Overview has been hidden for 10 seconds, on GPUs
+  that cannot runtime-suspend, and loaded again when it is shown. It held
+  about 20 MiB until `tuxctl` exited (`nvmlShutdown` frees none of it); RSS
+  on other screens drops from about 31 MiB to about 11 MiB, and the first
+  reading back on the Overview takes about 40 ms instead of about 12 ms.
+
 ### Fixed
 
 - `journalctl`'s error output is discarded instead of piped. The pipe was
