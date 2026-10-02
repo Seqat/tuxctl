@@ -1078,20 +1078,44 @@ fn returning_within_the_grace_period_keeps_nvml_loaded() {
 }
 
 #[test]
-fn nvml_initialized_per_reading_is_not_unloaded_while_hidden() {
-    let (tree, _) = nvidia_tree("nvidia-rtd3-hidden", "auto", "active");
+fn nvml_initialized_per_reading_is_unloaded_while_hidden_without_a_read() {
+    let (tree, gpu) = nvidia_tree("nvidia-rtd3-hidden", "auto", "active");
     let fake = FakeNvidia::reporting(45);
     let start = Instant::now();
     let mut sampler = TemperatureSampler::new(tree.roots(), Some(fake.clone()), start);
     sampler.sample(start);
-    let calls = fake.calls.borrow().len();
+    assert_eq!(
+        *fake.calls.borrow(),
+        [(vec!["0000:01:00.0".to_owned()], false)]
+    );
+    let grace = NVML_RELEASE_GRACE.as_millis() as u64;
 
+    // Hidden, and the GPU suspends: unloaded once, never read.
     sampler.set_active(false, at(start, 1_000));
-    for millis in [1_000, 60_000, 600_000] {
+    tree.write(&gpu.join("power/runtime_status"), "suspended");
+    for millis in [1_000, 1_000 + grace, 60_000, 600_000] {
         sampler.sample(at(start, millis));
     }
-    assert_eq!(*fake.unloads.borrow(), 0);
-    assert_eq!(fake.calls.borrow().len(), calls, "no reads while hidden");
+    assert_eq!(*fake.unloads.borrow(), 1);
+    assert_eq!(fake.calls.borrow().len(), 1, "no reads while hidden");
+
+    // Shown while still suspended: not read either, so not loaded again.
+    sampler.set_active(true, at(start, 600_000));
+    sampler.sample(at(start, 600_000));
+    assert_eq!(
+        fake.calls.borrow().len(),
+        1,
+        "a suspended GPU is never read"
+    );
+    assert_eq!(sampler.sample(at(start, 602_000))[0].celsius, None);
+
+    // Awake again: read per cycle, as before.
+    tree.write(&gpu.join("power/runtime_status"), "active");
+    sampler.sample(at(start, 604_000));
+    assert_eq!(
+        fake.calls.borrow().last().map(|(_, open)| *open),
+        Some(false)
+    );
 }
 
 #[test]

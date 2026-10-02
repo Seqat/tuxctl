@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- NVML is closed once the Overview has been hidden for 10 seconds, on GPUs
-  that cannot runtime-suspend, and loaded again when it is shown. It held
+- NVML is closed once the Overview has been hidden for 10 seconds, and
+  loaded again when it is shown. This also applies to GPUs with RTD3, where
+  NVML is already shut down after every reading but the library kept its
+  memory; closing it makes no call to NVML, so it cannot wake the GPU. It held
   about 20 MiB until `tuxctl` exited (`nvmlShutdown` frees none of it); RSS
   on other screens drops from about 31 MiB to about 11 MiB, and the first
   reading back on the Overview takes about 40 ms instead of about 12 ms.

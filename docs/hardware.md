@@ -61,9 +61,9 @@ NVML at run time, and only when it finds a GPU using the `nvidia` driver.
 - **Memory:** NVML adds about 20 MiB of private memory and a thread from the
   first reading on (on the reference machine: `RssAnon` +20.2 MiB, PSS
   +21.4 MiB; RSS +24.7 MiB including 4.5 MiB of shared library pages).
-  `nvmlShutdown` does not free it; closing the library does. For a GPU that
-  cannot runtime-suspend, `tuxctl` closes NVML once the Overview has been
-  hidden for 10 seconds (checked at each sample, so up to about 2 minutes at
+  `nvmlShutdown` does not free it, not even with RTD3, where NVML is shut
+  down after every reading; closing the library does. `tuxctl` closes NVML
+  once the Overview has been hidden for 10 seconds (checked at each sample, so up to about 2 minutes at
   a 60 s interval), and loads it again when the Overview is shown: the first
   reading then takes about 40 ms longer, on the background worker. Other
   monitors that read NVIDIA GPUs load the same library and pay the same
