@@ -1,6 +1,6 @@
 //! System metrics on one worker: total and per-CPU utilization, memory and swap,
-//! uptime, load, disk throughput, filesystem usage, hostname and kernel and,
-//! while the Overview is visible, temperatures, GPU telemetry and CPU power
+//! uptime, load, disk throughput, hostname and kernel and, while the Overview
+//! is visible, filesystem usage, temperatures, GPU telemetry and CPU power
 //! (sampled by the `temperature` and `gpu` modules).
 
 use std::{

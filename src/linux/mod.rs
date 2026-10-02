@@ -1,6 +1,9 @@
-//! Everything that reads the system. Each data source has a collector on its own
-//! thread that publishes bounded snapshots for the main loop to pick up; nothing
-//! outside this module touches `/proc`, `/sys`, `systemctl` or `journalctl`.
+//! Everything that reads the system, on background threads the main loop polls:
+//! processes, network and services each have a collector that publishes its
+//! latest snapshot; one system-metrics worker also samples temperatures, GPUs
+//! and CPU power; the journal streams entries through a bounded channel; and
+//! the hardware inventory is sent once. Nothing outside this module touches
+//! `/proc`, `/sys`, `systemctl` or `journalctl`.
 
 mod check;
 mod control;

@@ -1,7 +1,9 @@
 //! Network interfaces: counters from `/proc/net/dev`, state, MAC address and MTU
 //! from `/sys/class/net`, addresses from `getifaddrs`, and per-second rates
-//! computed from the counters. Rates start over when an interface appears or
-//! disappears or a read fails, rather than showing a spike.
+//! computed from the counters. Each interface keeps its own baseline, so one
+//! that appears starts without a rate rather than a spike; an interface
+//! without counters has no rate, and a failed read of `/proc/net/dev` resets
+//! every baseline.
 
 use std::{
     collections::HashMap,

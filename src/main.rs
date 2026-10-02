@@ -4,7 +4,8 @@
 //! This is the entry point and the event loop. It parses the command line, owns
 //! the terminal for the whole session (restored on a normal exit, on SIGTERM,
 //! SIGHUP and SIGINT, and on a panic of the main thread; a worker's panic never
-//! touches it), and starts one background collector per data source. The loop
+//! touches it), and starts the background collectors (Services paused until
+//! its tab is visible, the journal on the first visit to Logs). The loop
 //! turns terminal events and collector snapshots into `Action`s, applies them
 //! with `App::update`, and redraws from cached state only when something
 //! visible changed.

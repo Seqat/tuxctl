@@ -1,7 +1,8 @@
 //! Terminal events to `Action`s: keys through the key-binding tables, mouse
 //! clicks and the wheel through the hit regions of the last frame, and a tick
-//! when input is idle. Mouse movement produces an action only when the element
-//! under the pointer changes, so hovering does not cost redraws.
+//! every tick period whether or not input arrives. Mouse movement produces an
+//! action only when the element under the pointer changes, so hovering does
+//! not cost redraws.
 
 use std::{
     io,

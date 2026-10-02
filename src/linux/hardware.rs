@@ -1,7 +1,8 @@
 //! The hardware inventory: CPU packages, RAM modules, GPUs, disks and network
 //! adapters, discovered once at startup on its own thread (hardware attached
-//! later appears after a restart). Each device records its canonical sysfs
-//! path, which is how temperatures are matched to it.
+//! later appears after a restart). GPUs, disks and network adapters record
+//! their canonical sysfs path, which is how temperatures are matched to them;
+//! CPU packages are matched by physical id.
 
 use std::{
     collections::{BTreeMap, HashSet},

@@ -1,8 +1,8 @@
 //! Processes: the `/proc/<pid>/stat` scanner (CPU from tick deltas, memory,
-//! state, kernel threads), command lines read once per process identity, and
-//! signal delivery. A process is identified by `(PID, start time)`; a signal is
-//! sent through a pidfd only after that identity is checked again, and never by
-//! PID alone.
+//! state, kernel threads), command lines cached per process identity and read
+//! again when the process name changes (after an exec), and signal delivery. A
+//! process is identified by `(PID, start time)`; a signal is sent through a
+//! pidfd only after that identity is checked again, and never by PID alone.
 
 use std::{
     collections::HashMap,
