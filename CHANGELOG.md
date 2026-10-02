@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 
+- An x86_64 glibc release binary, `tuxctl-x86_64-unknown-linux-gnu.tar.gz`,
+  next to the static ones. It is linked against glibc 2.28 (manylinux_2_28),
+  so it runs on RHEL 8, Debian 10, Ubuntu 20.04 and newer, and unlike the
+  static binaries it can load NVML for NVIDIA GPUs on the proprietary
+  driver. It is covered by `SHA256SUMS` and the build provenance attestation
+  like the others.
+
 - The static binaries say on the GPU card why an NVIDIA GPU on the
   proprietary driver shows no temperature or usage ("NVML needs a glibc
   build"), instead of leaving it to Help and `--check`.

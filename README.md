@@ -56,10 +56,11 @@ Or from [crates.io](https://crates.io/crates/tuxctl), with Rust 1.88 or newer:
 cargo install tuxctl --locked
 ```
 
-The crates.io build can also show NVIDIA GPUs on the proprietary driver, which
-the static binaries cannot. See
-[Installation](https://seqat.github.io/tuxctl/installation.html) for
-verification and other options.
+The static binaries cannot show NVIDIA GPUs on the proprietary driver. On
+x86_64, download `tuxctl-x86_64-unknown-linux-gnu.tar.gz` instead (the same
+commands with `gnu` for `musl`; needs glibc 2.28 or newer), or build from
+crates.io. See [Installation](https://seqat.github.io/tuxctl/installation.html)
+for verification and other options.
 
 ## Quick start
 

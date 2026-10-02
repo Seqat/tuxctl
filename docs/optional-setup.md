@@ -9,7 +9,7 @@ the missing ones.
 | --- | --- |
 | SATA / SAS disk temperatures | the `drivetemp` kernel module ([below](#sata-and-sas-disk-temperatures)) |
 | CPU package power | readable RAPL energy counters ([below](#cpu-power)) |
-| Temperature and usage of NVIDIA GPUs on the proprietary driver | a glibc build of `tuxctl` ([below](#nvidia-gpus)) |
+| Temperature and usage of NVIDIA GPUs on the proprietary driver | the glibc release binary or a source build of `tuxctl` ([below](#nvidia-gpus)) |
 
 `tuxctl` itself never changes the system and asks for no privileges; each step
 below is one you take yourself, and each can be undone.
@@ -62,8 +62,11 @@ permissions; `tuxctl` does not need or recommend that.
 ## NVIDIA GPUs
 
 GPUs on NVIDIA's proprietary driver report through NVML, which `tuxctl` loads
-at run time. The static release binaries cannot load it; install a glibc build
-instead:
+at run time. The static release binaries cannot load it; use a glibc build
+instead. On x86_64 that can be the release's
+`tuxctl-x86_64-unknown-linux-gnu.tar.gz` (glibc 2.28 or newer; see
+[Installation](installation.md#nvidia-gpus-the-glibc-binary)); anywhere, a
+build from source:
 
 ```sh
 cargo install tuxctl --locked

@@ -37,9 +37,25 @@ workflow from its repository:
 gh attestation verify "tuxctl-$arch-unknown-linux-musl.tar.gz" --repo Seqat/tuxctl
 ```
 
+### NVIDIA GPUs: the glibc binary
+
 The static binaries cannot load NVIDIA's NVML library, so they show no
-temperature or usage for NVIDIA GPUs on the proprietary driver. Use a build
-from source for that (see [NVIDIA GPUs](optional-setup.md#nvidia-gpus)).
+temperature or usage for NVIDIA GPUs on the proprietary driver. From v0.3.4
+on, each release also has an `x86_64` binary linked against glibc, which can.
+It needs glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 20.04, and later
+releases of most other distributions); `ldd --version` shows yours.
+
+```sh
+base=https://github.com/Seqat/tuxctl/releases/latest/download
+curl -LO "$base/tuxctl-x86_64-unknown-linux-gnu.tar.gz" -LO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf tuxctl-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 tuxctl-x86_64-unknown-linux-gnu/tuxctl ~/.local/bin/tuxctl
+gh attestation verify tuxctl-x86_64-unknown-linux-gnu.tar.gz --repo Seqat/tuxctl
+```
+
+On `aarch64`, or with an older glibc, build from source instead (see
+[NVIDIA GPUs](optional-setup.md#nvidia-gpus)).
 
 ## From crates.io
 

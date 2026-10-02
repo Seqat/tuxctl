@@ -70,7 +70,8 @@ NVML at run time, and only when it finds a GPU using the `nvidia` driver.
 - **Opting out:** `--no-nvidia-temperature` leaves NVML unloaded.
 - **Static binaries:** the static release binaries cannot load NVML at all, so
   they show no temperature or usage for these GPUs; the GPU card says
-  "NVML needs a glibc build" instead. Use a glibc build, such as
+  "NVML needs a glibc build" instead. Use a glibc build: the x86_64
+  `tuxctl-x86_64-unknown-linux-gnu.tar.gz` release binary, or
   `cargo install tuxctl --locked`.
 
 ## Sleeping GPUs

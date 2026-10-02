@@ -22,8 +22,9 @@ and `TERM` at startup (see [Overview](overview.md#colors)).
   Linux-specific process signaling.
 - **systemd:** the Services and Logs screens need `systemctl` and
   `journalctl`.
-- **NVIDIA GPUs:** on the proprietary driver they need a glibc build; the
-  static release binaries cannot load NVML.
+- **NVIDIA GPUs:** on the proprietary driver they need a glibc build (the
+  x86_64 glibc release binary, or a source build); the static release
+  binaries cannot load NVML. There is no aarch64 glibc release binary.
 - **Hardware hotplug:** hardware is discovered at startup; newly attached
   devices appear after a restart.
 - **Permissions:** signaling other users' or privileged processes follows the

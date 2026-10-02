@@ -1,7 +1,8 @@
 name: Release
 
-# Publishing a GitHub release attaches static Linux binaries and checksums to
-# it and publishes the crate on crates.io. Other triggers are dry runs that
+# Publishing a GitHub release attaches Linux binaries (static musl ones, and an
+# x86_64 glibc one that can load NVIDIA's NVML) and checksums to it and
+# publishes the crate on crates.io. Other triggers are dry runs that
 # upload the same files as workflow artifacts only and run `cargo publish
 # --dry-run`: a manual run, or a push to dev that changes this workflow.
 on:
@@ -29,11 +30,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            libc: musl
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            libc: musl
+          # Linked against an old glibc so it runs on most distributions.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            libc: gnu
+            glibc_max: "2.28"
     env:
       TARGET: ${{ matrix.target }}
       BIN: target/${{ matrix.target }}/release/tuxctl
+      GLIBC_MAX: ${{ matrix.glibc_max }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,16 +63,66 @@ jobs:
             echo "::error::release tag $TAG does not match Cargo.toml version $VERSION"
             exit 1
           fi
-      - run: cargo test --locked --target "$TARGET"
-      - run: cargo build --release --locked --target "$TARGET"
-      - name: Check the binary
+      - if: matrix.libc == 'musl'
+        run: cargo test --locked --target "$TARGET"
+      - if: matrix.libc == 'musl'
+        run: cargo build --release --locked --target "$TARGET"
+      # The glibc build is tested and linked inside manylinux_2_28 (AlmaLinux
+      # 8, glibc 2.28) with the toolchain installed above, mounted read-write
+      # so cargo can use its registry cache. To update the image, see
+      # RELEASING.md.
+      - name: Test and build against glibc ${{ matrix.glibc_max }}
+        if: matrix.libc == 'gnu'
+        env:
+          IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.10.02-1@sha256:1e102f2e9ed9b7fd8d64b29f798c76078c3fa8f14d34914d7a4045e39419d8e0
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src" -w /src \
+            -v "${RUSTUP_HOME:-$HOME/.rustup}:/rustup" -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
+            -e HOME=/tmp -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR \
+            -e RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | cut -d ' ' -f 1)" -e TARGET \
+            "$IMAGE" sh -euc '
+              export PATH="$CARGO_HOME/bin:$PATH"
+              ldd --version | head -n 1
+              cargo test --locked --target "$TARGET"
+              cargo build --release --locked --target "$TARGET"
+            '
+      - name: Check the binary is static
+        if: matrix.libc == 'musl'
         run: |
           file "$BIN"
           if ! file "$BIN" | grep -Eq 'static(ally|-pie) linked'; then
             echo "::error::$BIN is not statically linked"
             exit 1
           fi
-          test "$("$BIN" --version)" = "tuxctl $VERSION"
+      - name: Check the binary's glibc requirement
+        if: matrix.libc == 'gnu'
+        run: |
+          set -euo pipefail
+          file "$BIN"
+          if ! file "$BIN" | grep -q 'dynamically linked'; then
+            echo "::error::$BIN is not dynamically linked"
+            exit 1
+          fi
+          if ! symbols=$(objdump -T "$BIN"); then
+            echo "::error::objdump could not read $BIN"
+            exit 1
+          fi
+          required=$(grep -o 'GLIBC_[0-9.]*' <<< "$symbols" | sort -uV | tail -n 1 || true)
+          required=${required#GLIBC_}
+          if [ -z "$required" ]; then
+            echo "::error::no GLIBC symbol versions found in $BIN"
+            exit 1
+          fi
+          highest=$(printf '%s\n%s\n' "$required" "$GLIBC_MAX" | sort -V | tail -n 1)
+          if [ "$highest" != "$GLIBC_MAX" ]; then
+            echo "::error::$BIN requires glibc $required, above the $GLIBC_MAX baseline"
+            exit 1
+          fi
+          echo "requires glibc $required (baseline $GLIBC_MAX)"
+          echo "GLIBC_REQUIRED=$required" >> "$GITHUB_ENV"
+      - name: Check the version
+        run: test "$("$BIN" --version)" = "tuxctl $VERSION"
       - name: Smoke test
         run: scripts/smoke.py "$BIN"
       - name: Package
@@ -79,6 +138,9 @@ jobs:
             echo '```'
             rustc -V
             file "$BIN"
+            if [ -n "${GLIBC_REQUIRED:-}" ]; then
+              echo "requires glibc $GLIBC_REQUIRED (baseline $GLIBC_MAX)"
+            fi
             echo "binary: $(stat -c %s "$BIN") bytes, archive: $(stat -c %s "dist/$name.tar.gz") bytes"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

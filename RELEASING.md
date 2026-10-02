@@ -63,13 +63,15 @@ the hood, performance, verification, and installation.
 
 ## 5. Verify what publishing started
 
-- [ ] **Release workflow** (`release.yml`) succeeded: both binaries, checksums
-      and upload, crates.io.
+- [ ] **Release workflow** (`release.yml`) succeeded: all three binaries (two
+      musl, one x86_64 glibc), checksums and upload, crates.io. The glibc
+      job's summary says `requires glibc 2.28 (baseline 2.28)` or lower.
 - [ ] **Binaries:** download one with the README commands;
       `sha256sum -c` passes and `tuxctl --version` prints the new version. The
       assets can take a minute or two to show up in `gh release view`.
 - [ ] **Attestation:**
-      `gh attestation verify tuxctl-x86_64-unknown-linux-musl.tar.gz --repo Seqat/tuxctl`.
+      `gh attestation verify tuxctl-x86_64-unknown-linux-musl.tar.gz --repo Seqat/tuxctl`,
+      and the same for `tuxctl-x86_64-unknown-linux-gnu.tar.gz`.
 - [ ] **crates.io:** `https://crates.io/api/v1/crates/tuxctl` reports the new
       `max_version`; `cargo install tuxctl --locked --root /tmp/tuxctl-check`
       builds and runs.
@@ -85,6 +87,30 @@ git checkout dev
 git merge --ff-only origin/main
 git push origin dev
 ```
+
+## Updating the manylinux image
+
+The glibc binary is tested and linked inside `quay.io/pypa/manylinux_2_28_x86_64`,
+pinned by digest in `release.yml` (the `IMAGE` of the "Test and build against
+glibc" step). Update it deliberately, on `dev`, never as part of a release:
+
+1. Find the newest dated tag and its digest:
+
+   ```sh
+   docker buildx imagetools inspect quay.io/pypa/manylinux_2_28_x86_64:latest
+   curl -s 'https://quay.io/api/v1/repository/pypa/manylinux_2_28_x86_64/tag/?limit=5&onlyActiveTags=true' \
+     | jq -r '.tags[] | "\(.name) \(.manifest_digest)"'
+   ```
+
+2. Replace both the tag and the `@sha256:` digest in `IMAGE`; the tag is only
+   for readers, the digest is what is pulled.
+3. Push to `dev`; the change to `release.yml` starts a dry run. Check that the
+   glibc job's tests pass and its summary still says
+   `requires glibc 2.28 (baseline 2.28)` or lower.
+
+Raising the baseline (`manylinux_2_34`, …) is a different change: it drops
+distributions, so it also needs `glibc_max` in the matrix, the README,
+`docs/installation.md` and the changelog.
 
 ## When something fails
 
