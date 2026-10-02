@@ -104,21 +104,13 @@ impl JournalCollector {
                 worker: None,
             };
         };
-        let stderr = child.stderr.take();
 
         let worker_dropped = Arc::clone(&dropped);
         let worker_terminal_error = Arc::clone(&terminal_error);
         let worker = match thread::Builder::new()
             .name("journal-stream".into())
-            .spawn(move || {
-                read_journal(
-                    stdout,
-                    stderr,
-                    sender,
-                    &worker_dropped,
-                    &worker_terminal_error,
-                )
-            }) {
+            .spawn(move || read_journal(stdout, sender, &worker_dropped, &worker_terminal_error))
+        {
             Ok(worker) => Some(worker),
             Err(error) => {
                 report_terminal_error(
@@ -221,19 +213,19 @@ fn spawn_journalctl() -> std::io::Result<Child> {
         ])
         .env("SYSTEMD_COLORS", "0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Its messages are not shown; a pipe nobody reads would fill and
+        // stall journalctl.
+        .stderr(Stdio::null())
         .spawn()
 }
 
-fn read_journal<R, E>(
+fn read_journal<R>(
     stdout: R,
-    mut stderr: Option<E>,
     sender: SyncSender<JournalEntry>,
     dropped: &AtomicUsize,
     terminal_error: &OnceLock<String>,
 ) where
     R: Read,
-    E: Read,
 {
     let mut next_id = 1_u64;
     for line in BufReader::new(stdout).lines() {
@@ -263,9 +255,6 @@ fn read_journal<R, E>(
     }
 
     report_terminal_error(terminal_error, "journal stream ended");
-    if let Some(stderr) = &mut stderr {
-        let _ = std::io::copy(stderr, &mut std::io::sink());
-    }
 }
 
 fn parse_journal_json(line: &str, id: u64) -> Option<JournalEntry> {
@@ -340,20 +329,6 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::other("simulated read failure"))
-        }
-    }
-
-    struct StatusCheckingEofReader {
-        terminal_error: Arc<OnceLock<String>>,
-    }
-
-    impl Read for StatusCheckingEofReader {
-        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-            assert_eq!(
-                self.terminal_error.get().map(String::as_str),
-                Some("journal stream ended")
-            );
-            Ok(0)
         }
     }
 
@@ -466,13 +441,7 @@ mod tests {
 
         let dropped = Arc::new(AtomicUsize::new(0));
         let terminal_error = Arc::new(OnceLock::new());
-        read_journal(
-            FailingReader,
-            None::<std::io::Empty>,
-            sender,
-            &dropped,
-            &terminal_error,
-        );
+        read_journal(FailingReader, sender, &dropped, &terminal_error);
         let collector = collector_for_test(receiver, dropped, Arc::clone(&terminal_error));
 
         let batch = collector
@@ -524,15 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_eof_reports_terminal_status_before_reading_stderr() {
+    fn stream_eof_reports_terminal_status() {
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
         let terminal_error = Arc::new(OnceLock::new());
         read_journal(
             std::io::Cursor::new(Vec::<u8>::new()),
-            Some(StatusCheckingEofReader {
-                terminal_error: Arc::clone(&terminal_error),
-            }),
             sender,
             &dropped,
             &terminal_error,
@@ -555,7 +521,6 @@ mod tests {
 
         read_journal(
             std::io::Cursor::new(input),
-            None::<std::io::Empty>,
             sender,
             &dropped,
             &terminal_error,

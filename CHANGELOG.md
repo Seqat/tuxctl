@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 
+### Fixed
+
+- `journalctl`'s error output is discarded instead of piped. The pipe was
+  only read once the journal stream ended, so enough warnings could fill it
+  and stall the Logs screen.
+
 ### Security
 
 - `tuxctl --check` removes control characters and bidirectional overrides
