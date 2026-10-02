@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
   --locked` builds against glibc and can show NVIDIA GPUs through NVML.
 
+- The static binaries say on the GPU card why an NVIDIA GPU on the
+  proprietary driver shows no temperature or usage ("NVML needs a glibc
+  build"), instead of leaving it to Help and `--check`.
+
 ### Fixed
 
 - `journalctl`'s error output is discarded instead of piped. The pipe was

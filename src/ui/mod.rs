@@ -36,6 +36,7 @@ use ratatui::{
 use crate::{
     action::{InputMode, IntervalStep, MenuItem, MouseTarget, PinMove, ProcessSortField, Tab},
     app::{App, Collector},
+    linux::NvidiaAccess,
 };
 
 #[derive(Debug, Default)]
@@ -786,7 +787,7 @@ pub(super) fn format_uptime(uptime: std::time::Duration) -> String {
 const HELP_WIDTH: u16 = 64;
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = help_lines(app.nvidia_temperature());
+    let lines = help_lines(app.nvidia());
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = layout::centered_rect(area, HELP_WIDTH, height);
     if popup.width == 0 || popup.height == 0 {
@@ -800,7 +801,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn help_lines(nvidia_temperature: bool) -> Vec<Line<'static>> {
+fn help_lines(nvidia: NvidiaAccess) -> Vec<Line<'static>> {
     let heading = |text: &'static str| {
         Line::from(text).style(
             Style::default()
@@ -834,20 +835,18 @@ fn help_lines(nvidia_temperature: bool) -> Vec<Line<'static>> {
         Line::from(""),
         heading("Temperatures (Overview):"),
         Line::from("  Sources             hwmon, thermal zones (– = no value now)"),
-        Line::from(nvidia_help(nvidia_temperature)),
+        Line::from(nvidia_help(nvidia)),
         Line::from(""),
         Line::from("Esc closes").style(Style::default().fg(theme::MUTED)),
     ]
 }
 
 /// Whether NVIDIA temperatures are on, and how to change that.
-fn nvidia_help(enabled: bool) -> &'static str {
-    if enabled {
-        "  NVIDIA GPUs         NVML; off: --no-nvidia-temperature"
-    } else if crate::cli::NVML_AVAILABLE {
-        "  NVIDIA GPUs         off (--no-nvidia-temperature)"
-    } else {
-        "  NVIDIA GPUs         off; NVML needs a glibc build"
+fn nvidia_help(nvidia: NvidiaAccess) -> &'static str {
+    match nvidia {
+        NvidiaAccess::On => "  NVIDIA GPUs         NVML; off: --no-nvidia-temperature",
+        NvidiaAccess::Off => "  NVIDIA GPUs         off (--no-nvidia-temperature)",
+        NvidiaAccess::Unsupported => "  NVIDIA GPUs         off; NVML needs a glibc build",
     }
 }
 

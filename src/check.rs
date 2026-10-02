@@ -45,13 +45,7 @@ pub fn report_text(report: &SensorReport) -> String {
 
     for gpu in &report.inventory.gpus {
         let path = gpu.device_path.as_ref();
-        let driver = path.and_then(|path| {
-            report
-                .gpu_drivers
-                .iter()
-                .find(|(known, _)| known == path)
-                .map(|(_, driver)| driver.as_str())
-        });
+        let driver = gpu.driver.as_deref();
         let title = match driver {
             Some(driver) => format!("{}  ({driver})", gpu.model),
             None => gpu.model.clone(),
@@ -235,6 +229,7 @@ mod tests {
                     kind: None,
                     vram_bytes: None,
                     device_path: Some(path("/gpu")),
+                    driver: Some("nvidia".into()),
                 }],
                 storage_devices: vec![
                     StorageDevice {
@@ -278,7 +273,6 @@ mod tests {
                 power_watts: Some(28.0),
                 fan_percent: Some(0.0),
             }],
-            gpu_drivers: vec![(path("/gpu"), "nvidia".into())],
             cpu_power: CpuPowerAccess::RootOnly,
             drivetemp_loaded,
             nvidia,

@@ -848,6 +848,7 @@ fn sensors_are_visible_only_on_the_overview_and_the_gpu_graph_restarts_there() {
                 kind: Some(crate::linux::GpuKind::Discrete),
                 vram_bytes: None,
                 device_path: Some(Arc::clone(&path)),
+                driver: None,
             }],
             ..crate::linux::HardwareInventory::default()
         },
@@ -897,6 +898,7 @@ fn gpu_history_records_the_primary_gpu_utilization() {
         kind: Some(kind),
         vram_bytes: None,
         device_path: Some(Arc::clone(path)),
+        driver: None,
     };
     let telemetry = |path: &Arc<Path>, utilization| crate::linux::GpuTelemetry {
         utilization: Some(utilization),

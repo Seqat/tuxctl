@@ -14,9 +14,9 @@ use crate::{
     },
     linux::{
         send_process_signal, HardwareInventory, JournalBatch, JournalEntry, NetworkInterfaceInfo,
-        NetworkSnapshot, ProcessIdentity, ProcessInfo, ProcessSignal, ProcessSignalError,
-        ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration, ServiceSnapshot,
-        SystemMetrics, SYSTEMCTL_TIMEOUT,
+        NetworkSnapshot, NvidiaAccess, ProcessIdentity, ProcessInfo, ProcessSignal,
+        ProcessSignalError, ProcessSnapshot, ProcessSummary, ServiceInfo, ServiceRefreshGeneration,
+        ServiceSnapshot, SystemMetrics, SYSTEMCTL_TIMEOUT,
     },
 };
 
@@ -127,8 +127,8 @@ pub struct App {
     active_tab: Tab,
     system_metrics: SystemMetrics,
     hardware: Option<HardwareInventory>,
-    /// Whether NVML may be loaded for NVIDIA GPUs, shown in Help.
-    nvidia_temperature: bool,
+    /// Whether NVML is used for NVIDIA GPUs, shown in Help and on the GPU card.
+    nvidia: NvidiaAccess,
     aggregate_cpu_history: MetricHistory,
     memory_history: MetricHistory,
     /// RX+TX bytes/s of the interface the Overview's Network card is about.
@@ -204,7 +204,7 @@ impl Default for App {
             active_tab: Tab::Overview,
             system_metrics: SystemMetrics::default(),
             hardware: None,
-            nvidia_temperature: false,
+            nvidia: NvidiaAccess::Off,
             aggregate_cpu_history: MetricHistory::default(),
             memory_history: MetricHistory::default(),
             network_history: MetricHistory::default(),
@@ -333,13 +333,13 @@ impl App {
         self.hardware.as_ref()
     }
 
-    pub fn with_nvidia_temperature(mut self, enabled: bool) -> Self {
-        self.nvidia_temperature = enabled;
+    pub fn with_nvidia(mut self, nvidia: NvidiaAccess) -> Self {
+        self.nvidia = nvidia;
         self
     }
 
-    pub fn nvidia_temperature(&self) -> bool {
-        self.nvidia_temperature
+    pub fn nvidia(&self) -> NvidiaAccess {
+        self.nvidia
     }
 
     pub fn input_mode(&self) -> InputMode {

@@ -14,8 +14,8 @@ use ratatui::{
 use crate::{
     app::App,
     linux::{
-        GpuDevice, GpuKind, GpuTelemetry, HardwareInventory, MemoryModule, StorageDevice,
-        StorageKind, SystemMetrics, Temperature, TemperatureKey,
+        GpuDevice, GpuKind, GpuTelemetry, HardwareInventory, MemoryModule, NvidiaAccess,
+        StorageDevice, StorageKind, SystemMetrics, Temperature, TemperatureKey,
     },
 };
 
@@ -224,8 +224,27 @@ pub(super) fn gpu_card_height(app: &App, graphs: bool) -> CardHeight {
         .map_or(0, |inventory| inventory.gpus.len().saturating_sub(1));
     let details = primary_gpu(app).map_or(1, |(gpu, telemetry)| {
         gpu_detail_lines(gpu, telemetry, usize::MAX).len()
-    });
+    }) + usize::from(nvml_hint(app).is_some());
     CardHeight::new(details as u16, others as u16, graphs && gpu_has_graph(app))
+}
+
+/// Why an NVIDIA GPU on the proprietary driver shows no temperature or
+/// usage: this build cannot load NVML. Any GPU counts, not only the primary
+/// one, since a hybrid laptop's dGPU may be listed after its iGPU. The
+/// second text is for cards too narrow for the first.
+fn nvml_hint(app: &App) -> Option<[&'static str; 2]> {
+    if app.nvidia() != NvidiaAccess::Unsupported {
+        return None;
+    }
+    let is_nvidia = |gpu: &GpuDevice| gpu.driver.as_deref() == Some("nvidia");
+    let inventory = app.hardware()?;
+    if inventory.primary_gpu().is_some_and(is_nvidia) {
+        Some(["NVML needs a glibc build", "NVML: glibc build"])
+    } else if inventory.gpus.iter().any(is_nvidia) {
+        Some(["NVIDIA: needs a glibc build", "NVIDIA: glibc build"])
+    } else {
+        None
+    }
 }
 
 /// The primary GPU's rows: utilization, video memory and fan where the
@@ -294,9 +313,10 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect, graphs: 
         banded: true,
         log_unit: None,
     });
-    let details = primary.map_or(1, |(gpu, telemetry)| {
+    let hint = nvml_hint(app);
+    let details = (primary.map_or(1, |(gpu, telemetry)| {
         gpu_detail_lines(gpu, telemetry, usize::MAX).len()
-    }) as u16;
+    }) + usize::from(hint.is_some())) as u16;
     let others = inventory.map_or(0, |inventory| inventory.gpus.len().saturating_sub(1)) as u16;
     let (rows, other_limit) =
         cards::render_graph_card(frame, area, &title, graph, graphs, details, others);
@@ -309,6 +329,17 @@ pub(super) fn render_gpu_card(frame: &mut Frame, app: &App, area: Rect, graphs: 
         (Some(_), None) => vec![Line::from("No GPU detected")],
         (Some(inventory), Some((primary_gpu, telemetry))) => {
             let mut lines = gpu_detail_lines(primary_gpu, telemetry, width);
+            if let Some([long, short]) = hint {
+                let hint = if long.chars().count() <= width {
+                    long
+                } else {
+                    short
+                };
+                lines.push(
+                    Line::from(layout::truncate(hint, width))
+                        .style(Style::default().fg(theme::MUTED)),
+                );
+            }
             let mut others: Vec<&GpuDevice> = inventory
                 .gpus
                 .iter()
@@ -913,6 +944,7 @@ mod tests {
             kind,
             vram_bytes: Some(16 << 30),
             device_path: None,
+            driver: None,
         }
     }
 
@@ -1094,6 +1126,86 @@ mod tests {
             rows[2].contains("Intel UHD Graphics 770  iGPU"),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn the_gpu_card_says_why_a_build_without_nvml_shows_no_nvidia_values() {
+        let nvidia = |kind| GpuDevice {
+            driver: Some("nvidia".into()),
+            ..gpu("NVIDIA GeForce RTX 4060", kind)
+        };
+        let app = |gpus: Vec<GpuDevice>, access| {
+            let mut app = App::default().with_nvidia(access);
+            app.update(crate::action::Action::HardwareDiscovered(
+                HardwareInventory {
+                    gpus,
+                    ..HardwareInventory::default()
+                },
+            ));
+            app
+        };
+        let card = |app: &App, width| {
+            rows(app, width, 6, |frame, app, area| {
+                render_gpu_card(frame, app, area, true)
+            })
+        };
+
+        let alone = app(
+            vec![nvidia(Some(GpuKind::Discrete))],
+            NvidiaAccess::Unsupported,
+        );
+        let rows = card(&alone, 60);
+        assert!(rows[1].contains("dGPU  16 GiB VRAM"), "{rows:#?}");
+        assert!(rows[2].contains("NVML needs a glibc build"), "{rows:#?}");
+        let plain = app(
+            vec![gpu("Radeon", Some(GpuKind::Discrete))],
+            NvidiaAccess::Off,
+        );
+        let (with_hint, without) = (gpu_card_height(&alone, true), gpu_card_height(&plain, true));
+        assert_eq!(
+            (with_hint.min, with_hint.desired),
+            (without.min + 1, without.desired + 1),
+            "the hint is counted in the card's height"
+        );
+
+        // A hybrid laptop whose dGPU was asleep at discovery: the iGPU is
+        // the card's GPU, and the hint still shows.
+        let hybrid = app(
+            vec![gpu("Intel Iris Xe Graphics", None), nvidia(None)],
+            NvidiaAccess::Unsupported,
+        );
+        let rows = card(&hybrid, 60);
+        assert!(
+            rows[0].contains(" GPU  Intel Iris Xe Graphics "),
+            "{rows:#?}"
+        );
+        assert!(rows[2].contains("NVIDIA: needs a glibc build"), "{rows:#?}");
+        assert!(rows[3].contains("NVIDIA GeForce RTX 4060"), "{rows:#?}");
+
+        // Narrow: the short text keeps "glibc"; narrower still, it is cut to
+        // the card, never wrapped onto another row.
+        let rows = card(&alone, 20);
+        assert!(rows[2].contains("│NVML: glibc build │"), "{rows:#?}");
+        let rows = card(&alone, 12);
+        assert!(rows[2].contains("│NVML: gli…│"), "{rows:#?}");
+        assert!(rows[3].trim_matches(['│', ' ']).is_empty(), "{rows:#?}");
+        for width in 1..8 {
+            card(&alone, width);
+        }
+
+        for access in [NvidiaAccess::On, NvidiaAccess::Off] {
+            let text = card(&app(vec![nvidia(Some(GpuKind::Discrete))], access), 60).join("\n");
+            assert!(!text.contains("glibc"), "{access:?}: {text}");
+        }
+        let text = card(
+            &app(
+                vec![gpu("Radeon", Some(GpuKind::Discrete))],
+                NvidiaAccess::Unsupported,
+            ),
+            60,
+        )
+        .join("\n");
+        assert!(!text.contains("glibc"), "no NVIDIA GPU: {text}");
     }
 
     #[test]

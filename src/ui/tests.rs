@@ -677,6 +677,7 @@ fn overview_sweep_app(cpu_count: u32) -> App {
                 kind: None,
                 vram_bytes: None,
                 device_path: Some(Path::new("/sys/devices/gpu").into()),
+                driver: None,
             }],
             storage_devices: vec![crate::linux::StorageDevice {
                 system_name: "nvme0n1".into(),
@@ -1579,15 +1580,19 @@ fn menu_and_about_render_at_every_size() {
 
 #[test]
 fn help_lists_every_binding_and_every_line_fits() {
-    for enabled in [false, true] {
-        for line in help_lines(enabled) {
+    for nvidia in [
+        NvidiaAccess::On,
+        NvidiaAccess::Off,
+        NvidiaAccess::Unsupported,
+    ] {
+        for line in help_lines(nvidia) {
             assert!(
                 line.to_string().chars().count() <= usize::from(HELP_WIDTH - 2),
                 "{line:?} is cut off"
             );
         }
     }
-    let lines = help_lines(false);
+    let lines = help_lines(NvidiaAccess::Off);
     let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
     for line in &text {
         assert!(

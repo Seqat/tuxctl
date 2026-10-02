@@ -70,6 +70,8 @@ pub struct GpuDevice {
     pub vram_bytes: Option<u64>,
     /// Canonical sysfs path of the PCI device; temperatures are matched by it.
     pub device_path: Option<Arc<Path>>,
+    /// The kernel driver bound to it, such as `nvidia` or `amdgpu`.
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,12 +342,16 @@ fn read_gpu(card: &Path, nvidia_root: &Path) -> Option<GpuDevice> {
         .filter(|value| *value > 0)
         .or_else(|| nvidia.and_then(|information| information.vram_bytes));
     let kind = classify_gpu(&device);
+    let driver = fs::canonicalize(device.join("driver"))
+        .ok()
+        .and_then(|driver| driver.file_name()?.to_str().map(str::to_owned));
 
     Some(GpuDevice {
         model,
         kind,
         vram_bytes,
         device_path: device_path.map(Arc::from),
+        driver,
     })
 }
 
@@ -666,6 +672,13 @@ mod tests {
             gpus[0].device_path.as_deref(),
             Some(fs::canonicalize(&gpu_device).unwrap().as_path())
         );
+        assert_eq!(gpus[0].driver, None, "no driver bound");
+
+        let driver = root.join("bus/pci/drivers/nvidia");
+        fs::create_dir_all(&driver).unwrap();
+        symlink(&driver, gpu_device.join("driver")).unwrap();
+        let gpus = discover_gpus(&drm, &root.join("no-nvidia"));
+        assert_eq!(gpus[0].driver.as_deref(), Some("nvidia"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -697,6 +710,7 @@ mod tests {
             kind: None,
             vram_bytes: None,
             device_path: None,
+            driver: None,
         };
 
         assert_eq!(gpu.model, "Intel graphics device [1234]");

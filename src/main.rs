@@ -109,7 +109,7 @@ fn main() -> io::Result<()> {
     let mut terminal = TerminalSession::new()?;
     let mut app = App::default()
         .with_collector_periods(periods)
-        .with_nvidia_temperature(nvidia_temperature);
+        .with_nvidia(linux::NvidiaAccess::new(nvidia_temperature));
     let mut events = EventHandler::new(TICK_RATE);
     let metrics = match linux::SystemMetricsCollector::start(periods.metrics, nvidia_temperature) {
         Ok(metrics) => metrics,
