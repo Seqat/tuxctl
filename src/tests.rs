@@ -541,6 +541,27 @@ fn terminal_restoration_precedes_blocked_worker_teardown() {
 }
 
 #[test]
+fn a_worker_that_never_stops_does_not_block_exit() {
+    let (events_tx, events_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let terminal = SignalingDrop {
+        event: events_tx.clone(),
+    };
+    let worker = BlockingWorkerDrop {
+        started: events_tx,
+        release: release_rx,
+    };
+
+    let started = Instant::now();
+    finish_application_within(terminal, worker, Ok(()), Duration::from_millis(100)).unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(events_rx.recv().unwrap(), "terminal");
+    assert_eq!(events_rx.recv().unwrap(), "worker");
+    release_tx.send(()).unwrap();
+}
+
+#[test]
 fn terminal_restore_commands_are_idempotent() {
     let mut buffer = Vec::new();
     assert!(restore_terminal_commands(&mut buffer).is_ok());

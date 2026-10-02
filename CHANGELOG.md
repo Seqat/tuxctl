@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its report, as the screens already did. Disk and network adapter
   models come from device firmware, so a USB device could otherwise send
   escape sequences to the terminal.
+- Quitting waits at most 2 seconds for the background workers. Reading a
+  process's command line waits on that process's memory lock, which another
+  local user can hold indefinitely (for example through a stalled FUSE
+  mapping); `tuxctl` restored the terminal but then never exited.
 - Command lines are read up to 4 KiB per process; longer ones end in `…`.
   Before, another local user could make `tuxctl` hold megabytes per process
   by starting processes with huge argument lists.

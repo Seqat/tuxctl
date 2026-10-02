@@ -59,6 +59,8 @@ const HOVER_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const BACKGROUND_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 /// Upper bound on actions applied before the loop renders or blocks again.
 const MAX_ACTIONS_PER_TURN: usize = 16;
+/// How long quitting waits for the background workers to stop.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> io::Result<()> {
     // Arguments are handled before the terminal is touched.
@@ -214,9 +216,37 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn finish_application<T, W, R>(terminal: T, workers: W, result: io::Result<R>) -> io::Result<R> {
+/// Restores the terminal, then stops the workers. A worker can be stuck in a
+/// read that another local user controls (a `/proc/<pid>/cmdline` read waits
+/// on that process's memory lock), so the stop is awaited for at most
+/// `WORKER_STOP_TIMEOUT`; the process then exits and takes the thread with it.
+fn finish_application<T, W, R>(terminal: T, workers: W, result: io::Result<R>) -> io::Result<R>
+where
+    W: Send + 'static,
+{
+    finish_application_within(terminal, workers, result, WORKER_STOP_TIMEOUT)
+}
+
+fn finish_application_within<T, W, R>(
+    terminal: T,
+    workers: W,
+    result: io::Result<R>,
+    timeout: Duration,
+) -> io::Result<R>
+where
+    W: Send + 'static,
+{
     drop(terminal);
-    drop(workers);
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let stopper = std::thread::Builder::new()
+        .name("stop-workers".into())
+        .spawn(move || {
+            drop(workers);
+            let _ = stopped_tx.send(());
+        });
+    if stopper.is_ok() {
+        let _ = stopped_rx.recv_timeout(timeout);
+    }
     result
 }
 
