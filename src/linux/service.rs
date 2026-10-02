@@ -142,7 +142,7 @@ fn run_collector(
 }
 
 fn collect_services(control: &CollectorControl) -> ServiceSnapshot {
-    let mut command = Command::new("systemctl");
+    let mut command = super::system_command("systemctl");
     command
         .args([
             "--system",

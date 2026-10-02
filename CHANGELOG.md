@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process's command line waits on that process's memory lock, which another
   local user can hold indefinitely (for example through a stalled FUSE
   mapping); `tuxctl` restored the terminal but then never exited.
+- `systemctl` and `journalctl` run from `/usr/bin` or `/bin` when they are
+  there, and only otherwise from `PATH`. A root `tuxctl` started with a
+  user's `PATH` (`su` without `-`) could run a same-named program from a
+  directory that user can write.
 - Command lines are read up to 4 KiB per process; longer ones end in `…`.
   Before, another local user could make `tuxctl` hold megabytes per process
   by starting processes with huge argument lists.
