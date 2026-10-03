@@ -1,7 +1,7 @@
 # Maintainer: Seqat <37043095+Seqat@users.noreply.github.com>
 
 pkgname=tuxctl
-pkgver=0.3.3
+pkgver=0.3.4
 pkgrel=1
 pkgdesc='A lightweight, keyboard-first Linux TUI for system monitoring and management'
 arch=('x86_64' 'aarch64')
@@ -13,7 +13,7 @@ optdepends=('nvidia-utils: temperature and usage of NVIDIA GPUs through NVML')
 # The release profile already strips the binary, so a -debug package would be empty.
 options=('!debug')
 source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
-sha256sums=('89cb9753eb45e20ce5b849b4ea1c25b546d980ea81ee4ef4120f8239d4a53178')
+sha256sums=('d03a3a3d1de0a479a85a311db72a8370cd65368021afcd19c7d6d62e5f9ddd75')
 
 prepare() {
   cd "$pkgname-$pkgver"

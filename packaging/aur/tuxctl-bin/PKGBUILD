@@ -2,7 +2,7 @@
 
 pkgname=tuxctl-bin
 _pkgname=tuxctl
-pkgver=0.3.3
+pkgver=0.3.4
 pkgrel=1
 pkgdesc='A lightweight, keyboard-first Linux TUI for system monitoring and management (static binary; no NVIDIA NVML support)'
 arch=('x86_64' 'aarch64')
@@ -17,8 +17,8 @@ _base="$url/releases/download/v$pkgver"
 source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::$_base/$_pkgname-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$_pkgname-$pkgver-aarch64.tar.gz::$_base/$_pkgname-aarch64-unknown-linux-musl.tar.gz")
 # From SHA256SUMS on the GitHub release.
-sha256sums_x86_64=('f6caafd53c44b232a68301de7856a90004753dd0a71c03c05b611e891f1b0185')
-sha256sums_aarch64=('03e2a95363872b5973d68a5a93d60d3b0720dec726f55ea63b2b2ce5d504c052')
+sha256sums_x86_64=('458d23fca0bba5d2ef0833701e4bef5095c810c043f1b8001daf07689f6da296')
+sha256sums_aarch64=('ab92cb6b10e5ffba227e64d05e1877da9d91acd975a5e2ba2e7b9dc06b80c3af')
 
 package() {
   cd "$_pkgname-$CARCH-unknown-linux-musl"
