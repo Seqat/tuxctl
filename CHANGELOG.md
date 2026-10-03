@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-03
+
+NVIDIA GPUs on the proprietary driver now work from a release download: a new
+x86_64 glibc binary (glibc 2.28 or newer) loads NVML, and the static binaries
+say on the GPU card why they cannot. NVML's 20 MiB are freed once the
+Overview has been hidden for 10 seconds. Also documentation at
+<https://seqat.github.io/tuxctl/>, AUR packages, and hardening of
+`tuxctl` itself and of the release workflows (pinned actions, build
+attestations, no third-party toolchain action).
+
+### Added
+
+- Documentation at <https://seqat.github.io/tuxctl/>: installation and
+  verification, each screen, every key, temperatures and GPUs, optional setup,
+  design, performance and development. The README is now a short
+  introduction that links to it.
+
+- AUR packaging in `packaging/aur/`: `tuxctl` builds from the crates.io
+  source against glibc (NVIDIA GPUs through NVML with `nvidia-utils`), and
+  `tuxctl-bin` installs the static release binary.
+
+- `tuxctl` is published on crates.io, from v0.3.3 on: `cargo install tuxctl
+  --locked` builds against glibc and can show NVIDIA GPUs through NVML.
+
+- An x86_64 glibc release binary, `tuxctl-x86_64-unknown-linux-gnu.tar.gz`,
+  next to the static ones. It is linked against glibc 2.28 (manylinux_2_28),
+  so it runs on RHEL 8, Debian 10, Ubuntu 20.04 and newer, and unlike the
+  static binaries it can load NVML for NVIDIA GPUs on the proprietary
+  driver. It is covered by `SHA256SUMS` and the build provenance attestation
+  like the others.
+
+- The static binaries say on the GPU card why an NVIDIA GPU on the
+  proprietary driver shows no temperature or usage ("NVML needs a glibc
+  build"), instead of leaving it to Help and `--check`.
+
+### Changed
+
+- NVML is closed once the Overview has been hidden for 10 seconds, and
+  loaded again when it is shown. This also applies to GPUs with RTD3, where
+  NVML is already shut down after every reading but the library kept its
+  memory; closing it makes no call to NVML, so it cannot wake the GPU. It held
+  about 20 MiB until `tuxctl` exited (`nvmlShutdown` frees none of it); RSS
+  on other screens drops from about 31 MiB to about 11 MiB, and the first
+  reading back on the Overview takes about 40 ms instead of about 12 ms.
+  Measured on a GPU that cannot runtime-suspend; unloading on RTD3 GPUs is
+  covered by tests but untested on real hardware.
+
+### Fixed
+
+- `journalctl`'s error output is discarded instead of piped. The pipe was
+  only read once the journal stream ended, so enough warnings could fill it
+  and stall the Logs screen.
+
+### Security
+
+- `tuxctl --check` removes control characters and bidirectional overrides
+  from its report, as the screens already did. Disk and network adapter
+  models come from device firmware, so a USB device could otherwise send
+  escape sequences to the terminal.
+- Quitting waits at most 2 seconds for the background workers. Reading a
+  process's command line waits on that process's memory lock, which another
+  local user can hold indefinitely (for example through a stalled FUSE
+  mapping); `tuxctl` restored the terminal but then never exited.
+- `systemctl` and `journalctl` run from `/usr/bin` or `/bin` when they are
+  there, and only otherwise from `PATH`. A root `tuxctl` started with a
+  user's `PATH` (`su` without `-`) could run a same-named program from a
+  directory that user can write.
+- Command lines are read up to 4 KiB per process; longer ones end in `…`.
+  Before, another local user could make `tuxctl` hold megabytes per process
+  by starting processes with huge argument lists.
+- A security policy (`SECURITY.md`) with private vulnerability reporting
+  through GitHub.
+- Release archives carry a build provenance attestation:
+  `gh attestation verify <archive> --repo Seqat/tuxctl` confirms that the
+  release workflow built it from this repository.
+
+### Internal
+
+- Issue forms for bugs (asking for `tuxctl --version` and `tuxctl --check`)
+  and feature requests, links to private security reports and the
+  documentation instead of blank issues, and a pull request checklist.
+- Every module except the unit-test files starts with a short `//!` summary of what it does, so the
+  code can be navigated from `cargo doc --document-private-items`.
+- A release checklist (`RELEASING.md`): preparing, checking, merging,
+  tagging, verifying what publishing starts, and what to do when a step
+  fails.
+- A contributing guide (`CONTRIBUTING.md`). Large unit-test modules live in
+  sibling `tests.rs` files (for example `src/ui/tests.rs`), following its
+  rule: a file over 500 lines whose tests are at least half of it, or whose
+  tests alone exceed 1000 lines. Nine files moved; the tests are unchanged.
+- Every `unsafe` block states why it is sound, enforced by clippy
+  (`undocumented_unsafe_blocks`); code outside tests may not use `unwrap`,
+  `expect`, `panic!` or `unreachable!`, and the two `unreachable!` left are
+  gone.
+- Tests for hostile `/proc/<pid>/stat` names (a name imitating the fields
+  after it cannot change the start time used to verify signal targets),
+  malformed stat lines and huge command lines.
+- Every GitHub Action is pinned to a commit, and checkouts do not keep the
+  repository token. A new Security workflow runs `cargo-deny` (RustSec
+  advisories, licenses, sources) and `zizmor` (workflow audit) on every push
+  and weekly; Dependabot proposes weekly dependency and action updates after
+  a 7-day cooldown.
+- Workflows install Rust with the runner's preinstalled `rustup` (minimal
+  profile, the same versions as before) instead of
+  `dtolnay/rust-toolchain`. That action is only published as moving
+  branches, so its pinned commit drifted from its `# master` comment and
+  failed zizmor's `ref-version-mismatch` audit on every upstream push.
+- Publishing a GitHub release also publishes the crate on crates.io through
+  Trusted Publishing (no stored token); other runs of the release workflow
+  check the package with `cargo publish --dry-run`.
+- The package lists keywords and the `command-line-utilities` category.
+
 ## [0.3.3] - 2026-09-30
 
 A redesigned Overview: responsive cards with temperatures, GPU usage, power,
@@ -346,7 +458,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/Seqat/tuxctl/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/Seqat/tuxctl/compare/v0.3.0...v0.3.3
 [0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7

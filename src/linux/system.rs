@@ -1,3 +1,8 @@
+//! System metrics on one worker: total and per-CPU utilization, memory and swap,
+//! uptime, load, disk throughput, hostname and kernel and, while the Overview
+//! is visible, filesystem usage, temperatures, GPU telemetry and CPU power
+//! (sampled by the `temperature` and `gpu` modules).
+
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -260,7 +265,7 @@ impl SystemMetricsSampler {
         }
 
         let sensors_active = self.sensors_active.load(Ordering::Relaxed);
-        self.temperatures.set_active(sensors_active);
+        self.temperatures.set_active(sensors_active, now);
         if sensors_active {
             self.mounts = fs::read_to_string(PROC_MOUNTS)
                 .map(|contents| mount_usage(&parse_mounts(&contents)))

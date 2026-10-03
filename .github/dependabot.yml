@@ -1,0 +1,26 @@
+# Version updates go to dev like any other change, and only once a release
+# is a week old, so a compromised release is likely caught before it reaches
+# us. Security updates for vulnerable dependencies are separate and open
+# against main.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

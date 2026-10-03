@@ -1,8 +1,10 @@
 name: Release
 
-# Publishing a GitHub release attaches static Linux binaries and checksums to
-# it. Other triggers are dry runs that upload the same files as workflow
-# artifacts only: a manual run, or a push to dev that changes this workflow.
+# Publishing a GitHub release attaches Linux binaries (static musl ones, and an
+# x86_64 glibc one that can load NVIDIA's NVML) and checksums to it and
+# publishes the crate on crates.io. Other triggers are dry runs that
+# upload the same files as workflow artifacts only and run `cargo publish
+# --dry-run`: a manual run, or a push to dev that changes this workflow.
 on:
   release:
     types: [published]
@@ -16,6 +18,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so release builds are reproducible; bump deliberately. Installed
+  # with the runner's preinstalled rustup (no third-party action to pin).
+  RUST_VERSION: "1.98.1"
 
 jobs:
   build:
@@ -28,18 +33,27 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            libc: musl
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            libc: musl
+          # Linked against an old glibc so it runs on most distributions.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            libc: gnu
+            glibc_max: "2.28"
     env:
       TARGET: ${{ matrix.target }}
       BIN: target/${{ matrix.target }}/release/tuxctl
+      GLIBC_MAX: ${{ matrix.glibc_max }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Pinned so release builds are reproducible; bump deliberately.
-          toolchain: "1.98.1"
-          targets: ${{ matrix.target }}
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET" --no-self-update
+          rustup default "$RUST_VERSION"
       - name: Read the package version
         run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
       - name: Check the tag matches Cargo.toml
@@ -51,16 +65,67 @@ jobs:
             echo "::error::release tag $TAG does not match Cargo.toml version $VERSION"
             exit 1
           fi
-      - run: cargo test --locked --target "$TARGET"
-      - run: cargo build --release --locked --target "$TARGET"
-      - name: Check the binary
+      - if: matrix.libc == 'musl'
+        run: cargo test --locked --target "$TARGET"
+      - if: matrix.libc == 'musl'
+        run: cargo build --release --locked --target "$TARGET"
+      # The glibc build is tested and linked inside manylinux_2_28 (AlmaLinux
+      # 8, glibc 2.28) with the toolchain installed above (the runner's
+      # $HOME/.rustup and $HOME/.cargo), mounted read-write so cargo can use
+      # its registry cache. To update the image, see
+      # RELEASING.md.
+      - name: Test and build against glibc ${{ matrix.glibc_max }}
+        if: matrix.libc == 'gnu'
+        env:
+          IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.10.02-1@sha256:1e102f2e9ed9b7fd8d64b29f798c76078c3fa8f14d34914d7a4045e39419d8e0
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src" -w /src \
+            -v "${RUSTUP_HOME:-$HOME/.rustup}:/rustup" -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
+            -e HOME=/tmp -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR \
+            -e RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | cut -d ' ' -f 1)" -e TARGET \
+            "$IMAGE" sh -euc '
+              export PATH="$CARGO_HOME/bin:$PATH"
+              ldd --version | head -n 1
+              cargo test --locked --target "$TARGET"
+              cargo build --release --locked --target "$TARGET"
+            '
+      - name: Check the binary is static
+        if: matrix.libc == 'musl'
         run: |
           file "$BIN"
           if ! file "$BIN" | grep -Eq 'static(ally|-pie) linked'; then
             echo "::error::$BIN is not statically linked"
             exit 1
           fi
-          test "$("$BIN" --version)" = "tuxctl $VERSION"
+      - name: Check the binary's glibc requirement
+        if: matrix.libc == 'gnu'
+        run: |
+          set -euo pipefail
+          file "$BIN"
+          if ! file "$BIN" | grep -q 'dynamically linked'; then
+            echo "::error::$BIN is not dynamically linked"
+            exit 1
+          fi
+          if ! symbols=$(objdump -T "$BIN"); then
+            echo "::error::objdump could not read $BIN"
+            exit 1
+          fi
+          required=$(grep -o 'GLIBC_[0-9.]*' <<< "$symbols" | sort -uV | tail -n 1 || true)
+          required=${required#GLIBC_}
+          if [ -z "$required" ]; then
+            echo "::error::no GLIBC symbol versions found in $BIN"
+            exit 1
+          fi
+          highest=$(printf '%s\n%s\n' "$required" "$GLIBC_MAX" | sort -V | tail -n 1)
+          if [ "$highest" != "$GLIBC_MAX" ]; then
+            echo "::error::$BIN requires glibc $required, above the $GLIBC_MAX baseline"
+            exit 1
+          fi
+          echo "requires glibc $required (baseline $GLIBC_MAX)"
+          echo "GLIBC_REQUIRED=$required" >> "$GITHUB_ENV"
+      - name: Check the version
+        run: test "$("$BIN" --version)" = "tuxctl $VERSION"
       - name: Smoke test
         run: scripts/smoke.py "$BIN"
       - name: Package
@@ -76,10 +141,13 @@ jobs:
             echo '```'
             rustc -V
             file "$BIN"
+            if [ -n "${GLIBC_REQUIRED:-}" ]; then
+              echo "requires glibc $GLIBC_REQUIRED (baseline $GLIBC_MAX)"
+            fi
             echo "binary: $(stat -c %s "$BIN") bytes, archive: $(stat -c %s "dist/$name.tar.gz") bytes"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tuxctl-${{ matrix.target }}
           path: dist/tuxctl-${{ matrix.target }}.tar.gz
@@ -91,8 +159,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance: a signed statement that these archives were built
+      # by this workflow from this commit (`gh attestation verify`).
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -102,7 +174,12 @@ jobs:
           sha256sum tuxctl-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
           sha256sum -c SHA256SUMS
-      - uses: actions/upload-artifact@v7
+      - name: Attest build provenance
+        if: github.event_name == 'release'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/tuxctl-*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tuxctl-release
           path: dist/
@@ -115,3 +192,45 @@ jobs:
         run: >
           gh release upload "$TAG" dist/tuxctl-*.tar.gz dist/SHA256SUMS
           --clobber --repo "$GITHUB_REPOSITORY"
+
+  crates:
+    name: crates.io
+    # Only once every binary built, so a broken release never reaches crates.io.
+    needs: build
+    runs-on: ubuntu-latest
+    # crates.io Trusted Publishing: the job trades its GitHub OIDC token for a
+    # short-lived publish token; no crates.io token is stored in the repository.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Read the package version
+        run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
+      - name: Check the tag matches Cargo.toml
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::release tag $TAG does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+      - name: Dry run
+        if: github.event_name != 'release'
+        run: cargo publish --dry-run --locked
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: github.event_name == 'release'
+        id: auth
+      - name: Publish
+        if: github.event_name == 'release'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

@@ -1,3 +1,8 @@
+//! systemd units from `systemctl`, collected only while the Services screen is
+//! visible. The call is bounded by `SYSTEMCTL_TIMEOUT` and its process group is
+//! killed when it expires, so a hung `systemctl` cannot stall the screen or
+//! exit.
+
 use std::{
     io::{self, Read},
     os::unix::process::CommandExt,
@@ -137,7 +142,7 @@ fn run_collector(
 }
 
 fn collect_services(control: &CollectorControl) -> ServiceSnapshot {
-    let mut command = Command::new("systemctl");
+    let mut command = super::system_command("systemctl");
     command
         .args([
             "--system",

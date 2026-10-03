@@ -1,3 +1,7 @@
+//! The Network screen: the interface table with its status line, and the detail
+//! view of one interface (addresses, counters, errors). Rendering also returns
+//! the rows it drew, so clicks can be resolved to interfaces.
+
 use std::sync::Arc;
 
 use ratatui::{

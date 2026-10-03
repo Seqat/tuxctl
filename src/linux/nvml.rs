@@ -342,6 +342,15 @@ impl NvidiaSource for NvmlReader {
             self.initialized = false;
         }
     }
+
+    /// `nvmlShutdown` alone frees nothing; closing the library frees what
+    /// NVML allocated (about 20 MiB). The CUDA library it loaded stays mapped,
+    /// with its thread, so loading NVML again is about as cheap as
+    /// initializing it again.
+    fn unload(&mut self) {
+        self.release();
+        self.library = None;
+    }
 }
 
 impl Drop for NvmlReader {

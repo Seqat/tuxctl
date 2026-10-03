@@ -1,3 +1,7 @@
+//! The Logs screen: the journal table with its status line, and the detail view
+//! of one entry. Rendering also returns the rows it drew, so clicks can be
+//! resolved to entries.
+
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},

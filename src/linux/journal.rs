@@ -1,7 +1,13 @@
+//! The systemd journal: `journalctl --follow --output=json` read on a thread into
+//! a bounded channel. Lines that do not parse, and entries that find the
+//! channel full, are counted as dropped instead of piling up, and a batch
+//! handed to the UI is capped so a burst of messages cannot starve input
+//! handling.
+
 use std::{
     cell::Cell,
     io::{BufRead, BufReader, Read},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -99,21 +105,13 @@ impl JournalCollector {
                 worker: None,
             };
         };
-        let stderr = child.stderr.take();
 
         let worker_dropped = Arc::clone(&dropped);
         let worker_terminal_error = Arc::clone(&terminal_error);
         let worker = match thread::Builder::new()
             .name("journal-stream".into())
-            .spawn(move || {
-                read_journal(
-                    stdout,
-                    stderr,
-                    sender,
-                    &worker_dropped,
-                    &worker_terminal_error,
-                )
-            }) {
+            .spawn(move || read_journal(stdout, sender, &worker_dropped, &worker_terminal_error))
+        {
             Ok(worker) => Some(worker),
             Err(error) => {
                 report_terminal_error(
@@ -203,7 +201,9 @@ impl Drop for JournalCollector {
 }
 
 fn spawn_journalctl() -> std::io::Result<Child> {
-    Command::new("journalctl")
+    // JSON output turns fields over 4096 bytes into `null`, which bounds every
+    // entry whatever other users log; do not add `--all`, which lifts that.
+    super::system_command("journalctl")
         .args([
             "--no-pager",
             "--quiet",
@@ -214,19 +214,19 @@ fn spawn_journalctl() -> std::io::Result<Child> {
         ])
         .env("SYSTEMD_COLORS", "0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Its messages are not shown; a pipe nobody reads would fill and
+        // stall journalctl.
+        .stderr(Stdio::null())
         .spawn()
 }
 
-fn read_journal<R, E>(
+fn read_journal<R>(
     stdout: R,
-    mut stderr: Option<E>,
     sender: SyncSender<JournalEntry>,
     dropped: &AtomicUsize,
     terminal_error: &OnceLock<String>,
 ) where
     R: Read,
-    E: Read,
 {
     let mut next_id = 1_u64;
     for line in BufReader::new(stdout).lines() {
@@ -256,9 +256,6 @@ fn read_journal<R, E>(
     }
 
     report_terminal_error(terminal_error, "journal stream ended");
-    if let Some(stderr) = &mut stderr {
-        let _ = std::io::copy(stderr, &mut std::io::sink());
-    }
 }
 
 fn parse_journal_json(line: &str, id: u64) -> Option<JournalEntry> {
@@ -333,20 +330,6 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::other("simulated read failure"))
-        }
-    }
-
-    struct StatusCheckingEofReader {
-        terminal_error: Arc<OnceLock<String>>,
-    }
-
-    impl Read for StatusCheckingEofReader {
-        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-            assert_eq!(
-                self.terminal_error.get().map(String::as_str),
-                Some("journal stream ended")
-            );
-            Ok(0)
         }
     }
 
@@ -459,13 +442,7 @@ mod tests {
 
         let dropped = Arc::new(AtomicUsize::new(0));
         let terminal_error = Arc::new(OnceLock::new());
-        read_journal(
-            FailingReader,
-            None::<std::io::Empty>,
-            sender,
-            &dropped,
-            &terminal_error,
-        );
+        read_journal(FailingReader, sender, &dropped, &terminal_error);
         let collector = collector_for_test(receiver, dropped, Arc::clone(&terminal_error));
 
         let batch = collector
@@ -517,15 +494,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_eof_reports_terminal_status_before_reading_stderr() {
+    fn stream_eof_reports_terminal_status() {
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
         let terminal_error = Arc::new(OnceLock::new());
         read_journal(
             std::io::Cursor::new(Vec::<u8>::new()),
-            Some(StatusCheckingEofReader {
-                terminal_error: Arc::clone(&terminal_error),
-            }),
             sender,
             &dropped,
             &terminal_error,
@@ -548,7 +522,6 @@ mod tests {
 
         read_journal(
             std::io::Cursor::new(input),
-            None::<std::io::Empty>,
             sender,
             &dropped,
             &terminal_error,

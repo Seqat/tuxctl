@@ -1,15 +1,25 @@
 [package]
 name = "tuxctl"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Seqat"]
 license = "MIT"
 repository = "https://github.com/Seqat/tuxctl"
+homepage = "https://seqat.github.io/tuxctl/"
 description = "A lightweight, keyboard-first Linux TUI for system monitoring and management."
 readme = "README.md"
-# Screenshots and development tooling are not needed to build from the crate.
-exclude = ["docs/screenshots/", "scripts/", ".github/"]
+keywords = ["tui", "system-monitor", "linux", "terminal", "ratatui"]
+categories = ["command-line-utilities"]
+# Screenshots, development tooling and distribution packaging are not needed
+# to build from the crate.
+exclude = [
+    "docs/screenshots/",
+    "scripts/",
+    ".github/",
+    "deny.toml",
+    "packaging/",
+]
 
 
 # Measured against the default profile (3 runs each, scripts/measure.py): 35 %

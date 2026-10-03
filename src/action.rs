@@ -1,3 +1,7 @@
+//! The vocabulary of the application: every `Action` that input or a collector
+//! can ask `App` to perform, the `MouseTarget`s a click can resolve to, and the
+//! tabs and input modes they refer to. Nothing here does any work.
+
 use std::{sync::Arc, time::Instant};
 
 use crate::linux::{

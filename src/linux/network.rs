@@ -1,3 +1,10 @@
+//! Network interfaces: counters from `/proc/net/dev`, state, MAC address and MTU
+//! from `/sys/class/net`, addresses from `getifaddrs`, and per-second rates
+//! computed from the counters. Each interface keeps its own baseline, so one
+//! that appears starts without a rate rather than a spike; an interface
+//! without counters has no rate, and a failed read of `/proc/net/dev` resets
+//! every baseline.
+
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -327,19 +334,30 @@ fn collect_ip_addresses() -> (
     let mut ipv6_map: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
 
     let mut ifaddrs_ptr: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `ifaddrs_ptr` is a valid out-pointer; on success getifaddrs(3)
+    // stores a list that stays valid until the freeifaddrs call below.
     if unsafe { libc::getifaddrs(&mut ifaddrs_ptr) } != 0 || ifaddrs_ptr.is_null() {
         return (ipv4_map, ipv6_map);
     }
 
+    // No early return between here and freeifaddrs, so the list is freed once.
     let mut cursor = ifaddrs_ptr;
     while !cursor.is_null() {
+        // SAFETY: `cursor` is a non-null node of the list from getifaddrs,
+        // which has not been freed yet.
         let ifa = unsafe { &*cursor };
         if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+            // SAFETY: `ifa_name` is non-null and points to the interface's
+            // NUL-terminated name, owned by the live list.
             let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: `ifa_addr` is non-null and points to a sockaddr owned by
+            // the live list; every sockaddr starts with `sa_family`.
             let family = unsafe { (*ifa.ifa_addr).sa_family as libc::c_int };
             if family == libc::AF_INET {
+                // SAFETY: for AF_INET, `ifa_addr` points to a complete, aligned
+                // `sockaddr_in`; it is copied out before the list is freed.
                 let sin = unsafe { *(ifa.ifa_addr as *const libc::sockaddr_in) };
                 let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
                 let list = ipv4_map.entry(name).or_default();
@@ -347,6 +365,8 @@ fn collect_ip_addresses() -> (
                     list.push(ip);
                 }
             } else if family == libc::AF_INET6 {
+                // SAFETY: for AF_INET6, `ifa_addr` points to a complete, aligned
+                // `sockaddr_in6`; it is copied out before the list is freed.
                 let sin6 = unsafe { *(ifa.ifa_addr as *const libc::sockaddr_in6) };
                 let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                 let list = ipv6_map.entry(name).or_default();
@@ -358,6 +378,8 @@ fn collect_ip_addresses() -> (
         cursor = ifa.ifa_next;
     }
 
+    // SAFETY: `ifaddrs_ptr` came from a successful getifaddrs call, is freed
+    // only here, and nothing borrowed from the list outlives this point.
     unsafe { libc::freeifaddrs(ifaddrs_ptr) };
     (ipv4_map, ipv6_map)
 }

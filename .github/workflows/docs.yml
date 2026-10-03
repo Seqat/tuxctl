@@ -1,0 +1,62 @@
+name: Docs
+
+# Builds the documentation (docs/, mdBook) on every push and pull request, so a
+# broken page fails early. Publishing a release, or a manual run, also deploys
+# it to GitHub Pages (https://seqat.github.io/tuxctl/), so the site describes
+# the latest release.
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The official release archive, checked against its published SHA-256.
+  MDBOOK_VERSION: v0.5.4
+  MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
+
+jobs:
+  build:
+    # Named for the required status check on main.
+    name: mdBook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        run: |
+          archive="mdbook-$MDBOOK_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfLO "https://github.com/rust-lang/mdBook/releases/download/$MDBOOK_VERSION/$archive"
+          echo "$MDBOOK_SHA256  $archive" | sha256sum -c
+          tar xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: mdbook build docs
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        with:
+          path: target/book
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deployment
