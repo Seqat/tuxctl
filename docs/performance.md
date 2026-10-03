@@ -34,6 +34,32 @@ within the larger of twice that band and a floor of 0.15 CPU percentage
 points, 0.3 redraws/s, or 256 KiB. After minute 5, RSS should grow by at most
 128 KiB over a 15-minute run.
 
+## v0.3.4
+
+Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.77 MB
+(v0.3.3: 1.74 MB). Median of three runs, alternated with three runs of the
+v0.3.3 musl binary in the same session (in brackets), on Linux 7.2.8.
+
+| Scenario | CPU % | Redraws/s | RSS |
+| --- | --- | --- | --- |
+| Overview, idle | 0.70 (0.70) | 2.00 (2.00) | 2.7 MiB |
+| Processes, idle | 0.70 (0.70) | 1.10 (1.25) | 2.8 MiB |
+| Logs, idle | 0.65 (0.60) | 0.05 (0.05) | 2.9 MiB |
+| Logs, 200 journal messages/s | 0.93 (1.00) | 3.87 (3.93) | 3.2 MiB |
+| Mouse hover at 240 Hz | 1.50 (1.50) | 13.46 (13.53) | 3.1 MiB |
+
+- CPU and redraws are unchanged: every difference is within the 0.15-point
+  floor and the redraw noise band.
+- Startup RSS: 2.6 MiB (2.6 MiB). After 15 minutes on Overview: 2.7 MiB,
+  56 KiB more than at minute 5.
+- Time to the first frame: 2.1 ms (2.1 ms). Input latency during the log
+  storm: 0.70 ms (0.73 ms).
+- The new glibc binary loads NVML for the NVIDIA GPU (an RTX 5070 Ti that
+  cannot runtime-suspend): Overview idle 1.05 % and 31 MiB. NVML is now
+  closed once the Overview has been hidden for 10 s, so the other screens
+  run at 11 MiB instead of about 31 MiB (Processes idle 0.70 %, 11.0 MiB);
+  returning to the Overview loads it again in about 40 ms on the worker.
+
 ## v0.3.3
 
 Release binary: `x86_64-unknown-linux-musl`, statically linked, 1.74 MB
@@ -63,9 +89,6 @@ load NVML, so these figures leave it out; see below for a glibc build.
 - A glibc build on the same machine loads NVML for its NVIDIA GPU: startup
   RSS is about 31 MiB, Overview idle about 0.95 % and Processes idle about
   0.60 % (hardware sensors are read only while the Overview is visible).
-  From v0.3.4 on, NVML is closed once the Overview has been hidden for 10 s:
-  RSS on other screens drops from about 31 MiB to about 11 MiB (measured on
-  this machine; the GPU cannot runtime-suspend).
 - Another `tuxctl` was running on the machine during these runs; both
   versions ran alongside it.
 

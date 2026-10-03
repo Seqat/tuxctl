@@ -71,7 +71,7 @@ GPUs on the proprietary driver.
 A tagged version straight from GitHub:
 
 ```sh
-cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.3 --locked
+cargo install --git https://github.com/Seqat/tuxctl --tag v0.3.4 --locked
 ```
 
 Or from a clone:

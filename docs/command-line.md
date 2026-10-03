@@ -15,7 +15,7 @@ tuxctl [--interval <DURATION>] [--no-nvidia-temperature] [--check]
 A `--check` report looks like this:
 
 ```text
-tuxctl 0.3.3 sensor check
+tuxctl 0.3.4 sensor check
 
 CPU     AMD Ryzen 5 7500F 6-Core Processor
         temperature  58°C       k10temp Tctl

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-03
+
+NVIDIA GPUs on the proprietary driver now work from a release download: a new
+x86_64 glibc binary (glibc 2.28 or newer) loads NVML, and the static binaries
+say on the GPU card why they cannot. NVML's 20 MiB are freed once the
+Overview has been hidden for 10 seconds. Also documentation at
+<https://seqat.github.io/tuxctl/>, AUR packages, and hardening of
+`tuxctl` itself and of the release workflows (pinned actions, build
+attestations, no third-party toolchain action).
+
 ### Added
 
 - Documentation at <https://seqat.github.io/tuxctl/>: installation and
@@ -41,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 20 MiB until `tuxctl` exited (`nvmlShutdown` frees none of it); RSS
   on other screens drops from about 31 MiB to about 11 MiB, and the first
   reading back on the Overview takes about 40 ms instead of about 12 ms.
+  Measured on a GPU that cannot runtime-suspend; unloading on RTD3 GPUs is
+  covered by tests but untested on real hardware.
 
 ### Fixed
 
@@ -446,7 +458,8 @@ Reliability and efficiency release. No new keys or screens.
 
 - Initial release with Overview, Processes, Services, Logs, and Network screens.
 
-[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/Seqat/tuxctl/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/Seqat/tuxctl/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/Seqat/tuxctl/compare/v0.3.0...v0.3.3
 [0.3.0]: https://github.com/Seqat/tuxctl/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/Seqat/tuxctl/compare/v0.2.5...v0.2.7
