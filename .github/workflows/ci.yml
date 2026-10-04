@@ -102,7 +102,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@2320916714171c258d01dbd81040d64d798c6f8e # v7.1.1
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
