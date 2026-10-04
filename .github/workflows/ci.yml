@@ -86,3 +86,24 @@ jobs:
             measure-250ms.json
           if-no-files-found: ignore
           retention-days: 30
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@2320916714171c258d01dbd81040d64d798c6f8e # v7.1.1
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: ${{ github.event.pull_request.head.repo.fork != true }}

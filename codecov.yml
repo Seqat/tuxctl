@@ -1,0 +1,14 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true   # toplam kapsam bilgi amaçlı, PR'ı bloklamaz
+    patch:
+      default:
+        target: 70%           # yeni eklenen kodun en az %70'i test edilmeli
+        threshold: 5%
+comment:
+  layout: "diff, files"
+  require_changes: true       # kapsam değişmediyse PR'a yorum atma
+ignore:
+  - "tests/**"
