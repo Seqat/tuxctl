@@ -1,11 +1,13 @@
 //! The last step of every frame: no control character reaches the terminal.
 //!
 //! Process names, command lines, journal messages and other system data are
-//! controlled by other local users. Ratatui only drops `\n` when rendering
-//! spans, and the backend prints cell symbols as they are, so an embedded
-//! escape sequence would be sent to the terminal (clipboard writes via OSC 52,
-//! a full reset, fake links). Every string reaches the terminal through the
-//! frame buffer, so cleaning the buffer covers every screen and overlay.
+//! controlled by other local users. Ratatui skips control characters when
+//! rendering spans, but not the bidirectional overrides that can make a name
+//! display as something else, and the backend prints cell symbols as they are.
+//! Cleaning the buffer does not depend on ratatui's filtering staying the same
+//! (an embedded escape sequence would otherwise reach the terminal: clipboard
+//! writes via OSC 52, a full reset, fake links). Every string reaches the
+//! terminal through the frame buffer, so this covers every screen and overlay.
 
 use ratatui::buffer::Buffer;
 
@@ -57,9 +59,11 @@ mod tests {
     }
 
     #[test]
-    fn unsanitized_spans_keep_escape_characters() {
-        // The reason this module exists: ratatui passes them through.
-        assert!(has_unsafe_symbol(&rendered("a\u{1b}]52;c;cm0=\u{7}b", 20)));
+    fn unsanitized_spans_keep_bidirectional_overrides() {
+        // Part of the reason this module exists: ratatui drops control
+        // characters itself, but passes these through.
+        assert!(has_unsafe_symbol(&rendered("abc\u{202E}fed", 20)));
+        assert!(has_unsafe_symbol(&rendered("\u{2066}iso\u{2069}", 20)));
     }
 
     #[test]
@@ -78,6 +82,23 @@ mod tests {
             sanitize_buffer(&mut buffer);
             assert!(!has_unsafe_symbol(&buffer), "{hostile:?}");
         }
+    }
+
+    #[test]
+    fn control_characters_written_straight_into_cells_are_removed() {
+        // Ratatui filters controls when rendering spans; cells set by other
+        // means (or by a future ratatui) must still be cleaned.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buffer[(0, 0)].set_symbol("\u{1b}");
+        buffer[(1, 0)].set_symbol("a\u{9b}");
+        buffer[(2, 0)].set_symbol("\u{7}");
+
+        sanitize_buffer(&mut buffer);
+
+        assert!(!has_unsafe_symbol(&buffer));
+        assert_eq!(buffer[(0, 0)].symbol(), REPLACEMENT);
+        assert_eq!(buffer[(1, 0)].symbol(), "a");
+        assert_eq!(buffer[(2, 0)].symbol(), REPLACEMENT);
     }
 
     #[test]

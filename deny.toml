@@ -13,11 +13,6 @@ all-features = true
 [advisories]
 # RustSec: vulnerabilities and unsound crates fail, as do yanked versions.
 yanked = "deny"
-ignore = [
-    # `paste` is unmaintained (no vulnerability); it comes only through
-    # ratatui 0.29's macros. Drop this once ratatui is upgraded.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained, not vulnerable; via ratatui 0.29" },
-]
 
 [licenses]
 # Compatible with tuxctl's MIT license.
